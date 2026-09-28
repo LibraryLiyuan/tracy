@@ -280,6 +280,31 @@ int main( int argc, char** argv )
         QueryJobStoreReader reader( root / "jobs", root / "strings", fingerprint, options );
         Require( reader.GetJobCount() == 2 && reader.GetGfxDispatchCount() == 1, "Job derived counts changed" );
         const auto jobs = reader.ScanJobs( 0, 10 );
+        const auto policyReadsBefore = reader.ReadStatistics();
+        const auto policyJobs = reader.ScanJobsForPolicy( 0, 10 );
+        const auto policyReadsAfter = reader.ReadStatistics();
+        Require( policyJobs.size() == jobs.size(), "Job policy projection changed page cardinality" );
+        for( size_t index = 0; index < jobs.size(); ++index )
+        {
+            const auto& full = jobs[index];
+            const auto& policy = policyJobs[index];
+            Require( policy.jobId == full.jobId && policy.packedHandle == full.packedHandle &&
+                policy.name == full.name && policy.typeId == full.typeId &&
+                policy.scheduleNs == full.scheduleNs && policy.readyNs == full.readyNs &&
+                policy.queueEnterNs == full.queueEnterNs && policy.firstRunNs == full.firstRunNs &&
+                policy.completedNs == full.completedNs && policy.executionNs == full.executionNs &&
+                policy.waitNs == full.waitNs && policy.originFrameId == full.originFrameId &&
+                policy.waitEndCount == full.waitEndCount && policy.continuationCount == full.continuationCount,
+                "Job policy projection changed an aggregate fact" );
+            Require( policy.dependencies.empty() && policy.stages.empty() &&
+                policy.waitCallstacks.empty() && policy.executionLanes.empty(),
+                "Job policy projection retained detail collections" );
+        }
+        Require( policyReadsAfter.refs.blockLoads == policyReadsBefore.refs.blockLoads,
+            "Job policy projection read Job reference pages" );
+        for( size_t domain = 0; domain < QueryJobDomainCount; ++domain )
+            Require( policyReadsAfter.facts[domain].blockLoads == policyReadsBefore.facts[domain].blockLoads,
+                "Job policy projection read Job fact pages" );
         Require( reader.FindJobRef( 1, {} ) == jobs.front().ref, "Job ID lookup changed reference" );
         Require( !reader.FindJobRef( 999, {} ), "unknown Job ID was reported present" );
         Require( jobs.size() == 2 && jobs[0].jobId == 1 && jobs[0].name == "RootJob" && jobs[0].executionNs == 10 &&
@@ -482,6 +507,10 @@ int main( int argc, char** argv )
             oversizedRejected = std::string( error.what() ).find( "workspace_budget" ) != std::string::npos;
         }
         Require( oversizedRejected, "single Job detail exceeded its bounded collection limit" );
+        const auto oversizedPolicy = oversizedReader.ScanJobsForPolicy( 0, 1 );
+        Require( oversizedPolicy.size() == 1 && oversizedPolicy.front().jobId == 77 &&
+            oversizedPolicy.front().stages.empty() && oversizedPolicy.front().dependencies.empty(),
+            "Job summary projection rejected or materialized an oversized detail collection" );
 
         Require( usage->Snapshot().currentBytes == AnalysisDiskUsage::Bytes( root ),
             "Job scratch cleanup did not release the disk ledger" );

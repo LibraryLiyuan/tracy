@@ -2262,6 +2262,8 @@ public:
     std::optional<std::string> FindJobRef( uint64_t jobId, const std::function<void()>& check ) const override
     { return m_jobs.FindJobRef( jobId, check ); }
     std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const override { return m_jobs.ScanJobs( offset, limit ); }
+    std::vector<analysis::JobDto> ScanJobsForPolicy( size_t offset, size_t limit ) const override
+    { return m_jobs.ScanJobsForPolicy( offset, limit ); }
     bool HasJobScheduleIndex() const override { return true; }
     std::vector<analysis::JobDto> ScanJobsBySchedule( size_t offset, size_t limit,
         const std::function<void()>& check ) const override { return m_jobs.ScanJobsBySchedule( offset, limit, check ); }
@@ -3744,6 +3746,12 @@ private:
 static_assert( std::is_same_v<decltype(&IndexedTraceSource::GetDirectedJobs),
     std::vector<analysis::JobDto> (IndexedTraceSource::*)(uint64_t, bool, const std::function<void()>&) const>,
     "IndexedTraceSource must override controlled directed Job reads" );
+template<class Owner>
+constexpr bool IndexedOwnsJobPolicyProjection(
+    std::vector<analysis::JobDto> (Owner::*)(size_t, size_t) const)
+{ return std::is_same_v<Owner, IndexedTraceSource>; }
+static_assert( IndexedOwnsJobPolicyProjection( &IndexedTraceSource::ScanJobsForPolicy ),
+    "IndexedTraceSource must override the summary-only Native Policy Job projection" );
 template<class Owner>
 constexpr bool IndexedOwnsControlledFrameJobs(std::vector<analysis::JobDto> (Owner::*)(uint64_t, const std::function<void()>&) const)
 { return std::is_same_v<Owner, IndexedTraceSource>; }

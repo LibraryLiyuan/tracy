@@ -4,6 +4,7 @@
 #include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <map>
 
@@ -12,6 +13,13 @@ using namespace tracy::analysis;
 
 namespace
 {
+
+std::filesystem::path UniqueTemporaryRoot( std::string_view name )
+{
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::filesystem::temp_directory_path() /
+        ( std::string( name ) + "-" + std::to_string( nonce ) );
+}
 
 template<typename T>
 std::vector<T> SliceValues( const std::vector<T>& values, size_t offset, size_t limit )
@@ -143,6 +151,17 @@ public:
         ReadBoundary( "job" );
         return SliceValues( jobs, offset, limit );
     }
+    std::vector<JobDto> ScanJobsForPolicy( size_t offset, size_t limit ) const override
+    {
+        policyJobProjectionRead = true;
+        auto values = SliceValues( jobs, offset, limit );
+        for( auto& job : values )
+        {
+            job.dependencies.clear(); job.executionLanes.clear();
+            job.waitCallstacks.clear(); job.stages.clear();
+        }
+        return values;
+    }
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override
     {
         ReadBoundary( "relation" );
@@ -173,6 +192,7 @@ public:
     std::function<void( std::string_view )> readHook;
     mutable bool cancellationRequested = false;
     mutable size_t readsAfterCancel = 0;
+    mutable bool policyJobProjectionRead = false;
     void ReadBoundary( std::string_view domain ) const
     {
         if( readHook ) readHook( domain );
@@ -320,6 +340,84 @@ int main()
     GpuJobManagedSource source;
     GpuJobManagedScanner scanner( source, 2 );
     const auto result = scanner.Scan();
+
+    // Native policy aggregation must preserve timing/signature/Job/Relation
+    // semantics without loading the unused Frame/Gfx association graph. The
+    // Relation ambiguity pass remains exact through bounded external sorting.
+    {
+        const auto temporary=UniqueTemporaryRoot("jn-gpu-policy-projection");
+        std::filesystem::remove_all(temporary);
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{temporary});
+        auto disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{usage,64*1024*1024,{}});
+        bool readUnused=false;
+        source.readHook=[&](std::string_view domain) {
+            if(domain=="frame" || domain=="gfx_entity" || domain=="gfx_link") readUnused=true;
+        };
+        GpuJobManagedScanOptions options; options.retainDetails=false;
+        options.includeGpuFrameEvidence=false; options.includeJobDetails=false;
+        options.temporaryRoot=temporary; options.disk=disk;
+        std::vector<GpuZoneScanFact> facts; size_t jobs=0;
+        options.gpuZoneSink=[&](const auto& fact){facts.push_back(fact);return true;};
+        options.jobSink=[&](const auto&){++jobs;return true;};
+        const auto projected=scanner.Scan(options);
+        source.readHook={};
+        if(projected.gpuFrameEvidenceEvaluated || !source.policyJobProjectionRead || readUnused ||
+            facts.size()!=result.gpuZones.size() || jobs!=result.jobCount ||
+            projected.relationCount!=result.relationCount ||
+            projected.ambiguousRelationCount!=result.ambiguousRelationCount)
+            throw std::runtime_error("GPU policy projection changed consumed facts or loaded unused associations");
+        for(size_t i=0;i<facts.size();++i) if(facts[i].signatureId!=result.gpuZones[i].signatureId ||
+            facts[i].inclusiveNs!=result.gpuZones[i].inclusiveNs || facts[i].exclusiveNs!=result.gpuZones[i].exclusiveNs ||
+            facts[i].l0SegmentOrdinal!=result.gpuZones[i].l0SegmentOrdinal)
+            throw std::runtime_error("GPU policy projection changed timing/signature/L0 identity");
+        if(usage->Snapshot().currentBytes!=0 ||
+            (std::filesystem::exists(temporary) && !std::filesystem::is_empty(temporary)))
+            throw std::runtime_error("GPU policy projection retained external-sort scratch");
+        std::filesystem::remove_all(temporary);
+    }
+
+    // A failed bounded sort owns and removes all of its output and run files.
+    // A later retry must not inherit scratch or charged bytes from the failure.
+    {
+        const auto temporary=UniqueTemporaryRoot("jn-gpu-policy-projection-failure");
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{temporary});
+        size_t growths=0;
+        auto disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{usage,64*1024*1024,[&] {
+            if(++growths==2) throw std::runtime_error("injected_sort_disk_failure");
+        }});
+        GpuJobManagedScanOptions options; options.retainDetails=false;
+        options.includeGpuFrameEvidence=false; options.temporaryRoot=temporary; options.disk=disk;
+        bool rejected=false;
+        try { (void)scanner.Scan(options); }
+        catch(const std::runtime_error& error) {
+            rejected=std::string_view(error.what()).find("injected_sort_disk_failure")!=std::string_view::npos;
+        }
+        if(!rejected || usage->Snapshot().currentBytes!=0 ||
+            (std::filesystem::exists(temporary) && !std::filesystem::is_empty(temporary)))
+            throw std::runtime_error("Failed GPU policy projection retained external-sort scratch");
+        std::filesystem::remove_all(temporary);
+    }
+
+    {
+        const auto temporary=UniqueTemporaryRoot("jn-gpu-policy-projection-cancel");
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{temporary});
+        bool cancelled=false;
+        auto disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{usage,64*1024*1024,[&] {
+            cancelled=true;
+        }});
+        GpuJobManagedScanOptions options; options.retainDetails=false;
+        options.includeGpuFrameEvidence=false; options.temporaryRoot=temporary; options.disk=disk;
+        options.cancelled=[&]{return cancelled;};
+        bool rejected=false;
+        try { (void)scanner.Scan(options); }
+        catch(const BoundedScanError& error) {
+            rejected=std::string_view(error.what()).find("cancelled")!=std::string_view::npos;
+        }
+        if(!rejected || usage->Snapshot().currentBytes!=0 ||
+            (std::filesystem::exists(temporary) && !std::filesystem::is_empty(temporary)))
+            throw std::runtime_error("Cancelled GPU policy projection retained external-sort scratch");
+        std::filesystem::remove_all(temporary);
+    }
 
     // A missing outer timestamp is a local quality gap, not permission to
     // erase the known parent identity or turn a valid child into an orphan.
@@ -496,6 +594,28 @@ int main()
         try { (void)scanner.Scan( cancelledDefinition ); }
         catch( const BoundedScanError& e ) { rejected = std::string( e.what() ).find( "cancelled" ) != std::string::npos; }
         assert( rejected && emitted == 1 && facts == 0 );
+    }
+    {
+        GpuJobManagedSource manyJobs;
+        manyJobs.frames.clear(); manyJobs.gpuZones.clear(); manyJobs.relations.clear();
+        manyJobs.gfxEntities.clear(); manyJobs.gfxLinks.clear();
+        manyJobs.scriptFrames.clear(); manyJobs.scriptEvents.clear();
+        manyJobs.jobs.clear(); manyJobs.jobs.reserve( 100000 );
+        for( uint64_t index = 0; index < 100000; ++index )
+        {
+            JobDto job;
+            job.ref = manyJobs.MakeEntityRef( "job", index + 1 );
+            job.jobId = index + 1; job.packedHandle = ( ( index + 1 ) << 32 ) | uint32_t( index );
+            job.name = "PolicyJob"; job.scheduleNs = int64_t( index );
+            job.completedNs = int64_t( index + 1 ); job.executionNs = 1;
+            manyJobs.jobs.emplace_back( std::move( job ) );
+        }
+        auto bounded = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        GpuJobManagedScanOptions options; options.workspace = bounded;
+        options.retainDetails = false; options.includeGpuFrameEvidence = false; options.includeJobDetails = false;
+        const auto output = GpuJobManagedScanner( manyJobs ).Scan( options );
+        if( output.jobCount != manyJobs.jobs.size() || bounded->Snapshot().peakBytes > 2 * 1024 * 1024 )
+            throw std::runtime_error( "Job handle-generation validation overcharged a fixed-width vector" );
     }
     {
         GpuJobManagedSource wide;

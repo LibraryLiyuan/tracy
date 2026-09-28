@@ -1043,9 +1043,10 @@ struct QueryJobStoreReader::Impl
         return ReadFact<JnCallsiteData>( *facts[size_t( QueryJobDomain::Callsite )], *ordinal );
     }
 
-    analysis::JobDto BuildJob( uint64_t ordinal, const StoredJob& stored, const std::function<void()>& check ) const
+    analysis::JobDto BuildJob( uint64_t ordinal, const StoredJob& stored,
+        const std::function<void()>& check, bool includeDetails = true ) const
     {
-        if( stored.refsCount > MaximumJobDetailReferences )
+        if( includeDetails && stored.refsCount > MaximumJobDetailReferences )
             throw std::runtime_error( "workspace_budget: single Job detail exceeds 32768 fact references" );
         analysis::JobDto job;
         job.ref = Ref( source, "job", stored.jobId ); job.jobId = stored.jobId; job.packedHandle = stored.packedHandle;
@@ -1070,6 +1071,7 @@ struct QueryJobStoreReader::Impl
         job.captureBoundary = ( stored.state & JobCaptureBoundary ) != 0; job.cancelled = ( stored.state & JobCancelled ) != 0;
         job.incomplete = ( stored.state & JobIncomplete ) != 0; job.orphan = ( stored.state & JobOrphan ) != 0;
         job.truncated = ( stored.state & JobTruncated ) != 0;
+        if( !includeDetails ) return job;
         for( uint64_t index = 0; index < stored.refsCount; index++ )
         {
             if( check && ( index & 1023 ) == 0 ) check();
@@ -1193,6 +1195,36 @@ std::vector<analysis::JobDto> QueryJobStoreReader::ScanJobs( size_t offset, size
         CheckCancelled( m_impl->options );
         StoredJob job; m_impl->jobs.Read( ordinal, &job, 1 ); result.emplace_back( m_impl->BuildJob( ordinal, job, {} ) );
     }
+    return result;
+}
+
+std::vector<analysis::JobDto> QueryJobStoreReader::ScanJobsForPolicy( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    CheckCancelled( m_impl->options );
+    const auto begin = std::min<uint64_t>( offset, m_impl->jobs.Count() );
+    const auto end = begin + std::min<uint64_t>( limit, m_impl->jobs.Count() - begin );
+    std::vector<StoredJob> stored( size_t( end - begin ) );
+    if( !stored.empty() ) m_impl->jobs.Read( begin, stored.data(), stored.size() );
+    std::vector<analysis::JobDto> result;
+    result.reserve( stored.size() );
+    for( size_t index = 0; index < stored.size(); ++index )
+    {
+        CheckCancelled( m_impl->options );
+        result.emplace_back( m_impl->BuildJob( begin + index, stored[index], {}, false ) );
+    }
+    return result;
+}
+
+QueryJobReadStatistics QueryJobStoreReader::ReadStatistics() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    QueryJobReadStatistics result;
+    result.jobs = m_impl->jobs.Statistics();
+    result.names = m_impl->names.RecordReadStatistics();
+    result.refs = m_impl->refs.Statistics();
+    for( size_t index = 0; index < QueryJobDomainCount; ++index )
+        result.facts[index] = m_impl->facts[index]->Statistics();
     return result;
 }
 

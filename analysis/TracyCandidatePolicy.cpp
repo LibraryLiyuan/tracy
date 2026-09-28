@@ -789,7 +789,7 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     // Keep capture limitations independently of candidate quotas and priorities.
     for( const auto& domain : input.aggregate.domains )
     {
-        if( domain.status != "invalid" && domain.qualityComplete ) continue;
+        if( ( domain.status == "complete" || domain.status == "absent" ) && domain.qualityComplete ) continue;
         result.captureQuality.push_back( {
             { "domain", domain.domain }, { "status", domain.status },
             { "reason", domain.unavailableReason.empty() ? "domain_invalid" : domain.unavailableReason },

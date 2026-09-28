@@ -523,6 +523,12 @@ struct AnalysisKeyMetadataRunCollector::Impl
         if( statistics ) *statistics = {};
     }
 
+    ~Impl()
+    {
+        std::string ignored;
+        CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", ignored, disk );
+    }
+
     void Flush()
     {
         if( values.empty() ) return;

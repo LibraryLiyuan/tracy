@@ -7,6 +7,7 @@
 #include "TracyQueue.hpp"
 
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -48,6 +49,14 @@ struct QueryJobBuildStatistics
     uint64_t jobNameCacheHits = 0;
 };
 
+struct QueryJobReadStatistics
+{
+    analysis::PagedRecordReader::ReadStats jobs;
+    analysis::PagedRecordReader::ReadStats names;
+    analysis::PagedRecordReader::ReadStats refs;
+    std::array<analysis::PagedRecordReader::ReadStats, QueryJobDomainCount> facts;
+};
+
 class QueryJobStoreWriter
 {
 public:
@@ -83,6 +92,8 @@ public:
     uint64_t Count( QueryJobDomain domain ) const;
     std::vector<analysis::JobDto> GetJobs() const;
     std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const;
+    std::vector<analysis::JobDto> ScanJobsForPolicy( size_t offset, size_t limit ) const;
+    QueryJobReadStatistics ReadStatistics() const;
     std::vector<analysis::JobDto> ScanJobsBySchedule( size_t offset, size_t limit,
         const std::function<void()>& check ) const;
     std::vector<analysis::JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,

@@ -1032,6 +1032,12 @@ public:
         const auto end = offset + std::min( limit, values.size() - offset );
         return { values.begin() + offset, values.begin() + end };
     }
+    // Native policy aggregation consumes lifecycle totals and identity, not
+    // the potentially much larger Stage/Dependency evidence collections.
+    // Indexed sources may provide a summary-only projection; the default
+    // preserves compatibility and exact values for other implementations.
+    virtual std::vector<JobDto> ScanJobsForPolicy( size_t offset, size_t limit ) const
+    { return ScanJobs( offset, limit ); }
     virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
     virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
     {

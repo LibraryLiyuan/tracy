@@ -682,9 +682,22 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         gpuOptions.cancelled = cancelled;
         gpuOptions.workspace = workspace;
         gpuOptions.retainDetails = false;
+        gpuOptions.includeGpuFrameEvidence = false;
+        gpuOptions.includeJobDetails = false;
+        gpuOptions.temporaryRoot = temporaryRoot / "gpu-relation-ambiguity";
+        gpuOptions.disk = request.disk;
         gpuOptions.includeExactGpuSignatures = true;
         gpuOptions.includeLogicalGpuSignatures = false;
         gpuOptions.logicalSignatureMode = GpuLogicalSignatureMode::FullPath;
+        auto gpuProgressReportedAt=std::chrono::steady_clock::now();
+        std::string gpuProgressStage;
+        gpuOptions.progress=[&](std::string_view stage,uint64_t completed,uint64_t total) {
+            const auto now=std::chrono::steady_clock::now();
+            if(stage==gpuProgressStage && completed!=total && now-gpuProgressReportedAt<std::chrono::seconds(5)) return;
+            gpuProgressStage=stage; gpuProgressReportedAt=now;
+            progress(ScanState::Scanning,completed,total,stage);
+            std::cerr<<"Query scan-progress stage="<<stage<<" completed="<<completed<<" total="<<total<<'\n';
+        };
         auto gpuDefinitionOutput = std::make_unique<AnalysisCacheSortedWriter>( gpuDefinitionsPath,
             products.neutralCacheIdentity, "gpu-definitions-v1", cacheOptions.table );
         gpuOptions.definitionSink = [&]( const GpuSignatureDefinition& definition ) {
@@ -837,6 +850,10 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         audit( "gpu", gpuJob.gpuZoneCount != 0,
             sourceStatus( gpuJob.gpuZoneCount != 0, gpuReason ),
             gpuJob.gpuZoneCount, gpuPresent.size(), gpuReason );
+        if( !gpuJob.gpuFrameEvidenceEvaluated )
+            audit( "gpu_frame_evidence", gpuJob.gpuZoneCount != 0,
+                gpuJob.gpuZoneCount == 0 ? "absent" : "unsupported",
+                gpuJob.gpuZoneCount, 0, "native_policy_frame_evidence_not_evaluated" );
         audit( "job", gpuJob.jobCount != 0,
             sourceStatus( gpuJob.jobCount != 0, jobReason ),
             gpuJob.jobCount, jobPresent.size(), jobReason );

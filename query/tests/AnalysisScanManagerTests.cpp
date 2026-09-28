@@ -803,6 +803,11 @@ void GpuLocalQualityRecovery(const std::filesystem::path& root)
     });
     if(!found || !products.aggregate.qualityComplete || products.aggregate.unreportedGapCount!=0)
         throw std::runtime_error("GPU source degradation must remain explicit without an internal transfer gap");
+    const auto frameEvidence=std::find_if(products.aggregate.domains.begin(),products.aggregate.domains.end(),
+        [](const auto& domain){return domain.domain=="gpu_frame_evidence";});
+    if(frameEvidence==products.aggregate.domains.end() || frameEvidence->status!="unsupported" ||
+        frameEvidence->unavailableReason!="native_policy_frame_evidence_not_evaluated")
+        throw std::runtime_error("Native policy projection silently reported skipped GPU frame evidence as healthy");
     if(test.mode==3 || test.mode==4 || test.mode==8) continue;
     const auto stateRoot=root/("gpu-quality-manager-"+std::to_string(test.mode));
     const auto cacheRoot=root/("gpu-quality-cache-"+std::to_string(test.mode));
@@ -825,6 +830,8 @@ void GpuLocalQualityRecovery(const std::filesystem::path& root)
         summary=manager.Summary(scanId); quality=manager.Quality(scanId);
         signatures=manager.Signatures(scanId,100,"",{},json::object());
         candidates=manager.Candidates(scanId,100,"",{},json::object());
+        if(quality.dump().find("native_policy_frame_evidence_not_evaluated")==std::string::npos)
+            throw std::runtime_error("Query quality response omitted the unsupported GPU frame-evidence capability");
         bool selected=false;
         for(const auto& candidate:candidates.at("items")) if(candidate.at("signature_id")==goodId) {
             selected=candidate.at("selected").get<bool>();
@@ -1817,7 +1824,9 @@ int main(int argc,char** argv)
     }
     {
         testStage="default scanners process memory cancellation";
-        for( const auto* domain : { "frame", "gfx_entity", "memory" } )
+        // Native policy intentionally skips the Frame/Gfx association graph.
+        // Exercise one live boundary in each remaining default scanner.
+        for( const auto* domain : { "cpu", "io", "memory" } )
         {
             auto native=std::make_shared<SourceDegradedTrace>();
             std::atomic<uint64_t> processBytes=128;

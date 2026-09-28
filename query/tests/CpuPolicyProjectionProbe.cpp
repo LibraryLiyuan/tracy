@@ -1,8 +1,10 @@
 #include "TracyQueryIndex.hpp"
 #include "../../analysis/TracyBoundedScanCursor.hpp"
+#include "../../analysis/TracyGpuJobManagedScanner.hpp"
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,107 @@ int main( int argc, char** argv )
 {
     try
     {
+        if( argc == 4 && ( std::string_view( argv[1] ) == "--gpu" ||
+            std::string_view( argv[1] ) == "--job" ) )
+        {
+            const auto mode = std::string_view( argv[1] );
+            const auto tracePath = std::filesystem::path( argv[2] );
+            const auto temporaryRoot = std::filesystem::path( argv[3] );
+            auto resources = QueryIndex::CreateResourceContext( tracePath );
+            resources->IncludeDiskRoots( { temporaryRoot } );
+            const auto validated = QueryIndex::Validate( tracePath, false, resources );
+            if( !validated.manifest ) throw std::runtime_error( validated.reason );
+            auto source = QueryIndex::Open( *validated.manifest, {}, {}, resources );
+            uint64_t definitions = 0, gpuFacts = 0, jobs = 0;
+            const auto began = std::chrono::steady_clock::now();
+            std::filesystem::create_directories( temporaryRoot );
+            std::ofstream progressLedger( temporaryRoot / "gpu-probe-progress.ndjson",
+                std::ios::binary | std::ios::app );
+            if( !progressLedger ) throw std::runtime_error( "gpu_probe_progress_open_failed" );
+            const auto writeProgress = [&]( std::string_view stage, uint64_t completed, uint64_t total ) {
+                progressLedger << nlohmann::json {
+                    { "elapsed_ms", std::to_string( ElapsedMs( began ) ) },
+                    { "stage", stage }, { "completed", std::to_string( completed ) },
+                    { "total", std::to_string( total ) }
+                }.dump() << '\n';
+                progressLedger.flush();
+                if( !progressLedger ) throw std::runtime_error( "gpu_probe_progress_write_failed" );
+            };
+            writeProgress( "starting", 0, 0 );
+            if( mode == "--job" )
+            {
+                const auto total = source->GetJobCount();
+                uint64_t completed = 0, checksum = 0;
+                auto reportedAt = std::chrono::steady_clock::now();
+                writeProgress( "job_policy_projection", 0, total );
+                while( completed < total )
+                {
+                    const auto take = size_t( std::min<uint64_t>( NativeBoundedScanMaximumBatch, total - completed ) );
+                    const auto page = source->ScanJobsForPolicy( size_t( completed ), take );
+                    if( page.size() != take ) throw std::runtime_error( "job_policy_projection_count" );
+                    for( const auto& job : page )
+                    {
+                        if( !job.dependencies.empty() || !job.stages.empty() ||
+                            !job.waitCallstacks.empty() || !job.executionLanes.empty() )
+                            throw std::runtime_error( "job_policy_projection_retained_details" );
+                        checksum ^= job.jobId + job.packedHandle + uint64_t( job.scheduleNs ) +
+                            uint64_t( job.executionNs ) + uint64_t( job.waitNs ) + job.originFrameId +
+                            uint64_t( job.typeId ) + uint64_t( job.name.size() );
+                    }
+                    completed += page.size();
+                    const auto now = std::chrono::steady_clock::now();
+                    if( completed == total || now - reportedAt >= std::chrono::seconds( 5 ) )
+                    {
+                        reportedAt = now;
+                        writeProgress( "job_policy_projection", completed, total );
+                        std::cerr << "job-probe completed=" << completed << " total=" << total << '\n';
+                    }
+                }
+                const auto snapshot = resources->Snapshot();
+                writeProgress( "complete", completed, total );
+                std::cout << nlohmann::json {
+                    { "mode", "job-policy" }, { "elapsed_ms", std::to_string( ElapsedMs( began ) ) },
+                    { "jobs", std::to_string( completed ) }, { "checksum", std::to_string( checksum ) },
+                    { "workspace_current", std::to_string( snapshot.workspace.currentBytes ) },
+                    { "workspace_peak", std::to_string( snapshot.workspace.peakBytes ) },
+                    { "disk_current", std::to_string( snapshot.disk.currentBytes ) },
+                    { "disk_peak", std::to_string( snapshot.disk.peakBytes ) }
+                }.dump() << '\n';
+                return 0;
+            }
+            GpuJobManagedScanOptions options;
+            options.workspace = resources->Workspace(); options.disk = resources->Disk();
+            options.temporaryRoot = temporaryRoot; options.retainDetails = false;
+            options.includeGpuFrameEvidence = false; options.includeJobDetails = false;
+            options.includeLogicalGpuSignatures = false;
+            auto reportedAt=std::chrono::steady_clock::now(); std::string reportedStage;
+            options.progress=[&](std::string_view stage,uint64_t completed,uint64_t total) {
+                const auto now=std::chrono::steady_clock::now();
+                if(stage==reportedStage && completed!=total && now-reportedAt<std::chrono::seconds(5)) return;
+                reportedStage=stage; reportedAt=now;
+                writeProgress( stage, completed, total );
+                std::cerr<<"gpu-probe stage="<<stage<<" completed="<<completed<<" total="<<total<<'\n';
+            };
+            options.definitionSink = [&]( const auto& ) { ++definitions; return true; };
+            options.gpuZoneSink = [&]( const auto& ) { ++gpuFacts; return true; };
+            options.jobSink = [&]( const auto& ) { ++jobs; return true; };
+            const auto result = GpuJobManagedScanner( *source ).Scan( options );
+            const auto snapshot = resources->Snapshot();
+            writeProgress( "complete", result.gpuZoneCount + result.jobCount + result.relationCount,
+                result.gpuZoneCount + result.jobCount + result.relationCount );
+            std::cout << nlohmann::json {
+                { "mode", "gpu-policy" }, { "elapsed_ms", std::to_string( ElapsedMs( began ) ) },
+                { "definitions", std::to_string( definitions ) }, { "gpu_facts", std::to_string( gpuFacts ) },
+                { "jobs", std::to_string( jobs ) }, { "relations", std::to_string( result.relationCount ) },
+                { "ambiguous_relations", std::to_string( result.ambiguousRelationCount ) },
+                { "managed_zones", std::to_string( result.managedZoneCount ) },
+                { "workspace_current", std::to_string( snapshot.workspace.currentBytes ) },
+                { "workspace_peak", std::to_string( snapshot.workspace.peakBytes ) },
+                { "disk_current", std::to_string( snapshot.disk.currentBytes ) },
+                { "disk_peak", std::to_string( snapshot.disk.peakBytes ) }
+            }.dump() << '\n';
+            return 0;
+        }
         if( argc != 4 ) throw std::runtime_error( "expected trace path, start ordinal and count" );
         const auto tracePath = std::filesystem::path( argv[1] );
         const auto start = std::stoull( argv[2] );
