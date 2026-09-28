@@ -118,6 +118,28 @@ template<class Writer> static void FrameSeries(const std::filesystem::path& root
     }
     else throw std::runtime_error("frame series still requires a raw uncompressed stream");
 }
+static void FrameSeriesBulkRead(const std::filesystem::path& root)
+{
+    const std::string identity(64,'b');
+    PagedRecordOptions options;options.blockBytes=64*1024;
+    options.workspace=std::make_shared<AnalysisWorkspaceBudget>(32*1024*1024,16*1024*1024);
+    PolicySignatureContext context;context.metricPreference="exclusive";
+    std::vector<NeutralMergedFrameValues> frames(16384);
+    for(size_t i=0;i<frames.size();++i) {
+        frames[i].frameIndex=i;frames[i].inclusiveNs=100+i;
+        frames[i].exclusiveNs=30+i;frames[i].exact=true;
+    }
+    { PagedRecordWriter writer(root/"bulk-series",identity,56,options);
+      WritePolicyFrameSeries(writer,context,frames);writer.Commit(); }
+    uint64_t cancellationChecks=0;
+    const auto restored=ReadPolicyFrameSeries(root/"bulk-series",context,32*1024*1024,
+        [&]{++cancellationChecks;return false;},identity);
+    Require(restored.size()==frames.size() && restored.front().valueNs==30 &&
+        restored.back().frameIndex==frames.size()-1 && restored.back().valueNs==30+int64_t(frames.size()-1),
+        "bulk frame-series read preserves every ordinal and value");
+    Require(cancellationChecks<64,
+        "sequential frame-series reading must check cancellation per chunk, not per record");
+}
 static void Run()
 {
     const auto root=std::filesystem::temp_directory_path()/
@@ -192,6 +214,7 @@ static void Run()
     catch(const std::exception&) { corrupt=true; }
     Require(corrupt,"corrupt block cannot be accepted");
     FrameSeries<PagedRecordWriter>(root,options);
+    FrameSeriesBulkRead(root);
     std::filesystem::remove_all(root);
 }
 #else

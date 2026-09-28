@@ -258,8 +258,9 @@ void LargeFrameTimeline(const std::filesystem::path& root)
     input.signatures.push_back(rootContext);
     PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
     timeline.frames.reserve(FrameCount);
+    const std::string frameReference(128,'r');
     for(uint64_t frame=0;frame<FrameCount;++frame)
-        timeline.frames.push_back({frame,frame==FrameCount/2?20'000'000:12'000'000,{},"",true});
+        timeline.frames.push_back({frame,frame==FrameCount/2?20'000'000:12'000'000,{frameReference},"",true});
     input.frameTimelines.push_back(std::move(timeline));
     NeutralStatisticsStreamSummary summary; summary.qualityComplete=true;
     NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.blockBytes=65536;
@@ -271,7 +272,7 @@ void LargeFrameTimeline(const std::filesystem::path& root)
     input.readFrameSeries=[&](const auto&){++seriesReads; throw std::runtime_error("duplicate_root_series_read");
         return std::vector<PolicyFrameEvidence>{};};
     CandidatePolicyCacheOptions options; options.table.blockBytes=65536; options.sortBufferBytes=262144;
-    options.frameWorkspaceBytes=512*1024*1024;
+    options.frameWorkspaceBytes=1024ull*1024*1024;
     options.table.workspace=std::make_shared<AnalysisWorkspaceBudget>();
     const auto identity=BuildCandidatePolicyCache(root/"policy",neutral,input,options);
     Require(seriesReads==0,"a supplied Frame Root Timeline must not load a duplicate full series");

@@ -230,7 +230,15 @@ struct Builder
         Check(options);
         if(!input.signatures.empty() || !input.aggregate.signatures.empty() || !input.aggregate.rankings.empty()) Fail("materialized_input");
         if(options.familyBytes<1024 || options.familyBytes>64*1024*1024) Fail("family_budget");
-        if(options.frameWorkspaceBytes<4096 || options.frameWorkspaceBytes>512*1024*1024) Fail("frame_workspace_budget");
+        // The shared workspace limits actual retained copies. Without a
+        // workspace owner, keep the conservative stand-alone ceiling.
+        // Small injected workspaces must reach their actual allocation gate;
+        // the frame admission ceiling cannot preempt those fault tests.
+        const auto sharedFrameLimit=options.table.workspace ?
+            std::max<uint64_t>(512ull*1024*1024,options.table.workspace->Snapshot().maximumBytes) :
+            512ull*1024*1024;
+        if(options.frameWorkspaceBytes<4096 || options.frameWorkspaceBytes>sharedFrameLimit)
+            Fail("frame_workspace_budget");
         if(input.normalizedProfile.dump().size()>options.table.manifestBytes/4) Fail("profile_budget");
         std::string error; if(!candidate_policy::ValidateInput(input,error)) throw std::runtime_error(error);
         if(input.aggregateIdentity!=neutral.Identity()) Fail("neutral_identity_mismatch");
@@ -348,9 +356,12 @@ struct Builder
                         for(const auto& ref:frame.eventRefs) current+=64+2ull*ref.size();
                         largest=std::max(largest,current);
                     }
-                    // Qualified/typical/window copies, ranges/quantile arrays,
-                    // and returned Signal JSON stay covered through spooling.
-                    const auto copies=c.frameRoot?4ull:32ull;
+                    // FrameBytes conservatively prices each series row at
+                    // 256 B plus owned strings. The loaded series, qualified
+                    // and typical copies, sparse references, range JSON and
+                    // emitted signals fit in eight such row sets. Window
+                    // vectors are charged separately against the Timeline.
+                    const auto copies=c.frameRoot?4ull:8ull;
                     if(bytes>(UINT64_MAX-8192-16ull*key.size())/copies) Fail("frame_workspace_budget");
                     seriesWorkspace.Resize(8192+copies*bytes+16ull*key.size());
                     if(timeline!=state.timelines.end() && !borrowedRoot) {

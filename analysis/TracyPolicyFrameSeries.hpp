@@ -104,23 +104,33 @@ inline std::vector<PolicyFrameEvidence> ReadPolicyFrameSeries( const std::filesy
     std::vector<PolicyFrameEvidence> result;
     result.reserve( size_t( context.seriesCount ) );
     Sha256Builder hash;
-    for( uint64_t i = 0; i < context.seriesCount; ++i )
+    constexpr uint64_t ChunkRecords=4096;
+    static_assert(residentPerRow>=sizeof(PolicyFrameEvidence)+sizeof(PolicySeriesRecord));
+    // The caller reserves at least 256 B per declared row before entering;
+    // this bounded chunk plus the returned vector fit that admission charge.
+    std::vector<PolicySeriesRecord> chunk(size_t(std::min<uint64_t>(context.seriesCount,ChunkRecords)));
+    for(uint64_t offset=0;offset<context.seriesCount;)
     {
-        if( ( i % 4096 == 0 ) && cancelled && cancelled() ) throw std::runtime_error( "cancelled" );
-        PolicySeriesRecord row;
-        if(paged) paged->Read(context.seriesOffset/sizeof(PolicySeriesRecord)+i,row.data(),1);
+        if(cancelled && cancelled()) throw std::runtime_error("cancelled");
+        const auto count=std::min<uint64_t>(chunk.size(),context.seriesCount-offset);
+        const auto bytes=size_t(count*sizeof(PolicySeriesRecord));
+        if(paged) paged->Read(context.seriesOffset/sizeof(PolicySeriesRecord)+offset,chunk.data(),count);
         else {
-            file.read( reinterpret_cast<char*>( row.data() ), sizeof( row ) );
+            file.read(reinterpret_cast<char*>(chunk.data()),std::streamsize(bytes));
             if( !file ) throw std::runtime_error( "frame_series_read_failed" );
         }
-        hash.Update( row.data(), sizeof( row ) );
-        size_t field = context.metricPreference == "inclusive" ? 1 :
-            context.metricPreference == "wait" ? 3 : context.metricPreference == "critical" ? 4 : 2;
-        if( row[6] > 1 || ( row[6] == 1 && row[field] > uint64_t( INT64_MAX ) ) )
-            throw std::runtime_error( "frame_series_value_invalid" );
-        // Invalid source values stay unknown; the placeholder is never ranked
-        // or included in distributions because exact remains false.
-        result.push_back( { row[0], row[6] == 1 ? int64_t( row[field] ) : 0, {}, {}, row[6] == 1 } );
+        hash.Update(chunk.data(),bytes);
+        for(uint64_t i=0;i<count;++i) {
+            const auto& row=chunk[size_t(i)];
+            const size_t field=context.metricPreference=="inclusive"?1:
+                context.metricPreference=="wait"?3:context.metricPreference=="critical"?4:2;
+            if(row[6]>1 || (row[6]==1 && row[field]>uint64_t(INT64_MAX)))
+                throw std::runtime_error("frame_series_value_invalid");
+            // Invalid source values stay unknown; absent rows are interpreted
+            // only by the later FrameSet policy, never by this decoder.
+            result.push_back({row[0],row[6]==1?int64_t(row[field]):0,{},{},row[6]==1});
+        }
+        offset+=count;
     }
     if( hash.FinalHex() != context.seriesSha256 ) throw std::runtime_error( "frame_series_checksum_mismatch" );
     return result;

@@ -492,6 +492,39 @@ void FrameTimelineWorkspace(const std::filesystem::path& root)
     if(snapshot.peakBytes>96*1024*1024) throw std::runtime_error("Frame Timeline exceeded its workspace contract");
 }
 
+// A valid long-capture timeline can exceed the old 128 MiB private metadata
+// admission cap while remaining well inside the shared workspace budget.
+void LargeBundleMetadataUsesSharedBudget( const std::filesystem::path& root )
+{
+    const auto generation=root/"large-metadata-bundle";
+    std::filesystem::create_directories(generation);
+    auto products=Products(generation);
+    PolicyFrameTimeline timeline;
+    timeline.frameScope="Player.Frame";timeline.name="Long timeline";
+    const std::string reference(1024,'r');
+    for(uint64_t ordinal=0;ordinal<30000;++ordinal)
+        timeline.frames.push_back({ordinal,1,{reference},"Root",true,ordinal,ordinal+1});
+    products.frameTimelines.push_back(std::move(timeline));
+    const std::string identity(64,'a');
+    const auto sha=PublishAnalysisNeutralBundle(generation,identity,products);
+    AnalysisCacheTableOptions options;
+    options.workspace=std::make_shared<AnalysisWorkspaceBudget>(512ull*1024*1024,256ull*1024*1024);
+    {
+        const auto loaded=OpenAnalysisNeutralBundle(generation,identity,sha,options);
+        assert(loaded.frameTimelines.size()==1 && loaded.frameTimelines[0].frames.size()==30000);
+        assert(loaded.frameTimelines[0].frames.front().frameIndex==0);
+        assert(loaded.frameTimelines[0].frames.back().frameIndex==29999);
+        assert(options.workspace->Snapshot().currentBytes>128ull*1024*1024);
+        assert(options.workspace->Snapshot().rejectedReservations==0);
+    }
+    assert(options.workspace->Snapshot().currentBytes==0);
+    RejectCache([&]{OpenAnalysisNeutralBundle(generation,identity,sha);},"metadata_budget");
+    AnalysisCacheTableOptions tight;
+    tight.workspace=std::make_shared<AnalysisWorkspaceBudget>(64ull*1024*1024,32ull*1024*1024);
+    RejectCache([&]{OpenAnalysisNeutralBundle(generation,identity,sha,tight);},"workspace_budget");
+    assert(tight.workspace->Snapshot().currentBytes==0);
+}
+
 // Removing control-document ownership must fail cold Status and new Start
 // under pressure; neither may silently report a missing scan or lose profile
 // ownership once its parsing stack frame has returned.
@@ -574,8 +607,12 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
         // no transient scan locals can influence this retained-owner check.
         assert(warm.Resume(scanId).completed);        for(const auto& ownedRoot:{root/"control-state",root/"control-cache"})
             for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(ownedRoot)))
-                if(file.is_directory() && file.path().filename()=="ranking-input")
-                    throw std::runtime_error("published scan retained disposable ranking input");
+                if(file.is_directory() && (file.path().filename()=="ranking-input" ||
+                    file.path().filename()=="local-top-input" ||
+                    file.path().filename()=="local-observations" ||
+                    file.path().filename()=="local-signals" ||
+                    file.path().filename()=="context-order"))
+                    throw std::runtime_error("published scan retained disposable Policy input");
         const auto held=workspace->Snapshot().currentBytes;
         if(held<65536+32768) std::cerr<<"completed entry retained an uncharged profile\n";
         protectedControl&=held>=65536+32768;
@@ -1260,6 +1297,7 @@ int main(int argc,char** argv)
         RemoveTestRoot(root); return 0;
     }
     testStage="bundle metadata"; BundleMetadata(root);
+    testStage="large bundle metadata shared budget"; LargeBundleMetadataUsesSharedBudget(root);
     testStage="bundle JSON workspace"; BundleJsonWorkspace(root);
     testStage="frame timeline workspace"; FrameTimelineWorkspace(root);
     if(argc==2 && std::string(argv[1])=="--bundle-json-only") {

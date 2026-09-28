@@ -245,7 +245,10 @@ void CleanupPublishedTables(const std::filesystem::path& root,const std::string&
         AnalysisWriterLease lease; std::string error;
         CheckCleanupPath(root,root/"build-state");
         if(!AcquireAnalysisWriterLease(root,lease,error)) return;
-        const json paths=policy ? json::array({"facts","priority","ranking-input"}) : json::array({"ranking-input"});
+        const json paths=policy ?
+            json::array({"facts","priority","ranking-input","context-order",
+                "local-top-input","local-observations","local-signals"}) :
+            json::array({"ranking-input"});
         json record;
         AnalysisWorkspaceReservation control(options.workspace);
         if(std::filesystem::exists(marker)) {
@@ -1724,17 +1727,23 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     policy.frameTimelines = std::move( products.frameTimelines );
     policy.cancelled = options.cancelled;
     const auto frameSeriesPath = products.frameSeriesPath;
-    const uint64_t seriesBudget=32*1024*1024;
+    // The caller already reserves each series and all policy copies against
+    // this shared workspace. A second fixed 32 MiB admission limit rejects
+    // valid long captures before that accounting can decide.
+    const uint64_t seriesBudget=workspace->Snapshot().maximumBytes;
     policy.readFrameSeries = [frameSeriesPath, seriesBudget, identity, cancelled=options.cancelled]( const PolicySignatureContext& context ) {
         return ReadPolicyFrameSeries( frameSeriesPath, context, seriesBudget,
             cancelled, identity );
     };
     const auto generation=NewGeneration(entry->scanRoot/"policy-generations");
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;
-    // Long captures can legitimately contain hundreds of thousands of frame
-    // boundaries. This remains inside the shared 4 GiB workspace contract;
-    // it only lifts the policy subsystem's smaller legacy admission ceiling.
-    policyOptions.frameWorkspaceBytes=512*1024*1024;
+    // Fewer external runs for millions of per-frame Top facts. A smaller
+    // injected workspace retains the original 8 MiB sort admission.
+    policyOptions.sortBufferBytes=std::min<uint64_t>(32ull*1024*1024,
+        std::max<uint64_t>(8ull*1024*1024,workspace->Snapshot().maximumBytes/16));
+    // Admit long capture timelines against the one shared workspace contract;
+    // PrepareLocals still reserves its real copies before allocation.
+    policyOptions.frameWorkspaceBytes=workspace->Snapshot().maximumBytes;
     const auto candidateRoot=entry->scanRoot/"policy-generations"/generation/"policy-cache";
     const auto policyIdentity=BuildCandidatePolicyCache(candidateRoot,neutral,policy,policyOptions);
     ValidateFinalTables(candidateRoot,policyIdentity,true,options);

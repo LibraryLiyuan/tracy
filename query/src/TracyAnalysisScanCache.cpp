@@ -4,6 +4,7 @@
 #include "TracyNeutralStatisticsCache.hpp"
 #include "TracyHash.hpp"
 #include "../../server/TracyTraceFormat.hpp"
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <stdexcept>
@@ -221,6 +222,11 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
     const std::string& identity,const std::string& headerSha,AnalysisCacheTableOptions options,uint64_t metadataBytes)
 {
     Check(options);
+    // The shared workspace is the actual memory contract for managed scans.
+    // Keep a conservative fallback for stand-alone readers without a budget;
+    // an explicit caller cap may only lower either limit.
+    const auto sharedLimit=options.workspace ? options.workspace->Snapshot().maximumBytes : 128ull*1024*1024;
+    const auto metadataLimit=std::min(metadataBytes,sharedLimit);
     AnalysisCacheTableReader header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
     if(header.RecordCount()!=1 || header.Descriptor().contentSha256!=headerSha) Fail("header_identity");
     const auto record=header.GetAt(0);
@@ -244,7 +250,7 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
     for(uint64_t i=0;i<metadata.RecordCount();++i) {
         Check(options); const auto row=metadata.GetAt(i);
         const auto bytes=uint64_t(row.payload.size())*4+512;
-        if(retained>metadataBytes || bytes>metadataBytes-retained) Fail("metadata_budget");
+        if(retained>metadataLimit || bytes>metadataLimit-retained) Fail("metadata_budget");
         products.metadataWorkspace.Add(bytes);
         AnalysisWorkspaceReservation parseWorkspace(options.workspace,65536+32ull*row.payload.size());
         retained+=bytes; const auto v=json::parse(row.payload); const auto type=v.at("type").get<std::string>();
@@ -261,7 +267,7 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
             finishTimeline(); const auto index=products.frameTimelines.size();
             if(v.at("ordinal")!=index || row.key!="timeline"+cache_key::Unsigned(index)+"0") Fail("timeline_order");
             expectedFrames=v.at("frame_count").get<uint64_t>();
-            if(expectedFrames>metadataBytes/(4*sizeof(PolicyFrameEvidence))) Fail("metadata_budget");
+            if(expectedFrames>metadataLimit/(4*sizeof(PolicyFrameEvidence))) Fail("metadata_budget");
             products.frameTimelines.push_back({v.at("frame_scope").get<std::string>(),v.at("name").get<std::string>(),{},
                 v.at("observation_unit").get<std::string>()});
         } else if(type=="frame") {
