@@ -1,6 +1,7 @@
 #include "TracyQueryIndex.hpp"
 #include "../../analysis/TracyBoundedScanCursor.hpp"
 #include "../../analysis/TracyGpuJobManagedScanner.hpp"
+#include "../../analysis/TracyFrameCpuScanner.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -39,6 +40,48 @@ int main( int argc, char** argv )
 {
     try
     {
+        if( argc == 4 && std::string_view( argv[1] ) == "--cpu-prefix" )
+        {
+            const auto target = std::stoull( argv[3] );
+            if( target == 0 || target > 20'000'000 ) throw std::runtime_error( "cpu_prefix_limit" );
+            const auto tracePath = std::filesystem::path( argv[2] );
+            QueryResourceContextOptions options;
+            const auto bytes = std::filesystem::file_size( tracePath );
+            options.expectedFinalDiskLimit = bytes * 4; options.expectedPeakDiskLimit = bytes * 8;
+            auto resources = QueryIndex::CreateResourceContext( tracePath, options );
+            const auto validated = QueryIndex::Validate( tracePath, false, resources );
+            if( !validated.manifest ) throw std::runtime_error( validated.reason );
+            auto source = QueryIndex::Open( *validated.manifest, {}, {}, resources );
+            const auto started = std::chrono::steady_clock::now();
+            uint64_t observed = 0, emitted = 0;
+            CpuFrameScanOptions scan;
+            scan.workspace = resources->Workspace();
+            scan.includeExactSignatures = false; scan.includeLogicalSignatures = true;
+            scan.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+            scan.canonicalizeLogicalDynamicNames = true;
+            scan.includeLogicalThreadRole = true;
+            scan.progress = [&]( uint64_t count, uint64_t runs ) { observed = count; emitted = runs; };
+            scan.cancelled = [&] { return observed >= target || ElapsedMs( started ) > 120000; };
+            scan.definitionSink = []( const CpuSignatureDefinition& ) { return true; };
+            bool stopped = false;
+            try {
+                ExactFrameCpuScanner( *source ).ScanView(
+                    []( const CpuSignatureFrameRunView& ) { return true; }, scan );
+            }
+            catch( const BoundedScanError& error ) {
+                if( std::string( error.what() ).find( "cancelled" ) == std::string::npos ) throw;
+                stopped = true;
+            }
+            const auto snapshot = resources->Snapshot();
+            std::cout << nlohmann::json {
+                { "mode", "cpu_prefix_bounded" }, { "zones", std::to_string( observed ) },
+                { "target", std::to_string( target ) }, { "emitted_runs", std::to_string( emitted ) },
+                { "scan_elapsed_ms", std::to_string( ElapsedMs( started ) ) },
+                { "stopped", stopped }, { "workspace_peak", std::to_string( snapshot.workspace.peakBytes ) },
+                { "disk_current", std::to_string( snapshot.disk.currentBytes ) }
+            }.dump() << '\n';
+            return stopped && observed >= target ? 0 : 2;
+        }
         if( argc == 3 && std::string_view( argv[1] ) == "--memory-summary" )
         {
             const std::filesystem::path tracePath = argv[2];
