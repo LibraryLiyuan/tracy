@@ -1146,13 +1146,15 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             std::vector<const NeutralMergedFrameValues*> ordered;
             ordered.reserve( frames.size() );
             for( const auto& frame : frames ) ordered.push_back( &frame );
-            std::sort( ordered.begin(), ordered.end(), [&]( const auto* left, const auto* right ) {
+            std::partial_sort( ordered.begin(), ordered.begin() + std::min<size_t>( 3, ordered.size() ),
+                ordered.end(), [&]( const auto* left, const auto* right ) {
                 if( value( *left ) != value( *right ) ) return value( *left ) > value( *right );
                 return left->frameIndex < right->frameIndex;
             } );
             for( size_t index = 0; index < std::min<size_t>( 3, ordered.size() ); ++index ) add( *ordered[index] );
             const auto p95 = metric->perCompleteFrame.p95;
-            std::sort( ordered.begin(), ordered.end(), [&]( const auto* left, const auto* right ) {
+            std::partial_sort( ordered.begin(), ordered.begin() + std::min<size_t>( 2, ordered.size() ),
+                ordered.end(), [&]( const auto* left, const auto* right ) {
                 const auto lhs = std::abs( double( value( *left ) ) - p95 );
                 const auto rhs = std::abs( double( value( *right ) ) - p95 );
                 if( lhs != rhs ) return lhs < rhs;
