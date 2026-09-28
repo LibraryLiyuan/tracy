@@ -306,6 +306,30 @@ void ReducedProfileAcceptedAtTraceEntry( const std::filesystem::path& root )
         "query_resource_profile_identity_mismatch" );
 }
 
+void ProfileAccountingRoots( const std::filesystem::path& root )
+{
+    const auto capture = root / "capture";
+    const auto retained = root / "retained";
+    std::filesystem::create_directories( capture );
+    std::filesystem::create_directories( retained );
+    const auto trace = capture / "trace.tracy";
+    std::ofstream( trace, std::ios::binary ).write( "0123456789", 10 );
+    std::ofstream( retained / "failed-run.work", std::ios::binary ).write( std::string( 30, 'x' ).data(), 30 );
+    QueryResourceContextOptions options;
+    options.expectedTraceBytes = 10;
+    options.expectedFinalDiskLimit = 40;
+    options.expectedPeakDiskLimit = 80;
+    options.diagnosticDiskReserveBytes = 0;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+    options.accountingRoots = { retained, retained };
+    auto context = QueryIndex::CreateResourceContext( trace, options );
+    Require( context->Snapshot().disk.currentBytes == 30,
+        "failed analysis roots were omitted or counted twice" );
+    options.accountingRoots = { root.parent_path() };
+    Reject( [&] { QueryIndex::CreateResourceContext( trace, options ); },
+        "query_resource_profile_accounting_root" );
+}
+
 void PhaseBoundaryTelemetry( const std::filesystem::path& root )
 {
     QueryResourceContextOptions options;
@@ -356,6 +380,7 @@ int main( int argc, char** argv )
         ReusedDiskRoots( base / "reused-roots" );
         ReducedProfileDiskLimits( base / "reduced-profile" );
         ReducedProfileAcceptedAtTraceEntry( base / "trace-entry" );
+        ProfileAccountingRoots( base / "accounting-roots" );
         PhaseBoundaryTelemetry( base / "phase-telemetry" );
         std::filesystem::remove_all( base, ignored );
         std::cout << "query resource context tests passed\n";

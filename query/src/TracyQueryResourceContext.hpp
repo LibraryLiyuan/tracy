@@ -26,6 +26,9 @@ struct QueryResourceContextOptions
     uint64_t expectedTraceBytes=0,expectedFinalDiskLimit=0,expectedPeakDiskLimit=0;
     std::string expectedTraceSha256;
     std::vector<std::filesystem::path> derivedRoots;
+    // Previously retained Query artifacts for the same analysis. Read-only
+    // accounting roots are validated against the trace's analysis parent.
+    std::vector<std::filesystem::path> accountingRoots;
     uint64_t privateBytesSoftTarget=16ull*1024*1024*1024;
     uint64_t processCommitHardLimit=32ull*1024*1024*1024;
     uint64_t workspaceMaximumBytes=4ull*1024*1024*1024;

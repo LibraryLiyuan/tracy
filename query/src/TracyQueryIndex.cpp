@@ -40,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -6238,6 +6239,37 @@ std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const st
         throw std::runtime_error("query_resource_profile_identity_mismatch");
     options.traceBytes=actualBytes;
     options.derivedRoots=ExistingDerivedPaths(tracePath);
+    if(!options.accountingRoots.empty())
+    {
+        const auto base=std::filesystem::weakly_canonical(tracePath.parent_path().parent_path());
+        std::set<std::filesystem::path> seen;
+        for(const auto& proposed:options.accountingRoots)
+        {
+            std::error_code ec;
+            if(!proposed.is_absolute() || !std::filesystem::exists(proposed,ec) || ec)
+                throw std::runtime_error("query_resource_profile_accounting_root");
+            const auto canonical=std::filesystem::weakly_canonical(proposed,ec);
+            if(ec) throw std::runtime_error("query_resource_profile_accounting_root");
+            const auto relative=std::filesystem::relative(canonical,base,ec);
+            if(ec || relative.empty() || relative=="." || relative.is_absolute() ||
+                *relative.begin()=="..")
+                throw std::runtime_error("query_resource_profile_accounting_root");
+            auto current=base;
+            for(const auto& part:relative)
+            {
+                current/=part;
+                const auto status=std::filesystem::symlink_status(current,ec);
+                if(ec || std::filesystem::is_symlink(status))
+                    throw std::runtime_error("query_resource_profile_accounting_root");
+#ifdef _WIN32
+                const auto attributes=GetFileAttributesW(analysis::AnalysisIoPath(current).c_str());
+                if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_REPARSE_POINT))
+                    throw std::runtime_error("query_resource_profile_accounting_root");
+#endif
+            }
+            if(seen.insert(canonical).second)options.derivedRoots.push_back(canonical);
+        }
+    }
     if(!options.diagnosticMemoryReserveBytes) options.diagnosticMemoryReserveBytes=64*1024;
     options.diagnosticDiskReserveBytes=std::min<uint64_t>(options.diagnosticDiskReserveBytes,options.traceBytes);
     return std::make_shared<QueryResourceContext>(std::move(options));

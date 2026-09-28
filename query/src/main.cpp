@@ -77,6 +77,15 @@ QueryResourceContextOptions LoadResourceProfile(const std::filesystem::path& pat
     if(profile.contains("workspace_target_bytes")) options.workspaceTargetBytes=profile.at("workspace_target_bytes").get<uint64_t>();
     if(profile.contains("diagnostic_memory_reserve_bytes")) options.diagnosticMemoryReserveBytes=profile.at("diagnostic_memory_reserve_bytes").get<uint64_t>();
     if(profile.contains("diagnostic_disk_reserve_bytes")) options.diagnosticDiskReserveBytes=profile.at("diagnostic_disk_reserve_bytes").get<uint64_t>();
+    if(profile.contains("additional_disk_roots")) {
+        const auto& roots=profile.at("additional_disk_roots");
+        if(!roots.is_array() || roots.size()>16) throw std::runtime_error("query_resource_profile_accounting_root");
+        for(const auto& root:roots) {
+            if(!root.is_string() || root.get<std::string>().empty())
+                throw std::runtime_error("query_resource_profile_accounting_root");
+            options.accountingRoots.emplace_back(root.get<std::string>());
+        }
+    }
     return options;
 }
 
