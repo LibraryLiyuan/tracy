@@ -6149,21 +6149,85 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 else
                 {
                     resources->SetPhase( "index-validate:deep:gpu-derived" );
-                    QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
-                        manifest.sourceFingerprint, storageOptions );
-                    if( !catalog.PreparePointerResolutionFastPath() )
-                        std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap during validation; using paged lookup\n";
                     auto referenceValidationScratch = manifest.gpuReferenceUses.path;
                     referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
                         std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
                     resources->IncludeDiskRoots( { referenceValidationScratch } );
-                    gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
-                        return catalog.ResolveResourcePointer( pointerToken, time );
-                    }, referenceValidationScratch );
+                    {
+                        QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
+                            manifest.sourceFingerprint, storageOptions );
+                        if( !catalog.PreparePointerResolutionFastPath() )
+                            std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap during validation; using paged lookup\n";
+                        gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                            return catalog.ResolveResourcePointer( pointerToken, time );
+                        }, referenceValidationScratch );
+                    }
                     QueryGpuPassResourceStoreReader passResources( manifest.gpuReferenceUses.path,
                         manifest.gpuCatalog.path, manifest.gpuReferenceUses.path,
                         manifest.sourceFingerprint, storageOptions );
-                    passResources.ValidateAll();
+                    {
+                        ReadOnlyZoneSection passes( manifest.gpuReferencePasses,
+                            ZoneSectionKind::GpuReferencePass, sizeof( JnGpuReferencePassData ),
+                            manifest.sourceFingerprint, storageOptions );
+                        ReadOnlyZoneSection links( manifest.gfxLinks, ZoneSectionKind::GfxLink,
+                            sizeof( JnGfxLinkData ), manifest.sourceFingerprint, storageOptions );
+                        QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
+                            manifest.sourceFingerprint, storageOptions );
+                        class MappingSource final : public QueryGpuPassResourceInput
+                        {
+                        public:
+                            MappingSource( const ReadOnlyZoneSection& passes,
+                                const ReadOnlyZoneSection& links, const QueryCatalogStoreReader& catalog )
+                                : m_passes( passes ), m_links( links ), m_catalog( catalog ) {}
+                            uint64_t MappingCount() const override
+                            { return m_passes.Count() + m_links.Count(); }
+                            QueryGpuPassMapping Mapping( uint64_t ordinal ) const override
+                            {
+                                if( ordinal < m_passes.Count() )
+                                {
+                                    const auto row = m_passes.At<JnGpuReferencePassData>( ordinal );
+                                    return { row.passId, row.passId };
+                                }
+                                const auto row = m_links.At<JnGfxLinkData>( ordinal - m_passes.Count() );
+                                return row.relation == uint8_t( JnGfxRelation::ReferencesResources ) ?
+                                    QueryGpuPassMapping { row.targetId, row.sourceId } : QueryGpuPassMapping {};
+                            }
+                            uint64_t RangeCount() const override { return m_catalog.RangeCount(); }
+                            JnGpuRangeSetRecordV1 Range( uint64_t ordinal ) const override
+                            { return m_catalog.RangeAt( ordinal ).record; }
+                            uint64_t UseCount() const override
+                            { throw std::logic_error( "mapping validation does not provide Uses" ); }
+                            QueryGpuReferenceResolvedUseRecord Use( uint64_t ) const override
+                            { throw std::logic_error( "mapping validation does not provide Uses" ); }
+                            uint64_t ResolveCatalogResource( uint64_t, int64_t ) const override
+                            { throw std::logic_error( "mapping validation does not resolve Resources" ); }
+                            uint64_t ResourceAllocation( uint64_t ) const override
+                            { throw std::logic_error( "mapping validation does not provide Allocations" ); }
+                            uint64_t AllocationBytesAtEnd( uint64_t ) const override
+                            { throw std::logic_error( "mapping validation does not provide Allocations" ); }
+                        private:
+                            const ReadOnlyZoneSection& m_passes;
+                            const ReadOnlyZoneSection& m_links;
+                            const QueryCatalogStoreReader& m_catalog;
+                        } input( passes, links, catalog );
+                        auto mappingScratch = manifest.gpuReferenceUses.path;
+                        mappingScratch += ".mapping-validation.tmp." + std::to_string( ProcessId() ) + "." +
+                            std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+                        resources->IncludeDiskRoots( { mappingScratch } );
+                        passResources.ValidateMappingSources( input, mappingScratch,
+                            [&]( std::string_view phase ) {
+                                resources->SetPhase( "index-validate:deep:gpu-mapping:" + std::string( phase ) );
+                            } );
+                    }
+                    auto passScratch = manifest.gpuReferenceUses.path;
+                    passScratch += ".pass-validation.tmp." + std::to_string( ProcessId() ) + "." +
+                        std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+                    resources->IncludeDiskRoots( { passScratch } );
+                    passResources.ValidateRelationsExact( passScratch,
+                        [&]( std::string_view phase ) {
+                            resources->SetPhase( "index-validate:deep:gpu-pass-relations:" +
+                                std::string( phase ) );
+                        } );
                 }
             }
         }

@@ -110,8 +110,18 @@ int main( int argc, char** argv )
         } );
         Require( loaded != phases.rend() && loaded->diskCurrentBytes < 49000,
             "completed CPU/GPU zones remained raw through Worker load" );
-        Require( query::QueryIndex::Validate( input, true ).manifest.has_value(),
+        auto deepResources = query::QueryIndex::CreateResourceContext( input );
+        Require( query::QueryIndex::Validate( input, true, deepResources ).manifest.has_value(),
             "early-packed CPU/GPU zones failed deep index validation" );
+        const auto deepPhases = deepResources->Snapshot().phaseHistory;
+        const auto containsDeepPhase = [&]( std::string_view prefix ) {
+            return std::any_of( deepPhases.begin(), deepPhases.end(), [&]( const auto& value ) {
+                return value.phase.starts_with( prefix );
+            } );
+        };
+        Require( containsDeepPhase( "index-validate:deep:gpu-mapping:" ) &&
+            containsDeepPhase( "index-validate:deep:gpu-pass-relations:" ),
+            "deep validation skipped exact GPU association source checks" );
         std::ifstream manifestInput( manifest.manifestPath );
         const auto json = nlohmann::json::parse( manifestInput );
         manifestInput.close();

@@ -3546,9 +3546,22 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
             throw std::runtime_error( "Catalog resource relation generation count mismatch" );
         if( detailedEvidenceGenerations.Count() != rawDetailedEvidence.Count() )
             throw std::runtime_error( "Catalog detailed evidence generation count mismatch" );
+        struct ExpectedLookupKeys
+        {
+            std::array<analysis::AnalysisUInt64Pair, 3> values {};
+            size_t count = 0;
+            void Add( uint64_t key, uint64_t secondary = 0 )
+            {
+                if( key == 0 ) return;
+                if( count >= values.size() ) throw std::runtime_error( "Catalog expected lookup fanout exceeds three" );
+                values[count++] = { key, secondary };
+            }
+        };
         const auto validateMetadataLookupOrdinal = [&]( analysis::PagedRecordReader& lookup,
             uint64_t rawCount, const auto& readRaw, const auto& matches,
-            std::string_view label, std::string_view scratchName ) {
+            std::string_view label, std::string_view scratchName,
+            const std::function<bool( uint64_t )>& includeOrdinal = {},
+            const std::function<ExpectedLookupKeys( uint64_t )>& expectedKeys = {} ) {
             constexpr size_t Batch = 4096;
             if( std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
                 throw std::runtime_error( "Catalog validation scratch already exists" );
@@ -3633,6 +3646,65 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     throw std::runtime_error( std::string( label ) +
                         " ordinal sort contains trailing data" );
                 input.close();
+                if( includeOrdinal )
+                {
+                    std::ifstream coverage( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+                    if( !coverage ) throw std::runtime_error( std::string( label ) +
+                        " ordinal coverage cannot be opened" );
+                    analysis::AnalysisKeyMetadataRecord next {};
+                    bool haveNext = bool( coverage.read( reinterpret_cast<char*>( &next ), sizeof( next ) ) );
+                    for( uint64_t sourceOrdinal = 0; sourceOrdinal < rawCount; sourceOrdinal++ )
+                    {
+                        if( ( sourceOrdinal & 4095 ) == 0 && m_impl->options.cancelled &&
+                            m_impl->options.cancelled() )
+                            throw std::runtime_error( std::string( label ) + " validation cancelled" );
+                        const bool expected = includeOrdinal( sourceOrdinal );
+                        if( haveNext && next.keyHigh < sourceOrdinal )
+                            throw std::runtime_error( std::string( label ) + " lookup duplicate ordinal" );
+                        const bool present = haveNext && next.keyHigh == sourceOrdinal;
+                        if( present != expected )
+                            throw std::runtime_error( std::string( label ) + " lookup coverage mismatch" );
+                        if( present )
+                        {
+                            haveNext = bool( coverage.read( reinterpret_cast<char*>( &next ), sizeof( next ) ) );
+                            if( haveNext && next.keyHigh == sourceOrdinal )
+                                throw std::runtime_error( std::string( label ) + " lookup duplicate ordinal" );
+                        }
+                    }
+                    if( haveNext || !coverage.eof() )
+                        throw std::runtime_error( std::string( label ) + " lookup coverage trailing data" );
+                }
+                if( expectedKeys )
+                {
+                    std::ifstream coverage( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+                    if( !coverage ) throw std::runtime_error( std::string( label ) +
+                        " key coverage cannot be opened" );
+                    analysis::AnalysisKeyMetadataRecord next {};
+                    bool haveNext = bool( coverage.read( reinterpret_cast<char*>( &next ), sizeof( next ) ) );
+                    for( uint64_t sourceOrdinal = 0; sourceOrdinal < rawCount; sourceOrdinal++ )
+                    {
+                        if( ( sourceOrdinal & 4095 ) == 0 && m_impl->options.cancelled &&
+                            m_impl->options.cancelled() )
+                            throw std::runtime_error( std::string( label ) + " validation cancelled" );
+                        auto keys = expectedKeys( sourceOrdinal );
+                        std::sort( keys.values.begin(), keys.values.begin() + keys.count,
+                            []( const auto& lhs, const auto& rhs ) {
+                                return lhs.key < rhs.key || ( lhs.key == rhs.key && lhs.value < rhs.value );
+                            } );
+                        for( size_t keyIndex = 0; keyIndex < keys.count; keyIndex++ )
+                        {
+                            if( !haveNext || next.keyHigh != sourceOrdinal ||
+                                next.keyLow != keys.values[keyIndex].key ||
+                                next.metadata != keys.values[keyIndex].value )
+                                throw std::runtime_error( std::string( label ) + " lookup coverage mismatch" );
+                            haveNext = bool( coverage.read( reinterpret_cast<char*>( &next ), sizeof( next ) ) );
+                        }
+                        if( haveNext && next.keyHigh == sourceOrdinal )
+                            throw std::runtime_error( std::string( label ) + " lookup duplicate ordinal key" );
+                    }
+                    if( haveNext || !coverage.eof() )
+                        throw std::runtime_error( std::string( label ) + " lookup coverage trailing data" );
+                }
             }
             catch( ... )
             {
@@ -3699,7 +3771,13 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     rawAllocations.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& row, uint64_t key, uint64_t ) {
                     return row.allocationId == key;
-                }, "Catalog allocation", "allocation-lookup" );
+                }, "Catalog allocation", "allocation-lookup", {}, [&]( uint64_t ordinal ) {
+                    JnGpuCatalogAllocationRecordV1 row {};
+                    rawAllocations.Read( ordinal, &row, 1 );
+                    ExpectedLookupKeys keys;
+                    keys.Add( row.allocationId );
+                    return keys;
+                } );
         }
         setPhase( "cross-check:allocation-summary" );
         uint64_t previousAllocationSummary = 0;
@@ -3722,7 +3800,9 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 validateMetadataLookupOrdinal( lookup, rawCount, readRaw,
                     [&]( const auto& raw, uint64_t key, uint64_t ) {
                         return includeRaw( raw ) && keyFor( raw ) == key;
-                    }, label, scratchName );
+                    }, label, scratchName, [&]( uint64_t ordinal ) {
+                        return includeRaw( readRaw( ordinal ) );
+                    } );
                 return;
             }
             analysis::AnalysisKeyMetadataRecord previous {};
@@ -3817,7 +3897,14 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     rawRelations.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t key, uint64_t ) {
                     return CatalogRtasRelationMatchesResource( raw, key );
-                }, "Catalog RTAS relation", "rtas-relation-lookup" );
+                }, "Catalog RTAS relation", "rtas-relation-lookup", {}, [&]( uint64_t ordinal ) {
+                    JnGpuCatalogRelationRecordV1 row {};
+                    rawRelations.Read( ordinal, &row, 1 );
+                    ExpectedLookupKeys keys;
+                    if( CatalogRtasRelationMatchesResource( row, row.sourceId ) )
+                        keys.Add( row.sourceId );
+                    return keys;
+                } );
         }
         if( scratchRoot.empty() )
         {
@@ -3846,7 +3933,17 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     rawRelations.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t key, uint64_t ) {
                     return CatalogRelationMatchesResource( raw, key );
-                }, "Catalog resource relation", "resource-relation-lookup" );
+                }, "Catalog resource relation", "resource-relation-lookup", {}, [&]( uint64_t ordinal ) {
+                    JnGpuCatalogRelationRecordV1 row {};
+                    rawRelations.Read( ordinal, &row, 1 );
+                    ExpectedLookupKeys keys;
+                    if( CatalogRelationMatchesResource( row, row.sourceId ) )
+                        keys.Add( row.sourceId );
+                    if( row.targetId != row.sourceId &&
+                        CatalogRelationMatchesResource( row, row.targetId ) )
+                        keys.Add( row.targetId );
+                    return keys;
+                } );
         }
         if( scratchRoot.empty() )
         {
@@ -3875,7 +3972,21 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     rawDetailedEvidence.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t key, uint64_t ) {
                     return raw.evidenceFrameId == key || raw.frameId == key || raw.sourceId == key;
-                }, "Catalog pass evidence", "pass-evidence-lookup" );
+                }, "Catalog pass evidence", "pass-evidence-lookup", {}, [&]( uint64_t ordinal ) {
+                    JnGpuDetailedEvidenceRecordV1 row {};
+                    rawDetailedEvidence.Read( ordinal, &row, 1 );
+                    ExpectedLookupKeys keys;
+                    const std::array<uint64_t, 3> candidates {
+                        row.evidenceFrameId, row.frameId, row.sourceId };
+                    for( size_t index = 0; index < candidates.size(); index++ )
+                    {
+                        bool duplicate = false;
+                        for( size_t previous = 0; previous < index; previous++ )
+                            duplicate |= candidates[previous] == candidates[index];
+                        if( !duplicate ) keys.Add( candidates[index] );
+                    }
+                    return keys;
+                } );
         }
         analysis::PagedRecordReader rawStrings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
@@ -3907,7 +4018,14 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     rawStrings.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t keyHigh, uint64_t keyLow ) {
                     return raw.generation == keyHigh && raw.header.stringId == keyLow;
-                }, "Catalog string", "string-lookup" );
+                }, "Catalog string", "string-lookup", {}, [&]( uint64_t ordinal ) {
+                    OfflineCatalogString row {};
+                    rawStrings.Read( ordinal, &row, 1 );
+                    ExpectedLookupKeys keys;
+                    if( row.generation != 0 && row.header.stringId != 0 )
+                        keys.Add( row.generation, row.header.stringId );
+                    return keys;
+                } );
         }
     }
 }

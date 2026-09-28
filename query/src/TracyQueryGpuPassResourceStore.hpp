@@ -9,8 +9,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace tracy::query
@@ -101,6 +103,28 @@ struct QueryGpuPassResourceValidationStats
     uint64_t totalMs = 0;
 };
 
+struct QueryGpuPassResourceExactValidationStats
+{
+    uint64_t mappingRows = 0;
+    uint64_t rangeRows = 0;
+    uint64_t useRows = 0;
+    uint64_t mappingSortMs = 0;
+    uint64_t rangeSortMs = 0;
+    uint64_t rangeCompareMs = 0;
+    uint64_t useSortMs = 0;
+    uint64_t useCompareMs = 0;
+    uint64_t totalMs = 0;
+};
+
+struct QueryGpuPassResourceMappingValidationStats
+{
+    uint64_t sourceRows = 0;
+    uint64_t uniqueMappings = 0;
+    uint64_t sortMs = 0;
+    uint64_t compareMs = 0;
+    uint64_t totalMs = 0;
+};
+
 struct QueryGpuPassRangeData
 {
     JnGpuRangeSetRecordV1 record {};
@@ -169,6 +193,12 @@ public:
     QueryGpuPassIdPage EvidencePassIds( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassResourceReadStats ReadStatistics() const;
     QueryGpuPassResourceValidationStats ValidateAll() const;
+    QueryGpuPassResourceExactValidationStats ValidateRelationsExact(
+        const std::filesystem::path& scratchRoot,
+        const std::function<void( std::string_view )>& phase = {} ) const;
+    QueryGpuPassResourceMappingValidationStats ValidateMappingSources(
+        const QueryGpuPassResourceInput& input, const std::filesystem::path& scratchRoot,
+        const std::function<void( std::string_view )>& phase = {} ) const;
 
 private:
     struct Impl;

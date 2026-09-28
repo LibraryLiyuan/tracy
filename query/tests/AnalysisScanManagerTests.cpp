@@ -2038,8 +2038,10 @@ int main(int argc,char** argv)
 
         const auto duplicate = manager.Start( request );
         assert( duplicate.scanId == scanId );
-        std::this_thread::sleep_for( 20ms );
-        assert( executions == 1 );
+        const auto executionDeadline = std::chrono::steady_clock::now() + 2s;
+        while( executions.load() == 0 && std::chrono::steady_clock::now() < executionDeadline )
+            std::this_thread::sleep_for( 2ms );
+        assert( executions.load() == 1 );
 
         const auto cancelAt = std::chrono::steady_clock::now();
         manager.Cancel( scanId );

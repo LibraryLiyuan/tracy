@@ -255,6 +255,10 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-query-gpu-pass-resource-store-tests)
     add_test(NAME tracy-query-gpu-pass-resource-store COMMAND tracy-query-gpu-pass-resource-store-tests)
 
+    add_executable(tracy-query-gpu-association-audit tests/QueryGpuAssociationAudit.cpp)
+    target_link_libraries(tracy-query-gpu-association-audit PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-association-audit)
+
     add_executable(tracy-query-catalog-association-search-tests tests/QueryCatalogAssociationSearchTests.cpp)
     target_link_libraries(tracy-query-catalog-association-search-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-catalog-association-search-tests)

@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <list>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -75,6 +77,72 @@ private:
     uint64_t m_total = 0, m_nextOrdinal = 0;
     std::array<analysis::AnalysisKeyMetadataRecord, 1024> m_buffer;
     size_t m_position = 0, m_available = 0;
+};
+
+// A small, lazily populated fence directory narrows random Pass lookups to one
+// 4096-row span. It is rebuilt from the published table and never changes the
+// on-disk schema or the authoritative record order.
+class PassFenceDirectory
+{
+public:
+    explicit PassFenceDirectory( std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace )
+        : m_memory( std::move( workspace ) ) {}
+
+    template<typename Row, typename Key>
+    uint64_t Bound( analysis::PagedRecordReader& reader, uint64_t passId,
+        bool upper, Key&& key )
+    {
+        std::call_once( m_once, [&] {
+            const auto count = reader.Count();
+            const auto fences = count / Stride + ( count % Stride != 0 );
+            if( fences > SIZE_MAX / sizeof( Fence ) )
+                throw std::runtime_error( "GPU Pass fence directory exceeds address space" );
+            m_memory.Resize( fences * sizeof( Fence ) );
+            try
+            {
+                m_fences.reserve( size_t( fences ) );
+                for( uint64_t ordinal = 0; ordinal < count; ordinal += Stride )
+                {
+                    Row row {};
+                    reader.Read( ordinal, &row, 1 );
+                    m_fences.push_back( { key( row ), ordinal } );
+                }
+                m_memory.Resize( uint64_t( m_fences.capacity() ) * sizeof( Fence ) );
+            }
+            catch( ... )
+            {
+                std::vector<Fence>().swap( m_fences );
+                m_memory.Resize( 0 );
+                throw;
+            }
+        } );
+        const auto fence = upper ?
+            std::upper_bound( m_fences.begin(), m_fences.end(), passId,
+                []( uint64_t value, const Fence& row ) { return value < row.key; } ) :
+            std::lower_bound( m_fences.begin(), m_fences.end(), passId,
+                []( const Fence& row, uint64_t value ) { return row.key < value; } );
+        uint64_t begin = fence == m_fences.begin() ? 0 : std::prev( fence )->ordinal;
+        uint64_t count = ( fence == m_fences.end() ? reader.Count() :
+            std::min<uint64_t>( reader.Count(), fence->ordinal + 1 ) ) - begin;
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            Row row {};
+            reader.Read( middle, &row, 1 );
+            if( key( row ) < passId || ( upper && key( row ) == passId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    }
+
+private:
+    static constexpr uint64_t Stride = 4096;
+    struct Fence { uint64_t key, ordinal; };
+    std::once_flag m_once;
+    analysis::AnalysisWorkspaceReservation m_memory;
+    std::vector<Fence> m_fences;
 };
 
 std::string Identity( std::string_view source, std::string_view kind )
@@ -1178,6 +1246,11 @@ struct QueryGpuPassResourceStoreReader::Impl
             sizeof( analysis::AnalysisKeyMetadataRecord ), options )
         , catalog( std::move( catalogRoot ), source, options )
         , gpuReferences( std::move( gpuReferenceRoot ), std::move( source ), options )
+        , summaryFences( options.workspace )
+        , rangeFences( options.workspace )
+        , useFences( options.workspace )
+        , evidenceFences( options.workspace )
+        , options( std::move( options ) )
     {}
     analysis::PagedRecordReader summaries;
     analysis::PagedRecordReader ranges;
@@ -1185,6 +1258,8 @@ struct QueryGpuPassResourceStoreReader::Impl
     analysis::PagedRecordReader evidence;
     QueryCatalogStoreReader catalog;
     QueryGpuReferenceStoreReader gpuReferences;
+    PassFenceDirectory summaryFences, rangeFences, useFences, evidenceFences;
+    analysis::PagedRecordOptions options;
 };
 
 QueryGpuPassResourceStoreReader::QueryGpuPassResourceStoreReader( std::filesystem::path root,
@@ -1213,16 +1288,10 @@ QueryGpuPassResourceSummary QueryGpuPassResourceStoreReader::SummaryAt( uint64_t
 std::optional<QueryGpuPassResourceSummary> QueryGpuPassResourceStoreReader::Summary( uint64_t passId ) const
 {
     if( passId == 0 ) return std::nullopt;
-    uint64_t first = 0, length = m_impl->summaries.Count();
+    const auto first = m_impl->summaryFences.Bound<QueryGpuPassResourceSummary>(
+        m_impl->summaries, passId, false,
+        []( const QueryGpuPassResourceSummary& value ) { return value.passId; } );
     QueryGpuPassResourceSummary row {};
-    while( length != 0 )
-    {
-        const auto half = length / 2;
-        const auto middle = first + half;
-        m_impl->summaries.Read( middle, &row, 1 );
-        if( row.passId < passId ) { first = middle + 1; length -= half + 1; }
-        else length = half;
-    }
     if( first >= m_impl->summaries.Count() ) return std::nullopt;
     m_impl->summaries.Read( first, &row, 1 );
     return row.passId == passId ? std::optional( row ) : std::nullopt;
@@ -1235,18 +1304,9 @@ QueryGpuPassRangePage QueryGpuPassResourceStoreReader::Ranges(
     if( passId == 0 || limit == 0 ) return result;
     auto& lookup = m_impl->ranges;
     const auto lowerBound = [&]( bool upper ) {
-        uint64_t begin = 0, count = lookup.Count();
-        analysis::AnalysisKeyMetadataRecord row {};
-        while( count != 0 )
-        {
-            const auto half = count / 2;
-            const auto middle = begin + half;
-            lookup.Read( middle, &row, 1 );
-            if( row.keyHigh < passId || ( upper && row.keyHigh == passId ) )
-            { begin = middle + 1; count -= half + 1; }
-            else count = half;
-        }
-        return begin;
+        return m_impl->rangeFences.Bound<analysis::AnalysisKeyMetadataRecord>(
+            lookup, passId, upper,
+            []( const analysis::AnalysisKeyMetadataRecord& value ) { return value.keyHigh; } );
     };
     const auto rangeBegin = lowerBound( false ), rangeEnd = lowerBound( true );
     result.total = rangeEnd - rangeBegin;
@@ -1271,18 +1331,9 @@ QueryGpuPassUsePage QueryGpuPassResourceStoreReader::Uses(
     if( passId == 0 || limit == 0 ) return result;
     auto& lookup = m_impl->uses;
     const auto lowerBound = [&]( bool upper ) {
-        uint64_t begin = 0, count = lookup.Count();
-        analysis::AnalysisKeyMetadataRecord row {};
-        while( count != 0 )
-        {
-            const auto half = count / 2;
-            const auto middle = begin + half;
-            lookup.Read( middle, &row, 1 );
-            if( row.keyHigh < passId || ( upper && row.keyHigh == passId ) )
-            { begin = middle + 1; count -= half + 1; }
-            else count = half;
-        }
-        return begin;
+        return m_impl->useFences.Bound<analysis::AnalysisKeyMetadataRecord>(
+            lookup, passId, upper,
+            []( const analysis::AnalysisKeyMetadataRecord& value ) { return value.keyHigh; } );
     };
     const auto rangeBegin = lowerBound( false ), rangeEnd = lowerBound( true );
     result.total = rangeEnd - rangeBegin;
@@ -1306,18 +1357,9 @@ QueryGpuPassIdPage QueryGpuPassResourceStoreReader::EvidencePassIds(
     if( passId == 0 || limit == 0 ) return result;
     auto& lookup = m_impl->evidence;
     const auto lowerBound = [&]( bool upper ) {
-        uint64_t begin = 0, count = lookup.Count();
-        analysis::AnalysisKeyMetadataRecord row {};
-        while( count != 0 )
-        {
-            const auto half = count / 2;
-            const auto middle = begin + half;
-            lookup.Read( middle, &row, 1 );
-            if( row.keyHigh < passId || ( upper && row.keyHigh == passId ) )
-            { begin = middle + 1; count -= half + 1; }
-            else count = half;
-        }
-        return begin;
+        return m_impl->evidenceFences.Bound<analysis::AnalysisKeyMetadataRecord>(
+            lookup, passId, upper,
+            []( const analysis::AnalysisKeyMetadataRecord& value ) { return value.keyHigh; } );
     };
     const auto rangeBegin = lowerBound( false ), rangeEnd = lowerBound( true );
     result.total = rangeEnd - rangeBegin;
@@ -1366,7 +1408,8 @@ QueryGpuPassResourceValidationStats QueryGpuPassResourceStoreReader::ValidateAll
     const auto checkOrder = []( const analysis::AnalysisKeyMetadataRecord& current,
         const analysis::AnalysisKeyMetadataRecord& previous, uint64_t ordinal, uint64_t rawCount,
         const char* label ) {
-        if( current.keyHigh == 0 || current.metadata >= rawCount ||
+        if( current.keyHigh == 0 || current.keyLow != current.metadata ||
+            current.metadata >= rawCount ||
             ( ordinal != 0 && ( current.keyHigh < previous.keyHigh ||
                 ( current.keyHigh == previous.keyHigh && ( current.keyLow < previous.keyLow ||
                     ( current.keyLow == previous.keyLow && current.metadata < previous.metadata ) ) ) ) ) )
@@ -1433,6 +1476,403 @@ QueryGpuPassResourceValidationStats QueryGpuPassResourceStoreReader::ValidateAll
     result.useDecodedBytes = useAfter.decodedBytes - useBefore.decodedBytes;
     result.evidenceDecodedBytes = evidenceAfter.decodedBytes - evidenceBefore.decodedBytes;
     return result;
+}
+
+QueryGpuPassResourceExactValidationStats QueryGpuPassResourceStoreReader::ValidateRelationsExact(
+    const std::filesystem::path& scratchRoot,
+    const std::function<void( std::string_view )>& phase ) const
+{
+    using Pair = analysis::AnalysisUInt64Pair;
+    using Record = analysis::AnalysisKeyMetadataRecord;
+    if( scratchRoot.empty() ) throw std::invalid_argument( "GPU pass exact validation needs scratch root" );
+    const auto started = std::chrono::steady_clock::now();
+    auto phaseStarted = started;
+    QueryGpuPassResourceExactValidationStats result;
+    const auto finish = [&]( uint64_t QueryGpuPassResourceExactValidationStats::*field ) {
+        const auto now = std::chrono::steady_clock::now();
+        result.*field = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - phaseStarted ).count() );
+        phaseStarted = now;
+    };
+    const auto& options = m_impl->options;
+    const auto cancelled = [&] {
+        if( options.cancelled && options.cancelled() )
+            throw std::runtime_error( "GPU pass exact validation cancelled" );
+    };
+    if( std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
+        throw std::runtime_error( "GPU pass exact validation scratch already exists" );
+    std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
+    const auto cleanup = [&] {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( scratchRoot, options.disk, error, true );
+        if( error ) throw std::runtime_error( "GPU pass exact validation scratch cleanup failed: " +
+            error.message() );
+    };
+    const auto removeFile = [&]( const std::filesystem::path& path ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, options.disk, error );
+        if( error ) throw std::runtime_error( "GPU pass exact validation scratch removal failed: " +
+            error.message() );
+    };
+    try
+    {
+        if( phase ) phase( "structural" );
+        ValidateAll();
+        if( phase ) phase( "mapping-sort" );
+        const auto mappingPath = scratchRoot / "mapping-by-source.work";
+        std::string sortError;
+        if( !analysis::SortAnalysisUInt64PairsGenerated( mappingPath, scratchRoot,
+                "gpu-pass-exact-mapping", analysis::ChooseAnalysisExternalSortBufferRecords(
+                    m_impl->evidence.Count(), sizeof( Pair ), options.workspace ),
+                [&]( const auto& emit ) {
+                    m_impl->evidence.VisitValidated( [&]( const void* data, uint64_t count ) {
+                        const auto* bytes = static_cast<const char*>( data );
+                        for( uint64_t index = 0; index < count; index++ )
+                        {
+                            Record row {};
+                            std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                            emit( Pair { row.keyLow, row.keyHigh } );
+                            result.mappingRows++;
+                        }
+                    } );
+                }, sortError, options.disk, options.workspace, options.cancelled ) )
+            throw std::runtime_error( "GPU pass exact mapping sort failed: " + sortError );
+        if( result.mappingRows != m_impl->evidence.Count() )
+            throw std::runtime_error( "GPU pass exact mapping count mismatch" );
+        finish( &QueryGpuPassResourceExactValidationStats::mappingSortMs );
+        std::ifstream mappingFile( analysis::AnalysisIoPath( mappingPath ), std::ios::binary );
+        if( !mappingFile ) throw std::runtime_error( "GPU pass exact mapping cannot be opened" );
+        const auto mappingBytes = std::filesystem::file_size( analysis::AnalysisIoPath( mappingPath ) );
+        if( mappingBytes != result.mappingRows * sizeof( Pair ) )
+            throw std::runtime_error( "GPU pass exact mapping size mismatch" );
+        analysis::AnalysisWorkspaceReservation mappingIndexMemory( options.workspace );
+        std::vector<Pair> mappingIndex;
+        // Range source ordinals are not Pass ordered. For a modest mapping
+        // table, keep the inverse directory only through the Range comparison;
+        // release it before the large Use sort and pointer fast path.
+        if( mappingBytes <= ( 1ull << 30 ) && result.mappingRows <= SIZE_MAX / sizeof( Pair ) )
+        {
+            mappingIndexMemory.Resize( mappingBytes );
+            mappingIndex.resize( size_t( result.mappingRows ) );
+            mappingIndexMemory.Resize( uint64_t( mappingIndex.capacity() ) * sizeof( Pair ) );
+            mappingFile.read( reinterpret_cast<char*>( mappingIndex.data() ),
+                std::streamsize( mappingBytes ) );
+            if( !mappingFile ) throw std::runtime_error( "GPU pass exact mapping directory read failed" );
+        }
+        const auto readMapping = [&]( uint64_t ordinal ) {
+            if( !mappingIndex.empty() ) return mappingIndex[size_t( ordinal )];
+            Pair row {};
+            mappingFile.clear();
+            mappingFile.seekg( std::streamoff( ordinal * sizeof( Pair ) ) );
+            mappingFile.read( reinterpret_cast<char*>( &row ), sizeof( row ) );
+            if( !mappingFile ) throw std::runtime_error( "GPU pass exact mapping read failed" );
+            return row;
+        };
+        analysis::AnalysisWorkspaceReservation mappingMemory( options.workspace );
+        std::vector<uint64_t> mappedPasses;
+        uint64_t cachedSourcePass = 0;
+        const auto& passesFor = [&]( uint64_t sourcePass ) -> const std::vector<uint64_t>& {
+            if( sourcePass == cachedSourcePass ) return mappedPasses;
+            cancelled();
+            mappedPasses.clear();
+            cachedSourcePass = sourcePass;
+            uint64_t first = 0, length = result.mappingRows;
+            while( length != 0 )
+            {
+                const auto half = length / 2;
+                const auto middle = first + half;
+                if( readMapping( middle ).key < sourcePass )
+                { first = middle + 1; length -= half + 1; }
+                else length = half;
+            }
+            uint64_t previous = 0;
+            while( first < result.mappingRows )
+            {
+                const auto row = readMapping( first++ );
+                if( row.key != sourcePass ) break;
+                if( row.value == 0 || row.value <= previous )
+                    throw std::runtime_error( "GPU pass exact mapping duplicate or zero Pass" );
+                AppendTracked( mappedPasses, mappingMemory, row.value,
+                    "GPU pass exact mapping fanout" );
+                previous = row.value;
+            }
+            return mappedPasses;
+        };
+        const auto checkDetails = [&]( analysis::PagedRecordReader& lookup,
+            uint64_t rawCount, std::string_view kind, const auto& sourcePassFor,
+            const auto& included, const auto& mappedPassesFor,
+            uint64_t QueryGpuPassResourceExactValidationStats::*sortMs,
+            uint64_t QueryGpuPassResourceExactValidationStats::*compareMs ) {
+            const auto sortedPath = scratchRoot / ( std::string( kind ) + "-by-ordinal.work" );
+            if( phase ) phase( kind == "Range" ? "range-sort" : "use-sort" );
+            std::string error;
+            uint64_t emitted = 0;
+            if( !analysis::SortAnalysisUInt64PairsGenerated( sortedPath, scratchRoot,
+                    "gpu-pass-exact-" + std::string( kind ),
+                    analysis::ChooseAnalysisExternalSortBufferRecords( lookup.Count(),
+                        sizeof( Pair ), options.workspace ),
+                    [&]( const auto& emit ) {
+                        lookup.VisitValidated( [&]( const void* data, uint64_t count ) {
+                            const auto* bytes = static_cast<const char*>( data );
+                            for( uint64_t index = 0; index < count; index++ )
+                            {
+                                Record row {};
+                                std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                                emit( Pair { row.metadata, row.keyHigh } );
+                                emitted++;
+                            }
+                        } );
+                    }, error, options.disk, options.workspace, options.cancelled ) )
+                throw std::runtime_error( "GPU pass exact detail sort failed: " + error );
+            if( emitted != lookup.Count() ||
+                std::filesystem::file_size( analysis::AnalysisIoPath( sortedPath ) ) !=
+                    emitted * sizeof( Pair ) )
+                throw std::runtime_error( "GPU pass exact detail sort count mismatch" );
+            finish( sortMs );
+            if( phase ) phase( kind == "Range" ? "range-compare" : "use-compare" );
+            std::ifstream sorted( analysis::AnalysisIoPath( sortedPath ), std::ios::binary );
+            if( !sorted ) throw std::runtime_error( "GPU pass exact sorted detail cannot be opened" );
+            std::array<Pair, 4096> buffer {};
+            size_t position = 0, available = 0;
+            const auto nextPair = [&]( Pair& row ) {
+                if( position == available )
+                {
+                    sorted.read( reinterpret_cast<char*>( buffer.data() ),
+                        std::streamsize( sizeof( buffer ) ) );
+                    const auto bytes = size_t( sorted.gcount() );
+                    if( bytes % sizeof( Pair ) != 0 || ( bytes == 0 && !sorted.eof() ) )
+                        throw std::runtime_error( "GPU pass exact sorted detail read failed" );
+                    position = 0;
+                    available = bytes / sizeof( Pair );
+                    if( available == 0 ) return false;
+                }
+                row = buffer[position++];
+                return true;
+            };
+            Pair actual {};
+            bool haveActual = nextPair( actual );
+            for( uint64_t ordinal = 0; ordinal < rawCount; ordinal++ )
+            {
+                if( ( ordinal & 4095 ) == 0 ) cancelled();
+                if( phase && ( ordinal & ( ( 1ull << 24 ) - 1 ) ) == 0 )
+                    phase( std::string( kind ) + "-compare:" + std::to_string( ordinal ) );
+                const auto sourcePass = sourcePassFor( ordinal );
+                const bool eligible = sourcePass != 0 && included( ordinal );
+                if( haveActual && actual.key < ordinal )
+                    throw std::runtime_error( "GPU pass " + std::string( kind ) +
+                        " exact duplicate source ordinal" );
+                if( !eligible )
+                {
+                    if( haveActual && actual.key == ordinal )
+                        throw std::runtime_error( "GPU pass " + std::string( kind ) +
+                            " exact ineligible source fact" );
+                    continue;
+                }
+                const auto& expected = mappedPassesFor( sourcePass );
+                if( kind == "Range" && !std::binary_search( expected.begin(),
+                        expected.end(), sourcePass ) )
+                    throw std::runtime_error( "GPU pass Range exact direct mapping missing" );
+                for( const auto passId : expected )
+                {
+                    if( !haveActual || actual.key != ordinal || actual.value != passId )
+                        throw std::runtime_error( "GPU pass " + std::string( kind ) +
+                            " exact source mapping mismatch" );
+                    haveActual = nextPair( actual );
+                }
+                if( haveActual && actual.key == ordinal )
+                    throw std::runtime_error( "GPU pass " + std::string( kind ) +
+                        " exact duplicate or unexpected Pass" );
+            }
+            if( haveActual ) throw std::runtime_error( "GPU pass " + std::string( kind ) +
+                " exact trailing source ordinal" );
+            sorted.close();
+            removeFile( sortedPath );
+            finish( compareMs );
+            return emitted;
+        };
+        JnGpuRangeSetRecordV1 currentRange {};
+        result.rangeRows = checkDetails( m_impl->ranges, m_impl->catalog.RangeCount(), "Range",
+            [&]( uint64_t ordinal ) {
+                currentRange = m_impl->catalog.RangeAt( ordinal ).record;
+                return currentRange.passInstanceId;
+            }, [&]( uint64_t ) { return currentRange.resourceId != 0; },
+            passesFor,
+            &QueryGpuPassResourceExactValidationStats::rangeSortMs,
+            &QueryGpuPassResourceExactValidationStats::rangeCompareMs );
+        std::vector<Pair>().swap( mappingIndex );
+        mappingIndexMemory.Resize( 0 );
+        m_impl->catalog.PreparePointerResolutionFastPath();
+        std::ifstream mappingSequence( analysis::AnalysisIoPath( mappingPath ), std::ios::binary );
+        if( !mappingSequence ) throw std::runtime_error( "GPU pass exact mapping sequence cannot be opened" );
+        std::array<Pair, 4096> mappingBuffer {};
+        size_t mappingPosition = 0, mappingAvailable = 0;
+        const auto nextMapping = [&]( Pair& row ) {
+            if( mappingPosition == mappingAvailable )
+            {
+                mappingSequence.read( reinterpret_cast<char*>( mappingBuffer.data() ),
+                    std::streamsize( sizeof( mappingBuffer ) ) );
+                const auto bytes = size_t( mappingSequence.gcount() );
+                if( bytes % sizeof( Pair ) != 0 || ( bytes == 0 && !mappingSequence.eof() ) )
+                    throw std::runtime_error( "GPU pass exact mapping sequence read failed" );
+                mappingPosition = 0;
+                mappingAvailable = bytes / sizeof( Pair );
+                if( mappingAvailable == 0 ) return false;
+            }
+            row = mappingBuffer[mappingPosition++];
+            return true;
+        };
+        Pair nextMapped {};
+        bool haveMapped = nextMapping( nextMapped );
+        analysis::AnalysisWorkspaceReservation sequenceMemory( options.workspace );
+        std::vector<uint64_t> sequencePasses;
+        uint64_t previousSourcePass = 0;
+        const auto& sequentialPassesFor = [&]( uint64_t sourcePass ) -> const std::vector<uint64_t>& {
+            if( sourcePass < previousSourcePass )
+                throw std::runtime_error( "GPU pass exact Use source Pass order mismatch" );
+            if( sourcePass == previousSourcePass ) return sequencePasses;
+            previousSourcePass = sourcePass;
+            sequencePasses.clear();
+            while( haveMapped && nextMapped.key < sourcePass )
+                haveMapped = nextMapping( nextMapped );
+            uint64_t previousQueryPass = 0;
+            while( haveMapped && nextMapped.key == sourcePass )
+            {
+                if( nextMapped.value == 0 || nextMapped.value <= previousQueryPass )
+                    throw std::runtime_error( "GPU pass exact mapping duplicate or zero Pass" );
+                AppendTracked( sequencePasses, sequenceMemory, nextMapped.value,
+                    "GPU pass exact sequential mapping fanout" );
+                previousQueryPass = nextMapped.value;
+                haveMapped = nextMapping( nextMapped );
+            }
+            return sequencePasses;
+        };
+        QueryGpuReferenceResolvedUseRecord currentUse {};
+        result.useRows = checkDetails( m_impl->uses, m_impl->gpuReferences.UseCount(), "Use",
+            [&]( uint64_t ordinal ) {
+                currentUse = m_impl->gpuReferences.UseAt( ordinal );
+                return currentUse.passId;
+            }, [&]( uint64_t ) {
+                return m_impl->catalog.ResolveResourcePointer(
+                    currentUse.resourceId, currentUse.passEnd ) != 0;
+            }, sequentialPassesFor, &QueryGpuPassResourceExactValidationStats::useSortMs,
+            &QueryGpuPassResourceExactValidationStats::useCompareMs );
+        mappingSequence.close();
+        mappingFile.close();
+        if( phase ) phase( "cleanup" );
+        cleanup();
+        result.totalMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started ).count() );
+        return result;
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        cleanup();
+        std::rethrow_exception( failure );
+    }
+}
+
+QueryGpuPassResourceMappingValidationStats QueryGpuPassResourceStoreReader::ValidateMappingSources(
+    const QueryGpuPassResourceInput& input, const std::filesystem::path& scratchRoot,
+    const std::function<void( std::string_view )>& phase ) const
+{
+    using Pair = analysis::AnalysisUInt64Pair;
+    if( scratchRoot.empty() ) throw std::invalid_argument( "GPU pass mapping validation needs scratch root" );
+    const auto started = std::chrono::steady_clock::now();
+    const auto& options = m_impl->options;
+    if( std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
+        throw std::runtime_error( "GPU pass mapping validation scratch already exists" );
+    std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
+    const auto cleanup = [&] {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( scratchRoot, options.disk, error, true );
+        if( error ) throw std::runtime_error( "GPU pass mapping validation scratch cleanup failed: " +
+            error.message() );
+    };
+    QueryGpuPassResourceMappingValidationStats result;
+    try
+    {
+        if( phase ) phase( "mapping-source-sort" );
+        const auto sortedPath = scratchRoot / "mapping-source-sorted.work";
+        std::string sortError;
+        const auto sourceCount = input.MappingCount();
+        const auto rangeCount = input.RangeCount();
+        const auto upperBound = sourceCount > std::numeric_limits<uint64_t>::max() - rangeCount ?
+            std::numeric_limits<uint64_t>::max() : sourceCount + rangeCount;
+        {
+        analysis::AnalysisUInt64PairRunCollector collector( sortedPath, scratchRoot,
+            "gpu-pass-mapping-source", std::min<uint64_t>( 16ull << 20,
+                analysis::ChooseAnalysisExternalSortBufferRecords( upperBound,
+                    sizeof( Pair ), options.workspace ) ), options.disk, options.workspace,
+            options.cancelled );
+        for( uint64_t ordinal = 0; ordinal < sourceCount; ordinal++ )
+        {
+            if( ( ordinal & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                throw std::runtime_error( "GPU pass mapping source validation cancelled" );
+            if( phase && ( ordinal & ( ( 1ull << 24 ) - 1 ) ) == 0 )
+                phase( "mapping-source:" + std::to_string( ordinal ) );
+            const auto row = input.Mapping( ordinal );
+            if( row.evidencePassId == 0 || row.queryPassId == 0 ) continue;
+            collector.Emit( { row.queryPassId, row.evidencePassId } );
+            result.sourceRows++;
+        }
+        for( uint64_t ordinal = 0; ordinal < rangeCount; ordinal++ )
+        {
+            if( ( ordinal & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                throw std::runtime_error( "GPU pass mapping Range validation cancelled" );
+            const auto row = input.Range( ordinal );
+            if( row.passInstanceId == 0 || row.resourceId == 0 ) continue;
+            collector.Emit( { row.passInstanceId, row.passInstanceId } );
+            result.sourceRows++;
+        }
+        if( !collector.Finish( sortError ) )
+            throw std::runtime_error( "GPU pass mapping source sort failed: " + sortError );
+        }
+        result.sortMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started ).count() );
+        if( phase ) phase( "mapping-source-compare" );
+        {
+            std::ifstream expected( analysis::AnalysisIoPath( sortedPath ), std::ios::binary );
+            if( !expected ) throw std::runtime_error( "GPU pass mapping source sort cannot be opened" );
+            SequentialLookup actual( m_impl->evidence );
+            analysis::AnalysisKeyMetadataRecord stored {}, previousStored {};
+            bool haveStored = actual.Next( stored );
+            Pair source {}, previous {};
+            bool havePrevious = false;
+            while( expected.read( reinterpret_cast<char*>( &source ), sizeof( source ) ) )
+            {
+                if( havePrevious && source.key == previous.key && source.value == previous.value )
+                    continue;
+                if( ( result.uniqueMappings & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                    throw std::runtime_error( "GPU pass mapping comparison cancelled" );
+                if( !haveStored || stored.keyHigh != source.key || stored.keyLow != source.value ||
+                    ( result.uniqueMappings != 0 && ( stored.keyHigh < previousStored.keyHigh ||
+                        ( stored.keyHigh == previousStored.keyHigh &&
+                            stored.keyLow <= previousStored.keyLow ) ) ) )
+                    throw std::runtime_error( "GPU pass mapping source identity or coverage mismatch" );
+                previousStored = stored;
+                haveStored = actual.Next( stored );
+                previous = source;
+                havePrevious = true;
+                result.uniqueMappings++;
+            }
+            if( !expected.eof() || haveStored || result.uniqueMappings != m_impl->evidence.Count() )
+                throw std::runtime_error( "GPU pass mapping source trailing or missing mapping" );
+        }
+        result.compareMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started ).count() ) - result.sortMs;
+        if( phase ) phase( "mapping-source-cleanup" );
+        cleanup();
+        result.totalMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started ).count() );
+        return result;
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        cleanup();
+        std::rethrow_exception( failure );
+    }
 }
 
 }

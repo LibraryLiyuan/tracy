@@ -1,6 +1,7 @@
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyHash.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -583,6 +584,150 @@ int main( int argc, char** argv )
             "GPU pass resource scratch was retained" );
         QueryGpuPassResourceStoreReader reader( passRoot, catalogRoot, referenceRoot, identity );
         reader.ValidateAll();
+        reader.ValidateRelationsExact( passRoot / "exact-validation-scratch" );
+        reader.ValidateMappingSources( input, passRoot / "mapping-validation-scratch" );
+        {
+            PassInput missingMapping( catalog, references );
+            missingMapping.mappings.erase( std::remove_if( missingMapping.mappings.begin(),
+                missingMapping.mappings.end(), []( const auto& row ) {
+                    return row.evidencePassId == 20 && row.queryPassId == 1000;
+                } ), missingMapping.mappings.end() );
+            const auto scratch = passRoot / "missing-mapping-validation-scratch";
+            bool rejected = false;
+            try { reader.ValidateMappingSources( missingMapping, scratch ); }
+            catch( const std::exception& error )
+            { rejected = std::string_view( error.what() ).find( "mapping source" ) != std::string_view::npos; }
+            Require( rejected && !fs::exists( scratch ),
+                "GPU pass source mapping omission was accepted" );
+        }
+        {
+            analysis::PagedRecordOptions cancelledOptions;
+            bool cancel = false;
+            cancelledOptions.cancelled = [&] { return cancel; };
+            QueryGpuPassResourceStoreReader cancelled( passRoot, catalogRoot, referenceRoot,
+                identity, cancelledOptions );
+            const auto scratch = passRoot / "exact-cancelled-scratch";
+            bool stopped = false;
+            cancel = true;
+            try { cancelled.ValidateRelationsExact( scratch ); }
+            catch( const std::exception& ) { stopped = true; }
+            Require( stopped && !fs::exists( scratch ),
+                "GPU pass exact validation cancellation kept scratch or succeeded" );
+        }
+        {
+            const auto scratch = passRoot / "exact-disk-refused-scratch";
+            auto usage = std::make_shared<analysis::AnalysisDiskUsage>( std::vector<fs::path>{ scratch } );
+            auto disk = std::make_shared<analysis::AnalysisDiskBudget>();
+            disk->usage = usage; disk->maximumBytes = 1;
+            analysis::PagedRecordOptions refusedOptions;
+            refusedOptions.disk = disk;
+            QueryGpuPassResourceStoreReader refused( passRoot, catalogRoot, referenceRoot,
+                identity, refusedOptions );
+            bool stopped = false;
+            try { refused.ValidateRelationsExact( scratch ); }
+            catch( const std::exception& ) { stopped = true; }
+            Require( stopped && !fs::exists( scratch ) && usage->Snapshot().currentBytes == 0,
+                "GPU pass exact validation disk rejection kept scratch or succeeded" );
+        }
+        const auto passIdentity = [&]( std::string_view kind ) {
+            analysis::Sha256Builder hash;
+            hash.Update( identity.data(), identity.size() );
+            hash.Update( kind.data(), kind.size() );
+            constexpr std::string_view version = "query-gpu-pass-resource-v1";
+            hash.Update( version.data(), version.size() );
+            return hash.FinalHex();
+        };
+        const auto corruptDetail = [&]( std::string_view kind, uint64_t rowOrdinal,
+            uint64_t replacementMetadata, std::string_view expectedError ) {
+            const auto corruptRoot = root / ( "corrupt-" + std::string( kind ) + "-" +
+                std::to_string( rowOrdinal ) );
+            fs::copy( passRoot, corruptRoot, fs::copy_options::recursive );
+            const auto detail = corruptRoot / std::string( kind );
+            const auto replacement = corruptRoot / "replacement";
+            const auto storeIdentity = passIdentity( kind );
+            {
+                analysis::PagedRecordReader original( detail, storeIdentity,
+                    sizeof( analysis::AnalysisKeyMetadataRecord ) );
+                analysis::PagedRecordWriter changed( replacement, storeIdentity,
+                    sizeof( analysis::AnalysisKeyMetadataRecord ) );
+                Require( rowOrdinal < original.Count(), "GPU pass corruption fixture ordinal is absent" );
+                for( uint64_t index = 0; index < original.Count(); index++ )
+                {
+                    analysis::AnalysisKeyMetadataRecord row {};
+                    original.Read( index, &row, 1 );
+                    if( index == rowOrdinal ) row.metadata = row.keyLow = replacementMetadata;
+                    changed.Append( &row, 1 );
+                }
+                changed.Commit();
+            }
+            fs::remove_all( detail );
+            fs::rename( replacement, detail );
+            bool rejected = false;
+            try
+            {
+                QueryGpuPassResourceStoreReader corrupted( corruptRoot, catalogRoot,
+                    referenceRoot, identity );
+                corrupted.ValidateRelationsExact( corruptRoot / "exact-validation-scratch" );
+            }
+            catch( const std::exception& error )
+            { rejected = std::string_view( error.what() ).find( expectedError ) != std::string_view::npos; }
+            Require( rejected, "GPU pass valid-checksum semantic corruption was accepted" );
+            fs::remove_all( corruptRoot );
+        };
+        corruptDetail( "pass-resource-ranges", 0, 2, "Range exact" );
+        corruptDetail( "pass-resource-uses", 0, 1, "Use exact" );
+        {
+            const auto corruptRoot = root / "corrupt-evidence-direct-range";
+            fs::copy( passRoot, corruptRoot, fs::copy_options::recursive );
+            const auto detail = corruptRoot / "pass-resource-evidence-ids";
+            const auto replacement = corruptRoot / "replacement";
+            const auto storeIdentity = passIdentity( "pass-resource-evidence-ids" );
+            {
+                analysis::PagedRecordReader original( detail, storeIdentity,
+                    sizeof( analysis::AnalysisKeyMetadataRecord ) );
+                analysis::PagedRecordWriter changed( replacement, storeIdentity,
+                    sizeof( analysis::AnalysisKeyMetadataRecord ) );
+                for( uint64_t index = 0; index < original.Count(); index++ )
+                {
+                    analysis::AnalysisKeyMetadataRecord row {};
+                    original.Read( index, &row, 1 );
+                    if( index == 0 ) row.keyLow = 20;
+                    changed.Append( &row, 1 );
+                }
+                changed.Commit();
+            }
+            fs::remove_all( detail );
+            fs::rename( replacement, detail );
+            bool rejected = false;
+            try
+            {
+                QueryGpuPassResourceStoreReader corrupted( corruptRoot, catalogRoot,
+                    referenceRoot, identity );
+                corrupted.ValidateRelationsExact( corruptRoot / "exact-validation-scratch" );
+            }
+            catch( const std::exception& error )
+            { rejected = std::string_view( error.what() ).find( "direct mapping missing" ) != std::string_view::npos; }
+            Require( rejected, "GPU pass direct Range mapping corruption was accepted" );
+            fs::remove_all( corruptRoot );
+        }
+        {
+            const auto unresolvedReferenceRoot = root / "unresolved-references";
+            const auto unresolvedPassRoot = root / "unresolved-passes";
+            ReferenceInput unresolved = referenceInput;
+            unresolved.passes.push_back( { 30, 30, 0, 1, 0, 0, 0 } );
+            unresolved.ends.push_back( { 35, 30, 0, 1, 0, 0, 0 } );
+            unresolved.uses.push_back( { 31, 30, 999, 1, 7, 9, 0, 2 } );
+            QueryGpuReferenceStore::Build( unresolvedReferenceRoot, identity, unresolved );
+            QueryGpuReferenceStoreReader unresolvedReferences( unresolvedReferenceRoot, identity );
+            PassInput unresolvedInput( catalog, unresolvedReferences );
+            QueryGpuPassResourceStore::Build( unresolvedPassRoot, identity, unresolvedInput,
+                budgeted, nullptr, QueryGpuPassResourceStore::BuildMode::Fused );
+            QueryGpuPassResourceStoreReader unresolvedReader( unresolvedPassRoot, catalogRoot,
+                unresolvedReferenceRoot, identity, budgeted );
+            unresolvedReader.ValidateRelationsExact( unresolvedPassRoot / "exact-validation-scratch" );
+            Require( !unresolvedReader.Summary( 30 ),
+                "GPU pass unresolved Catalog pointer was silently materialized" );
+        }
         Require( reader.SummaryCount() == 3 && reader.SummaryAt( 0 ).passId == 10 &&
             reader.SummaryAt( 1 ).passId == 20 && reader.SummaryAt( 2 ).passId == 1000,
             "GPU pass summary ordinal scan changed count or order" );

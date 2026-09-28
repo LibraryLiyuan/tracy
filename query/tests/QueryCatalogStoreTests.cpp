@@ -16,6 +16,7 @@
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyPagedRecordStore.hpp"
+#include "TracyHash.hpp"
 
 #if __has_include( "TracyQueryCatalogStore.hpp" )
 #  include "TracyQueryCatalogStore.hpp"
@@ -44,6 +45,35 @@ int main( int argc, char** argv )
         namespace fs = std::filesystem;
         using namespace tracy;
         using namespace tracy::query;
+        if( argc == 6 && std::string_view( argv[1] ) == "--validate-index" )
+        {
+            const fs::path scratch = argv[4];
+            const auto maximumScratch = std::stoull( argv[5] );
+            if( maximumScratch == 0 ) throw std::runtime_error( "Catalog validation scratch limit is zero" );
+            auto usage = std::make_shared<analysis::AnalysisDiskUsage>(
+                std::vector<fs::path> { scratch } );
+            auto disk = std::make_shared<analysis::AnalysisDiskBudget>();
+            disk->usage = usage; disk->maximumBytes = maximumScratch;
+            analysis::PagedRecordOptions options;
+            options.disk = disk;
+            options.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+                4ull << 30, 2ull << 30 );
+            options.readerCacheBytes = 64ull << 20;
+            QueryCatalogStoreReader catalog( fs::path( argv[2] ), argv[3], options );
+            const auto begin = std::chrono::steady_clock::now();
+            catalog.ValidateAll( []( std::string_view phase ) {
+                std::cerr << "catalog_validation_phase=" << phase << '\n';
+            }, scratch );
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - begin ).count();
+            std::cout << nlohmann::json { { "status", "passed" },
+                { "algorithm", "catalog-ordinal-coverage-v1" },
+                { "elapsed_ms", elapsed },
+                { "scratch_peak_bytes", std::to_string( usage->Snapshot().peakBytes ) },
+                { "scratch_remaining_bytes", std::to_string( usage->Snapshot().currentBytes ) },
+                { "workspace_peak_bytes", std::to_string( options.workspace->Snapshot().peakBytes ) } }.dump() << '\n';
+            return 0;
+        }
         if( argc == 5 && std::string_view( argv[1] ) == "--semantic-diagnose" )
         {
             analysis::PagedRecordOptions options;
@@ -937,6 +967,90 @@ int main( int argc, char** argv )
         catch( const std::exception& error ) { budgetRejected = std::string( error.what() ).find( "disk_budget" ) != std::string::npos; }
         Require( budgetRejected && tracy::analysis::AnalysisDiskUsage::Bytes( deniedRoot ) == 0,
             "Catalog store did not reject its first record extent before writing" );
+        // Keep the record count, keys and paged-record checksums valid while
+        // replacing one eligible View ordinal with a duplicate of another.
+        const auto missingViewRoot = root.parent_path() / "tracy-query-catalog-missing-view-ordinal";
+        fs::remove_all( missingViewRoot, ignored );
+        fs::copy( associationRoot, missingViewRoot, fs::copy_options::recursive );
+        analysis::Sha256Builder viewHash;
+        viewHash.Update( identity.data(), identity.size() );
+        constexpr std::string_view viewKind = "resource-view-lookup-v1";
+        viewHash.Update( viewKind.data(), viewKind.size() );
+        constexpr std::string_view catalogVersion = "query-catalog-v1";
+        viewHash.Update( catalogVersion.data(), catalogVersion.size() );
+        const auto viewIdentity = viewHash.FinalHex();
+        const auto viewLookup = missingViewRoot / "resource-view-lookup";
+        const auto replacement = missingViewRoot / "resource-view-lookup-replacement";
+        {
+            analysis::PagedRecordReader original( viewLookup, viewIdentity,
+                sizeof( analysis::AnalysisKeyMetadataRecord ) );
+            analysis::PagedRecordWriter changed( replacement, viewIdentity,
+                sizeof( analysis::AnalysisKeyMetadataRecord ) );
+            Require( original.Count() == 2, "View corruption fixture has unexpected size" );
+            for( uint64_t ordinal = 0; ordinal < original.Count(); ordinal++ )
+            {
+                analysis::AnalysisKeyMetadataRecord row {};
+                original.Read( ordinal, &row, 1 );
+                if( ordinal == 0 ) row.metadata = 1;
+                changed.Append( &row, 1 );
+            }
+            changed.Commit();
+        }
+        fs::remove_all( viewLookup, ignored );
+        fs::rename( replacement, viewLookup );
+        bool rejectedMissingView = false;
+        try
+        {
+            QueryCatalogStoreReader corrupted( missingViewRoot, identity );
+            corrupted.ValidateAll( {}, missingViewRoot / "validation-scratch" );
+        }
+        catch( const std::exception& error )
+        {
+            rejectedMissingView = std::string_view( error.what() ).find(
+                "Catalog view lookup coverage mismatch" ) != std::string_view::npos;
+            if( !rejectedMissingView ) std::cerr << "View corruption diagnostic: " << error.what() << '\n';
+        }
+        Require( rejectedMissingView, "Catalog View omission plus duplicate was accepted" );
+        fs::remove_all( missingViewRoot, ignored );
+        const auto missingEvidenceRoot = root.parent_path() / "tracy-query-catalog-missing-evidence-key";
+        fs::remove_all( missingEvidenceRoot, ignored );
+        fs::copy( associationRoot, missingEvidenceRoot, fs::copy_options::recursive );
+        analysis::Sha256Builder evidenceHash;
+        evidenceHash.Update( identity.data(), identity.size() );
+        constexpr std::string_view evidenceKind = "pass-evidence-lookup-v1";
+        evidenceHash.Update( evidenceKind.data(), evidenceKind.size() );
+        evidenceHash.Update( catalogVersion.data(), catalogVersion.size() );
+        const auto evidenceIdentity = evidenceHash.FinalHex();
+        const auto evidenceLookup = missingEvidenceRoot / "pass-evidence-lookup";
+        const auto evidenceReplacement = missingEvidenceRoot / "replacement";
+        {
+            analysis::PagedRecordReader original( evidenceLookup, evidenceIdentity,
+                sizeof( analysis::AnalysisKeyMetadataRecord ) );
+            analysis::PagedRecordWriter changed( evidenceReplacement, evidenceIdentity,
+                sizeof( analysis::AnalysisKeyMetadataRecord ) );
+            Require( original.Count() == 4, "Evidence corruption fixture has unexpected size" );
+            for( uint64_t ordinal = 0; ordinal < original.Count(); ordinal++ )
+            {
+                analysis::AnalysisKeyMetadataRecord row {};
+                original.Read( ordinal, &row, 1 );
+                if( ordinal == 0 ) row.metadata = 1;
+                changed.Append( &row, 1 );
+            }
+            changed.Commit();
+        }
+        fs::remove_all( evidenceLookup, ignored );
+        fs::rename( evidenceReplacement, evidenceLookup );
+        bool rejectedMissingEvidence = false;
+        try
+        {
+            QueryCatalogStoreReader corrupted( missingEvidenceRoot, identity );
+            corrupted.ValidateAll( {}, missingEvidenceRoot / "validation-scratch" );
+        }
+        catch( const std::exception& error )
+        { rejectedMissingEvidence = std::string_view( error.what() ).find(
+            "Catalog pass evidence lookup coverage mismatch" ) != std::string_view::npos; }
+        Require( rejectedMissingEvidence, "Catalog multi-key Evidence omission plus duplicate was accepted" );
+        fs::remove_all( missingEvidenceRoot, ignored );
         fs::remove_all( root, ignored );
         fs::remove_all( deniedRoot, ignored );
         fs::remove_all( rangeRoot, ignored );
