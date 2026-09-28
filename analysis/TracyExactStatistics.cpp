@@ -628,6 +628,10 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     result.max = int64_t( maximum );
     result.p50 = result.median;
 
+    // Durations are non-negative: if their exact median is zero, the
+    // distribution of absolute deviations has the same zero median.
+    if(result.median==0) {result.mad=0;return result;}
+
     uint64_t medianLow = 0;
     uint64_t medianHigh = 0;
     if( !reader( ( result.count - 1 ) / 2, medianLow ) ||
@@ -829,6 +833,10 @@ try
     result.min = int64_t( minimum );
     result.max = int64_t( maximum );
     result.p50 = result.median;
+
+    if(result.median==0) {
+        result.mad=0;accessor.Close();cleanup();return result;
+    }
 
     uint64_t medianLow = 0;
     uint64_t medianHigh = 0;

@@ -358,6 +358,17 @@ int main( int argc, char** argv )
         if(state.peakBytes>3*values.size()*sizeof(AnalysisUInt64Pair))
         { std::cerr<<"distribution retains redundant unsorted source files; peak="<<state.peakBytes<<std::endl; return 1; }
         assert(state.currentBytes==0 && AnalysisDiskUsage::Bytes(root)==0);
+        {
+            const auto zeroRoot=root/"zero-dominant";
+            auto zeroUsage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{zeroRoot});
+            AnalysisDiskActivity zeroActivity(zeroUsage);
+            auto zeroDisk=std::make_shared<AnalysisDiskBudget>();zeroDisk->usage=zeroUsage;
+            const auto zeroResult=ComputeExactDistributionExternal(values,3*values.size(),zeroRoot,"zero",128,zeroDisk);
+            AssertDistribution(zeroResult,DistributionOracle(values,3*values.size()));
+            if(zeroUsage->Snapshot().peakBytes>2*values.size()*sizeof(AnalysisUInt64Pair))
+            {std::cerr<<"zero median rebuilt an unnecessary deviation sort; peak="<<zeroUsage->Snapshot().peakBytes<<std::endl;return 1;}
+            assert(zeroUsage->Current()==0 && AnalysisDiskUsage::Bytes(zeroRoot)==0);
+        }
         std::filesystem::remove_all(root);
         return 0;
     }
