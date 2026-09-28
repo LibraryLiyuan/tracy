@@ -1,5 +1,7 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyQueryService.hpp"
+#include "TracySessionManager.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -73,12 +75,64 @@ int main( int argc, char** argv )
             "indexed trace changed context-switch sample count" );
         const auto actual = indexed->ScanSampleEvents( range );
         Require( actual.size() == expected.size(), "indexed trace lost sample events" );
+        for( size_t offset = 0; offset < expected.size(); ++offset )
+        {
+            auto ordinalRange = range;
+            ordinalRange.offset = offset; ordinalRange.limit = 1;
+            ordinalRange.startNs = INT64_MAX-1; ordinalRange.endNs = INT64_MAX;
+            const auto row = indexed->ScanSampleEventsRaw( ordinalRange );
+            Require( row.size() == 1 && row[0].ref == expected[offset].ref &&
+                row[0].timeNs == expected[offset].timeNs && row[0].kind == expected[offset].kind &&
+                row[0].callstack == expected[offset].callstack,
+                "sample physical cursor applied filters or changed Main/Context identity" );
+        }
         for( size_t index = 0; index < expected.size(); index++ )
         {
             Require( actual[index].ref == expected[index].ref && actual[index].threadRef == expected[index].threadRef &&
                 actual[index].timeNs == expected[index].timeNs && actual[index].callstack == expected[index].callstack &&
                 actual[index].callstackRef == expected[index].callstackRef && actual[index].kind == expected[index].kind,
                 "indexed sample event changed" );
+        }
+        {
+            using nlohmann::json;
+            tracy::query::SessionManager sessions( { root }, 1,
+                [&]( const fs::path&, tracy::query::SessionManager::StateCallback callback ) {
+                    return tracy::query::QueryIndex::Open( manifest, std::move(callback) );
+                } );
+            tracy::query::QueryService service( sessions );
+            uint64_t requestId=1;
+            const auto call=[&](const char* method,json params) {
+                auto response=service.Execute(json{{"protocol","tracy-query/1"},{"id",requestId++},
+                    {"method",method},{"params",std::move(params)}});
+                if(!response.at("ok").get<bool>()) throw std::runtime_error(response.dump());
+                return response;
+            };
+            const auto traceId=call("trace.open",{{"path",input.string()}}).at("data").at("trace_id").get<std::string>();
+            Require(sessions.WaitReady(traceId,std::chrono::seconds(5)).state==tracy::analysis::TraceSourceState::Ready,
+                "sample pagination integration did not open source");
+            const auto begin=expected.at(expected.size()/2).timeNs;
+            std::vector<std::string> refs;
+            for(const auto& row:expected) if(row.timeNs>=begin && row.timeNs<INT64_MAX) refs.push_back(row.ref);
+            std::vector<std::string> actualRefs; std::string cursor;
+            for(size_t pageIndex=0;;++pageIndex){
+                Require(pageIndex<=expected.size()+1,"sample pagination failed to terminate");
+                json params{{"trace_id",traceId},{"start_ns",std::to_string(begin)},
+                    {"end_ns",std::to_string(INT64_MAX)},{"limit",1}};
+                if(!cursor.empty())params["cursor"]=cursor;
+                const auto response=call("sample.list",params);
+                for(const auto& row:response.at("data").at("samples"))actualRefs.push_back(row.at("ref").get<std::string>());
+                const auto& next=response.at("page").at("next_cursor");
+                if(next.is_null())break;
+                Require(next.get<std::string>()!=cursor,"sample cursor made no progress");cursor=next.get<std::string>();
+            }
+            Require(refs==actualRefs,"time-filtered sample service pagination repeated or omitted facts");
+            const auto graph=call("sample.flamegraph",{{"trace_id",traceId},{"start_ns",std::to_string(begin)},
+                {"end_ns",std::to_string(INT64_MAX)},{"sample_kind","all"},{"top_n",500}});
+            uint64_t graphSamples=0,expectedSamples=0;
+            for(const auto& row:expected) if(row.timeNs>=begin && row.timeNs<INT64_MAX && row.callstack)++expectedSamples;
+            for(const auto& row:graph.at("data").at("paths"))graphSamples+=std::stoull(row.at("samples").get<std::string>());
+            Require(graphSamples==expectedSamples,"raw sample flamegraph changed time/kind filtering");
+            (void)call("trace.close",{{"trace_id",traceId}});
         }
         const auto actualGhostZones = indexed->ScanGhostZones( range );
         const auto actualSymbols = indexed->GetSymbols();

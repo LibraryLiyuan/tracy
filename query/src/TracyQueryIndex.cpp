@@ -2917,6 +2917,14 @@ public:
     std::vector<analysis::SampleDto> ScanSampleEvents( const analysis::ScanRange& range ) const override
     {
         const auto rows = m_samples.Scan( range.startNs, range.endNs, range.offset, range.limit );
+        return ConvertSampleRows( rows );
+    }
+    std::vector<analysis::SampleDto> ScanSampleEventsRaw( const analysis::ScanRange& range ) const override
+    {
+        return ConvertSampleRows( m_samples.ScanOrdinals( range.offset, range.limit ) );
+    }
+    std::vector<analysis::SampleDto> ConvertSampleRows( const std::vector<QuerySampleRow>& rows ) const
+    {
         std::vector<analysis::SampleDto> result;
         result.reserve( rows.size() );
         for( const auto& row : rows )

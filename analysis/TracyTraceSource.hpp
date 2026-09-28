@@ -1229,6 +1229,15 @@ public:
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
+    // Logical Main/Context ordinals, independent of time filtering. Callers
+    // apply predicates after advancing the physical cursor.
+    virtual std::vector<SampleDto> ScanSampleEventsRaw( const ScanRange& range ) const
+    {
+        auto all = range;
+        all.startNs = std::numeric_limits<int64_t>::min();
+        all.endNs = std::numeric_limits<int64_t>::max();
+        return ScanSampleEvents( all );
+    }
     virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
     // Cursor offsets are physical Ghost ordinals. Rows outside the requested

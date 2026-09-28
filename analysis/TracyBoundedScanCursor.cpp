@@ -170,7 +170,14 @@ BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) 
         m_source.ScanJobs( offset, request.limit ); break;
     case BoundedScanDomain::Relation: records = m_source.ScanRelations( offset, request.limit ); break;
     case BoundedScanDomain::Memory: records = m_source.ScanMemoryEvents( RangeFor( cursor, request.limit ) ); break;
-    case BoundedScanDomain::Sample: records = m_source.ScanSampleEvents( RangeFor( cursor, request.limit ) ); break;
+    case BoundedScanDomain::Sample:
+        // The unfiltered native audit enumerates the complete logical view;
+        // filtered callers retain their existing matched-offset contract.
+        records = request.startNs == std::numeric_limits<int64_t>::min() &&
+            request.endNs == std::numeric_limits<int64_t>::max() ?
+            m_source.ScanSampleEventsRaw( RangeFor( cursor, request.limit ) ) :
+            m_source.ScanSampleEvents( RangeFor( cursor, request.limit ) );
+        break;
     case BoundedScanDomain::ContextSwitch: records = m_source.ScanContextSwitchEvents( RangeFor( cursor, request.limit ) ); break;
     case BoundedScanDomain::RuntimeDomain: records = m_source.ScanRuntimeDomainStates( offset, request.limit ); break;
     case BoundedScanDomain::ScriptFrame: records = m_source.ScanScriptFrames( offset, request.limit ); break;

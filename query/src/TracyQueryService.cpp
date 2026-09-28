@@ -721,7 +721,10 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
     bound.erase( "max_cpu_ms" );
     bound.erase( "max_nodes" );
     bound.erase( "max_groups" );
-    page.binding = Hex16( Fnv1a( bound.dump() ) );
+    // Sample v2 raw offsets used to count time-filtered rows. Reject those
+    // opaque cursors instead of interpreting them as logical view ordinals.
+    page.binding = Hex16( Fnv1a( bound.dump() +
+        ( method == "sample.list" ? "\nsample-view-ordinal-v1" : "" ) ) );
     if( params.contains( "cursor" ) )
     {
         if( !params["cursor"].is_string() ) throw QueryError( "INVALID_PARAMS", "cursor must be a string" );
@@ -12690,10 +12693,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const std::string kind = params.value( "kind", "" );
         std::optional<uint32_t> callstack;
         if( params.contains( "callstack" ) ) callstack = parseCallstack( params["callstack"] );
+        const auto time = ScanRangeFrom( params, 0, 1 );
         auto scanPage = ScanFiltered<analysis::SampleDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanSampleEvents( range ); },
+            []( const auto& item, const auto& range ) { return item.ScanSampleEventsRaw( range ); },
             [&]( const auto& sample ) {
-                return ( threadRef.empty() || sample.threadRef == threadRef ) &&
+                return sample.timeNs >= time.startNs && sample.timeNs < time.endNs &&
+                    ( threadRef.empty() || sample.threadRef == threadRef ) &&
                     ( kind.empty() || sample.kind == kind ) && ( !callstack || sample.callstack == *callstack );
             }, SampleJson );
         const auto returned = scanPage.values.size();
@@ -12733,9 +12738,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             checkCancelled();
             const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
             auto range = ScanRangeFrom( params, offset, allowed );
-            const auto samples = source->ScanSampleEvents( range );
+            const auto samples = source->ScanSampleEventsRaw( range );
             BudgetScanned( samples.size(), chunk, allowed );
-            for( const auto& sample : samples ) if( sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
+            for( const auto& sample : samples ) if( sample.timeNs >= range.startNs && sample.timeNs < range.endNs &&
+                sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
             {
                 if( !counts.contains( sample.callstack ) && !BudgetConsumeGroup() ) continue;
                 counts[sample.callstack]++;
@@ -14301,7 +14307,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 checkCancelled();
                 const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
                 analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-                const auto values = source->ScanSampleEvents( range );
+                const auto values = source->ScanSampleEventsRaw( range );
                 BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& value : values )
                 {

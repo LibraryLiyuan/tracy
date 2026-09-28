@@ -29,6 +29,8 @@ public:
     uint64_t Count() const;
     uint64_t MainCount() const;
     uint64_t ContextSwitchCount() const;
+    // Unfiltered logical view position, including Main and derived Context rows.
+    std::vector<QuerySampleRow> ScanOrdinals( uint64_t offset, size_t limit ) const;
     std::vector<QuerySampleRow> Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit,
         std::optional<QuerySampleKind> kind = {} ) const;
     void Visit( const std::function<bool( const QuerySampleRow& )>& visitor ) const;

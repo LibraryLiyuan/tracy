@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace tracy::query
 {
@@ -83,6 +84,7 @@ struct QuerySampleViewReader::Impl
         , raw( root, sourceFingerprint, options )
         , contexts( root / "query-contexts", ViewIdentity( sourceFingerprint, "query-samples-contexts-v1" ), sizeof( uint64_t ), options )
         , spans( root / "query-spans", ViewIdentity( sourceFingerprint, "query-samples-view-spans-v1" ), sizeof( ViewSpan ), options )
+        , cancelled( std::move( options.cancelled ) )
     {
         uint64_t logical = 0;
         uint64_t previousThread = 0;
@@ -93,6 +95,8 @@ struct QuerySampleViewReader::Impl
             spans.Read( index, &span, 1 );
             if( span.logicalFirst != logical || span.mainFirst > raw.Count() || span.mainCount > raw.Count() - span.mainFirst ||
                 span.contextFirst > contexts.Count() || span.contextCount > contexts.Count() - span.contextFirst ||
+                span.mainCount > UINT64_MAX - span.contextCount ||
+                span.mainCount + span.contextCount > UINT64_MAX - logical ||
                 ( !first && span.thread <= previousThread ) )
                 throw std::runtime_error( "sample logical view directory is invalid" );
             logical += span.mainCount + span.contextCount;
@@ -131,6 +135,11 @@ struct QuerySampleViewReader::Impl
     analysis::PagedRecordReader spans;
     uint64_t mainCount = 0;
     uint64_t contextCount = 0;
+    std::function<bool()> cancelled;
+    void CheckCancelled() const
+    {
+        if( cancelled && cancelled() ) throw std::runtime_error( "sample view read cancelled" );
+    }
     std::mutex mutex;
 };
 
@@ -143,6 +152,54 @@ QuerySampleViewReader::~QuerySampleViewReader() = default;
 uint64_t QuerySampleViewReader::Count() const { return m_impl->mainCount + m_impl->contextCount; }
 uint64_t QuerySampleViewReader::MainCount() const { return m_impl->mainCount; }
 uint64_t QuerySampleViewReader::ContextSwitchCount() const { return m_impl->contextCount; }
+
+std::vector<QuerySampleRow> QuerySampleViewReader::ScanOrdinals( uint64_t offset, size_t limit ) const
+{
+    auto& value = *m_impl;
+    std::unique_lock lock( value.mutex, std::defer_lock );
+    while( !lock.try_lock() ) { value.CheckCancelled(); std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) ); }
+    value.CheckCancelled();
+    std::vector<QuerySampleRow> result;
+    if( offset >= Count() || limit == 0 ) return result;
+    if( limit > 65536 ) throw std::runtime_error( "sample ordinal page exceeds bounded scan limit" );
+    const auto take = size_t( std::min<uint64_t>( limit, Count() - offset ) );
+    result.reserve( take );
+    uint64_t first = 0, count = value.spans.Count();
+    ViewSpan span {};
+    while( count )
+    {
+        value.CheckCancelled();
+        const auto half = count / 2;
+        value.spans.Read( first + half, &span, 1 );
+        if( span.logicalFirst + span.mainCount + span.contextCount <= offset )
+        { first += half + 1; count -= half + 1; }
+        else count = half;
+    }
+    for( uint64_t index = first; index < value.spans.Count() && result.size() < take; ++index )
+    {
+        value.CheckCancelled();
+        value.spans.Read( index, &span, 1 );
+        const auto begin = offset > span.logicalFirst ? offset - span.logicalFirst : 0;
+        for( uint64_t rowIndex = begin; rowIndex < span.mainCount + span.contextCount && result.size() < take; ++rowIndex )
+        {
+            value.CheckCancelled();
+            const bool context = rowIndex >= span.mainCount;
+            uint64_t physical = span.mainFirst + rowIndex;
+            if( context )
+            {
+                value.contexts.Read( span.contextFirst + rowIndex - span.mainCount, &physical, 1 );
+                if( physical < span.mainFirst || physical - span.mainFirst >= span.mainCount )
+                    throw std::runtime_error( "sample context points outside its main span" );
+            }
+            auto row = value.raw.ReadPhysical( physical, span.thread,
+                context ? QuerySampleKind::ContextSwitch : QuerySampleKind::Main );
+            row.ordinal = span.logicalFirst + rowIndex;
+            result.emplace_back( std::move( row ) );
+        }
+    }
+    if( result.size() != take ) throw std::runtime_error( "sample ordinal page is incomplete" );
+    return result;
+}
 
 std::vector<QuerySampleRow> QuerySampleViewReader::Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit,
     std::optional<QuerySampleKind> kind ) const
