@@ -215,6 +215,32 @@ void DiskStatistics(const std::filesystem::path& root)
 int main( int argc, char** argv )
 {
     const auto temporary = TemporaryRoot();
+    {
+        constexpr uint64_t Count=1025;
+        for(const uint64_t maximum:{256ull*1024*1024,16ull*1024*1024})
+        {
+            auto workspace=std::make_shared<AnalysisWorkspaceBudget>(maximum,maximum/2);
+            NeutralStatisticsStreamBuilder stream(temporary/("adaptive-"+std::to_string(maximum)),16,1,workspace);
+            uint64_t mergedRecords=0;
+            stream.SetProgress([&](std::string_view stage,uint64_t done,uint64_t total){
+                if(stage.starts_with("neutral_statistics_merge_pass_") && done==total)mergedRecords+=done;
+            });
+            for(uint64_t frame=0;frame<Count;++frame)assert(stream.AddRun(Input("adaptive",frame,1,1)));
+            stream.AddDenominator(Denominator("adaptive",Count));
+            stream.AddDomainAudit({"cpu",true,"complete",Count,Count,1,std::string(64,'a'),std::string(64,'a'),true,{}});
+            NeutralStatisticsStreamSummary result;std::string error;uint64_t signatures=0;
+            const bool ok=stream.FinishToSink(result,error,[&](const auto& value,const auto& frames){
+                ++signatures;assert(frames.size()==Count && value.exclusive.perCompleteFrame.total==Count &&
+                    value.exclusive.perCompleteFrame.median==1);
+            });
+            if(!ok || !result.qualityComplete || signatures!=1){std::cerr<<"Adaptive merge failed: "<<error<<'\n';return 1;}
+            if(maximum>=256ull*1024*1024 && mergedRecords>2*Count)
+            {std::cerr<<"Statistics merge reread an avoidable third pass despite available workspace\n";return 1;}
+            assert(workspace->Snapshot().peakBytes<=maximum);
+        }
+        if(argc>1 && std::string_view(argv[1])=="--adaptive-merge-only")
+        {std::filesystem::remove_all(temporary);return 0;}
+    }
     std::filesystem::create_directories( temporary );
 
     {

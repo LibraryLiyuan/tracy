@@ -1401,18 +1401,29 @@ struct NeutralStatisticsStreamBuilder::Impl
 
     bool Consolidate( const std::function<bool()>& cancelled )
     {
-        constexpr size_t FanIn = 32;
         size_t pass = 0;
         while( runs.size() > 1 )
         {
-            std::vector<std::filesystem::path> next;
-            for( size_t first = 0; first < runs.size(); first += FanIn )
+            // v2 readers have at most a 256 KiB decoded block, a stored block,
+            // decoder state and stream/queue overhead. Keep a conservative
+            // MiB per reader and two MiB for the writer; share the remaining
+            // budget with the live scan instead of assigning another quota.
+            size_t fanIn=128;
+            if(workspace)
             {
-                const auto last = std::min( first + FanIn, runs.size() );
+                const auto budget=workspace->Snapshot();
+                const auto remaining=budget.maximumBytes-budget.currentBytes;
+                const auto readers=remaining>2ull*1024*1024 ? (remaining-2ull*1024*1024)/(1024*1024) : 0;
+                fanIn=size_t(std::clamp<uint64_t>(readers,2,128));
+            }
+            std::vector<std::filesystem::path> next;
+            for( size_t first = 0; first < runs.size(); first += fanIn )
+            {
+                const auto last = std::min( first + fanIn, runs.size() );
                 std::vector<std::filesystem::path> group( runs.begin() + first, runs.begin() + last );
                 const auto output = NextPath( "neutral-merge" );
                 const auto stage = "neutral_statistics_merge_pass_" + std::to_string( pass ) +
-                    "_group_" + std::to_string( first / FanIn );
+                    "_group_" + std::to_string( first / fanIn );
                 if( !MergeGroup( group, output, stage, cancelled ) ) return false;
                 next.push_back( output );
                 for( const auto& path : group ) RemoveQuietly( path,disk );
