@@ -93,6 +93,8 @@ public:
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
+    std::vector<MemoryEventDto> ScanMemoryEventsForSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
 

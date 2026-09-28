@@ -123,6 +123,7 @@ uint64_t RecordBytes( const IoRequestDto& value )
     for( const auto& stage : value.stages ) bytes += 256 + 4 * stage.threadRef.size();
     return bytes;
 }
+uint64_t RecordBytes( const SampleSummaryDto& ) { return sizeof(SampleSummaryDto) * 2; }
 uint64_t RecordBytes( const SampleDto& value )
 { return 1024 + 4 * ( value.ref.size() + value.threadRef.size() + value.kind.size() + TextBytes( value.callstackRef ) ); }
 uint64_t RecordBytes( const ContextSwitchDto& value )
@@ -291,7 +292,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
     MemoryIoSamplingTelemetryScanResult result;
     result.outputWorkspace = AnalysisWorkspaceReservation( workspace, 8192 );
     AnalysisWorkspaceReservation metadataWorkspace( workspace );
-    BoundedTraceScanner scanner( m_source );
+    BoundedTraceScanner scanner( m_source, false, false, !retainDetails, checkCancelled );
     const auto info = m_source.GetTraceInfo();
     checkCancelled();
     metadataWorkspace.Add( 2048 + 4 * ( info.fingerprint.size() + info.captureName.size() +
@@ -673,17 +674,23 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         // Aggregate each bounded page immediately; retaining every SampleDto
         // made Query memory grow linearly with capture duration even though the
         // final result only needs one row per role/kind/callstack key.
-        VisitAll<SampleDto>( scanner, BoundedScanDomain::Sample, m_batchSize,
-            result.maximumBatchObserved, cancelled, workspace, progress, [&]( const SampleDto& sample ) {
+        const auto countSample = [&]( uint32_t callstack ) {
                 result.inputSampleCount++;
                 result.sampling.totalSamples++;
-                if( sample.callstack == 0 ) result.sampling.unresolvedSamples++;
+                if( callstack == 0 ) result.sampling.unresolvedSamples++;
                 else
                 {
-                    if( !callstacks.contains( sample.callstack ) ) samplingWorkspace.Add( 160 );
-                    callstacks[sample.callstack]++;
+                    if( !callstacks.contains( callstack ) ) samplingWorkspace.Add( 160 );
+                    callstacks[callstack]++;
                 }
-                if( !retainDetails ) return;
+        };
+        if( !retainDetails )
+            VisitAll<SampleSummaryDto>( scanner, BoundedScanDomain::Sample, m_batchSize,
+                result.maximumBatchObserved, cancelled, workspace, progress,
+                [&]( const SampleSummaryDto& sample ) { countSample(sample.callstack); } );
+        else VisitAll<SampleDto>( scanner, BoundedScanDomain::Sample, m_batchSize,
+            result.maximumBatchObserved, cancelled, workspace, progress, [&]( const SampleDto& sample ) {
+                countSample(sample.callstack);
                 AnalysisWorkspaceReservation currentKey( workspace, 1024 + 8 * ( sample.threadRef.size() + sample.kind.size() ) );
                 const Key key { role( sample.threadRef ), sample.kind, sample.callstack };
                 if( !aggregate.contains( key ) ) samplingWorkspace.Add( 2048 + 8 * ( key.role.size() + key.kind.size() ) );

@@ -83,6 +83,7 @@ using BoundedScanRecords = std::variant<
     std::vector<RelationDto>,
     std::vector<MemoryEventDto>,
     std::vector<SampleDto>,
+    std::vector<SampleSummaryDto>,
     std::vector<ContextSwitchDto>,
     std::vector<RuntimeDomainStateDto>,
     std::vector<ScriptFrameDto>,
@@ -142,7 +143,8 @@ class BoundedTraceScanner
 {
 public:
     explicit BoundedTraceScanner( const TraceSource& source, bool cpuPolicyProjection = false,
-        bool jobPolicyProjection = false );
+        bool jobPolicyProjection = false, bool systemSummaryProjection = false,
+        std::function<void()> check = {} );
     BoundedScanBatch Read( const BoundedScanRequest& request ) const;
 
 private:
@@ -151,6 +153,8 @@ private:
     const GpuCatalogBoundedScanSource* m_gpu = nullptr;
     bool m_cpuPolicyProjection = false;
     bool m_jobPolicyProjection = false;
+    bool m_systemSummaryProjection = false;
+    std::function<void()> m_check;
 };
 
 const char* BoundedScanDomainName( BoundedScanDomain domain );

@@ -422,6 +422,13 @@ struct CpuContextSwitchDto
     bool complete = true;
 };
 
+struct SampleSummaryDto
+{
+    uint64_t ordinal = 0;
+    int64_t timeNs = 0;
+    uint32_t callstack = 0;
+};
+
 struct SampleDto
 {
     std::string ref;
@@ -989,6 +996,17 @@ public:
     virtual std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const = 0;
     virtual std::vector<FrameDto> ScanFrames( const ScanRange& range ) const = 0;
     virtual std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const = 0;
+    // Whole-domain ordinal projection for capacity/quality consumers. Full
+    // detail implementations remain a compatibility fallback for other sources.
+    virtual std::vector<MemoryEventDto> ScanMemoryEventsForSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const
+    {
+        if( check ) check();
+        ScanRange range; range.offset = offset; range.limit = limit;
+        auto result = ScanMemoryEvents( range );
+        if( check ) check();
+        return result;
+    }
     virtual std::vector<MessageDto> ScanMessages( const ScanRange& range ) const = 0;
     virtual std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const = 0;
 
@@ -1237,6 +1255,17 @@ public:
         all.startNs = std::numeric_limits<int64_t>::min();
         all.endNs = std::numeric_limits<int64_t>::max();
         return ScanSampleEvents( all );
+    }
+    virtual std::vector<SampleSummaryDto> ScanSampleSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const
+    {
+        if( check ) check();
+        ScanRange range; range.offset=offset; range.limit=limit;
+        const auto rows=ScanSampleEventsRaw(range);
+        if( check ) check();
+        std::vector<SampleSummaryDto> result; result.reserve(rows.size());
+        for( size_t i=0; i<rows.size(); ++i ) result.push_back({offset+i,rows[i].timeNs,rows[i].callstack});
+        return result;
     }
     virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }

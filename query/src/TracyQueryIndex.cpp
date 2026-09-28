@@ -2236,6 +2236,8 @@ public:
     TRACY_INDEX_FORWARD0( std::vector<analysis::LockDto>, GetLocks )
     TRACY_INDEX_FORWARD1( std::vector<analysis::FrameDto>, ScanFrames, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<analysis::MemoryEventDto>, ScanMemoryEvents, const analysis::ScanRange&, range )
+    TRACY_INDEX_FORWARD3( std::vector<analysis::MemoryEventDto>, ScanMemoryEventsForSummary,
+        size_t, offset, size_t, limit, const std::function<void()>&, check )
     TRACY_INDEX_FORWARD1( std::vector<analysis::MessageDto>, ScanMessages, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<analysis::PlotPointDto>, ScanPlots, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanLocks, const analysis::ScanRange&, range )
@@ -2922,6 +2924,21 @@ public:
     std::vector<analysis::SampleDto> ScanSampleEventsRaw( const analysis::ScanRange& range ) const override
     {
         return ConvertSampleRows( m_samples.ScanOrdinals( range.offset, range.limit ) );
+    }
+    std::vector<analysis::SampleSummaryDto> ScanSampleSummary( size_t offset, size_t limit,
+        const std::function<void()>& check ) const override
+    {
+        if( check ) check();
+        const auto rows=m_samples.ScanOrdinals(offset,limit);
+        std::vector<analysis::SampleSummaryDto> result; result.reserve(rows.size());
+        for( size_t index=0; index<rows.size(); ++index )
+        {
+            if( check && (index&1023)==0 ) check();
+            const auto& row=rows[index];
+            result.push_back({row.ordinal,row.timeNs,row.callstack});
+        }
+        if( check ) check();
+        return result;
     }
     std::vector<analysis::SampleDto> ConvertSampleRows( const std::vector<QuerySampleRow>& rows ) const
     {

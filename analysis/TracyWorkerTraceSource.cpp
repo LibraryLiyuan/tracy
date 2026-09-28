@@ -3318,6 +3318,49 @@ std::vector<int64_t> WorkerTraceSource::GetContextSwitchStartTimes( uint64_t thr
     return result;
 }
 
+std::vector<MemoryEventDto> WorkerTraceSource::ScanMemoryEventsForSummary( size_t offset, size_t limit,
+    const std::function<void()>& check ) const
+{
+    if( check ) check();
+    if( limit == 0 ) return {};
+    if( limit > NativeBoundedScanMaximumBatch ) throw BoundedScanError( "memory_summary_batch_out_of_range" );
+    std::unique_lock lock( m_impl->readMutex, std::defer_lock );
+    while( !lock.try_lock() ) { if( check ) check(); std::this_thread::sleep_for( std::chrono::milliseconds(1) ); }
+    std::vector<std::pair<uint64_t, const MemData*>> pools;
+    for( const auto& value : m_impl->worker->GetMemNameMap() ) pools.emplace_back( value.first, value.second );
+    std::sort( pools.begin(), pools.end(), [&]( const auto& a, const auto& b ) {
+        return m_impl->memoryPoolIndex.at(a.first) < m_impl->memoryPoolIndex.at(b.first);
+    } );
+    std::vector<MemoryEventDto> result;
+    result.reserve( limit );
+    for( const auto& [poolId, memory] : pools )
+    {
+        if( check ) check();
+        if( offset >= memory->data.size() ) { offset -= memory->data.size(); continue; }
+        const auto poolIndex = m_impl->memoryPoolIndex.at( poolId );
+        const auto poolRef = m_impl->MakeRef( "memory-pool", poolIndex );
+        const auto name = poolId == 0 ? std::string("Default allocator") : Safe(m_impl->worker->GetString(poolId));
+        const bool gpu = IsGpuD3D12PoolName( name );
+        for( size_t index = offset; index < memory->data.size() && result.size() < limit; ++index )
+        {
+            if( check && (index & 255) == 0 ) check();
+            const auto& event = memory->data[index];
+            MemoryEventDto value;
+            value.ref = m_impl->MakeRef( "memory-event", (uint64_t(poolIndex)<<40) | index );
+            value.poolRef = poolRef;
+            value.address = gpu ? std::to_string(event.Ptr()) : Hex(event.Ptr());
+            value.size = event.Size(); value.allocationNs = event.TimeAlloc();
+            if( event.TimeFree() >= 0 ) value.freeNs = event.TimeFree();
+            value.complete = event.TimeFree() >= 0;
+            result.emplace_back( std::move(value) );
+        }
+        if( result.size() == limit ) break;
+        offset = 0;
+    }
+    if( check ) check();
+    return result;
+}
+
 std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( const ScanRange& range ) const
 {
     std::lock_guard lock( m_impl->readMutex );

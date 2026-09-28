@@ -39,6 +39,45 @@ int main( int argc, char** argv )
 {
     try
     {
+        if( argc == 3 && std::string_view( argv[1] ) == "--memory-summary" )
+        {
+            const std::filesystem::path tracePath = argv[2];
+            QueryResourceContextOptions options;
+            const auto bytes=std::filesystem::file_size(tracePath);
+            if(bytes>UINT64_MAX/8) throw std::runtime_error("probe_trace_size");
+            options.expectedFinalDiskLimit=bytes*4; options.expectedPeakDiskLimit=bytes*8;
+            auto resources=QueryIndex::CreateResourceContext(tracePath,options);
+            const auto validated=QueryIndex::Validate(tracePath,false,resources);
+            if(!validated.manifest)throw std::runtime_error(validated.reason);
+            auto source=QueryIndex::Open(*validated.manifest,{},{},resources);
+            const auto total=source->GetTraceInfo().counts.memoryEvents;
+            if(total<32)throw std::runtime_error("memory_probe_needs_32_events");
+            for(uint64_t offset:{uint64_t(0),total/2,total-32})
+            {
+                ScanRange range;range.offset=size_t(offset);range.limit=32;
+                const auto full=source->ScanMemoryEvents(range);
+                const auto at=std::chrono::steady_clock::now();
+                const auto small=source->ScanMemoryEventsForSummary(size_t(offset),32);
+                if(full.size()!=32 || small.size()!=32)throw std::runtime_error("memory_projection_count");
+                for(size_t i=0;i<small.size();++i)
+                {
+                    const auto& a=full[i];const auto& b=small[i];
+                    if(a.ref!=b.ref || a.poolRef!=b.poolRef || a.address!=b.address || a.size!=b.size ||
+                        a.allocationNs!=b.allocationNs || a.freeNs!=b.freeNs || a.complete!=b.complete)
+                        throw std::runtime_error("memory_projection_changed_lifetime_fact");
+                    if(!b.allocationThreadRef.empty() || b.freeThreadRef || b.allocationCallstack || b.freeCallstack ||
+                        b.allocationCallstackRef || b.freeCallstackRef || b.allocationZoneRef || b.freeZoneRef)
+                        throw std::runtime_error("memory_summary_retained_optional_details");
+                }
+                std::cout<<nlohmann::json{{"offset",offset},{"rows",small.size()},
+                    {"elapsed_ms",ElapsedMs(at)},{"facts_equal",true}}.dump()<<std::endl;
+            }
+            bool rejected=false;
+            try{(void)source->ScanMemoryEventsForSummary(0,32,[]{throw std::runtime_error("probe_cancelled");});}
+            catch(const std::runtime_error& e){rejected=std::string_view(e.what())=="probe_cancelled";}
+            if(!rejected)throw std::runtime_error("memory_summary_ignored_cancellation");
+            return 0;
+        }
         if( argc == 4 && ( std::string_view( argv[1] ) == "--gpu" ||
             std::string_view( argv[1] ) == "--job" ) )
         {

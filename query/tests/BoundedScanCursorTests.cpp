@@ -4,6 +4,7 @@
 #include <cassert>
 #include <limits>
 #include <stdexcept>
+#include <iostream>
 
 using namespace tracy::analysis;
 
@@ -204,6 +205,15 @@ void VerifySource( TraceSourceKind kind )
 
 int main()
 {
+    {
+        StrictBoundedSource source(TraceSourceKind::Snapshot);
+        BoundedTraceScanner scanner(source,false,false,true);
+        BoundedScanRequest request;request.domain=BoundedScanDomain::Sample;request.limit=2;
+        const auto page=scanner.Read(request);
+        const auto* rows=std::get_if<std::vector<SampleSummaryDto>>(&page.records);
+        if(!rows || rows->size()!=1 || rows->front().callstack!=1 || rows->front().timeNs!=30 || rows->front().ordinal!=0)
+        { std::cerr<<"System Sample scan still materialized entity DTOs instead of summary facts\n";return 1; }
+    }
     static_assert( NativeBoundedScanSchemaVersion == 1 );
     VerifySource( TraceSourceKind::Snapshot );
     VerifySource( TraceSourceKind::Segment );

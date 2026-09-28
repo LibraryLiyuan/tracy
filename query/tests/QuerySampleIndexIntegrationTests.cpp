@@ -85,6 +85,9 @@ int main( int argc, char** argv )
                 row[0].timeNs == expected[offset].timeNs && row[0].kind == expected[offset].kind &&
                 row[0].callstack == expected[offset].callstack,
                 "sample physical cursor applied filters or changed Main/Context identity" );
+            const auto summary=indexed->ScanSampleSummary(offset,1);
+            Require(summary.size()==1 && summary[0].ordinal==offset && summary[0].timeNs==expected[offset].timeNs &&
+                summary[0].callstack==expected[offset].callstack,"sample numeric summary lost an original fact");
         }
         for( size_t index = 0; index < expected.size(); index++ )
         {
