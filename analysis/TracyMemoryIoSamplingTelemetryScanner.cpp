@@ -227,6 +227,16 @@ struct ProducerSnapshot
     json producer;
 };
 
+struct ProducerWindow
+{
+    // Keep the reservation alive until after both JSON trees have been freed.
+    AnalysisWorkspaceReservation memory;
+    ProducerSnapshot first, last;
+    uint64_t count = 0;
+    uint64_t maximumRecordBytes = 0;
+    explicit ProducerWindow( const std::shared_ptr<AnalysisWorkspaceBudget>& workspace ) : memory(workspace) {}
+};
+
 void AddEvidenceClass( std::vector<TelemetryEvidenceClass>& values, TelemetryEvidenceClass value )
 {
     if( std::find( values.begin(), values.end(), value ) == values.end() ) values.emplace_back( value );
@@ -507,6 +517,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
     }
     if( dynamic_cast<const GpuCatalogBoundedScanSource*>( &m_source ) )
     {
+        {
         AnalysisWorkspaceReservation allocationWorkspace( workspace );
         std::unordered_set<uint64_t> allocationIds;
         struct PhysicalPoint { uint64_t time; uint64_t bytes; bool create; };
@@ -573,6 +584,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         result.gpuMemory.ownedPhysicalBytes = result.gpuMemory.physicalBytes;
         result.gpuMemory.physicalFactsAvailable = true;
         progress.End();
+        } // Allocation identities and sweep points have no remaining consumers.
 
         if( result.gpuMemory.catalogState == GpuCatalogState::Complete )
         {
@@ -791,7 +803,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
     // Producer self-cost is the only cost measurable from one trace. Overall
     // capture overhead is a counterfactual and therefore always requires A/B.
     AnalysisWorkspaceReservation telemetryWorkspace( workspace );
-    std::map<std::pair<uint64_t, std::string>, std::vector<ProducerSnapshot>> producerSnapshots;
+    std::map<std::pair<uint64_t, std::string>, ProducerWindow> producerSnapshots;
     bool invalidProducerRecord = false;
     progress.Begin( "telemetry_read" );
     for( const auto& record : info.appInfo )
@@ -802,7 +814,9 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         result.inputTelemetryRecordCount++;
         // Outside the parse catch: budget rejection must abort, never become
         // a quality warning that permits publication of an incomplete scan.
-        telemetryWorkspace.Add( 8192 + 64 * record.size() );
+        if( record.size() > (UINT64_MAX-8192)/64 ) throw BoundedScanError("telemetry_record_size_overflow");
+        const auto recordBytes = 8192 + 64 * uint64_t(record.size());
+        AnalysisWorkspaceReservation parsingWorkspace( workspace, recordBytes );
         try
         {
             const auto document = json::parse( record.begin() + 5, record.end() );
@@ -813,9 +827,26 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
             if( key.empty() ) continue;
             const auto sequence = document.contains( "snapshot_sequence" ) ?
                 JsonUnsigned( document["snapshot_sequence"] ).value_or( 0 ) : 0;
-            producerSnapshots[{ producerId, key }].push_back( { sequence, producer } );
+            const auto identity = std::make_pair(producerId,key);
+            auto found = producerSnapshots.find(identity);
+            if( found == producerSnapshots.end() )
+            {
+                telemetryWorkspace.Add(1024+8*key.size());
+                found=producerSnapshots.try_emplace(identity,workspace).first;
+            }
+            auto& window=found->second;
+            const auto maximum=std::max(window.maximumRecordBytes,recordBytes);
+            if(maximum>UINT64_MAX/3)throw BoundedScanError("telemetry_window_size_overflow");
+            // Two retained endpoints plus one replacement during copy/swap.
+            // The parsed input document is covered separately above.
+            window.memory.Resize(3*maximum);
+            window.maximumRecordBytes=maximum;
+            if(window.count==0 || sequence<window.first.sequence) window.first={sequence,producer};
+            // Original record ordinal is the deterministic tie-breaker.
+            if(window.count==0 || sequence>=window.last.sequence) window.last={sequence,producer};
+            ++window.count;
         }
-        catch( const std::exception& )
+        catch( const json::exception& )
         {
             invalidProducerRecord = true;
             result.qualityComplete = false;
@@ -829,22 +860,18 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         complete = false;
         return uint64_t( 0 );
     };
-    for( auto& [identity, snapshots] : producerSnapshots )
+    for( auto& [identity, window] : producerSnapshots )
     {
         checkCancelled();
         progress.Advance();
-        std::sort( snapshots.begin(), snapshots.end(), [&]( const auto& lhs, const auto& rhs ) {
-            checkCancelled();
-            return lhs.sequence < rhs.sequence;
-        } );
         result.outputWorkspace.Add( 4096 + 8 * identity.second.size() +
-            ( snapshots.back().producer.contains( "source_mode" ) && snapshots.back().producer["source_mode"].is_string() ?
-                8 * snapshots.back().producer["source_mode"].get_ref<const std::string&>().size() : 0 ) );
+            ( window.last.producer.contains( "source_mode" ) && window.last.producer["source_mode"].is_string() ?
+                8 * window.last.producer["source_mode"].get_ref<const std::string&>().size() : 0 ) );
         TelemetryProducerFact fact;
         fact.producerId = identity.first; fact.key = identity.second;
-        fact.sourceMode = snapshots.back().producer.value( "source_mode", std::string() );
-        const auto& first = snapshots.front().producer;
-        const auto& last = snapshots.back().producer;
+        fact.sourceMode = window.last.producer.value( "source_mode", std::string() );
+        const auto& first = window.first.producer;
+        const auto& last = window.last.producer;
         const bool requested = last.value( "requested", false );
         const bool supported = last.value( "supported", false );
         const bool effective = last.value( "effective", false );
@@ -864,7 +891,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         fact.unresolved = delta( Counter( first, "unresolved" ), Counter( last, "unresolved" ), fact.complete );
         fact.tailTruncated = delta( Counter( first, "tail_truncated" ), Counter( last, "tail_truncated" ), fact.complete );
         fact.degrade = delta( Counter( first, "degrade" ), Counter( last, "degrade" ), fact.complete );
-        if( snapshots.size() < 2 ) fact.complete = false;
+        if( window.count < 2 ) fact.complete = false;
         if( fact.dropped != 0 || fact.overflow != 0 || fact.mismatch != 0 ||
             fact.unresolved != 0 || fact.tailTruncated != 0 || fact.degrade != 0 )
             fact.complete = false;

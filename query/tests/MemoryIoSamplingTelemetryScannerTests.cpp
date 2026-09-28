@@ -137,6 +137,18 @@ public:
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":0,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"0\",\"event_bytes\":\"0\"}}}",
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":1,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"10\",\"emitted\":\"8\",\"dropped\":\"1\",\"filtered\":\"1\",\"sampled_out\":\"0\",\"overflow\":\"1\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"1000\",\"event_bytes\":\"256\"}}}"
         };
+        if( telemetryHistoryCount )
+        {
+            info.appInfo.clear();
+            for(size_t i=0;i<telemetryHistoryCount;++i)
+            {
+                const auto sequence=telemetryHistoryCount-1-i;
+                info.appInfo.push_back("JNQ1|{\"snapshot_sequence\":"+std::to_string(sequence)+
+                    ",\"producer\":{\"id\":1,\"key\":\"test.producer\",\"source_mode\":\"test\","
+                    "\"requested\":true,\"supported\":true,\"effective\":true,\"counters\":{\"emitted\":"+
+                    std::to_string(sequence*2)+",\"cpu_time_ns\":"+std::to_string(sequence*10)+"}}}");
+            }
+        }
         if( wideMetadataAt == "info" ) info.captureName = std::string( 3 * 1024 * 1024, 'x' );
         return info;
     }
@@ -290,6 +302,19 @@ private:
     std::vector<GpuAnalysisResourceSummary> resources;
 public:
     std::vector<GpuAllocationAnalysisRecord> allocations;
+    size_t telemetryHistoryCount=0;
+    void PopulateGpuLifetimes( size_t count )
+    {
+        auto allocation=allocations.front(); auto resource=resources.front();
+        allocations.clear(); resources.clear();
+        for(size_t i=0;i<count;++i)
+        {
+            allocation.allocationId=1000+i; allocation.createTime=10; allocation.destroyTime=20;
+            allocation.lastUpdateTime=10; allocation.parentAllocationId=0; allocation.sizeBytes=100;
+            resource.resourceId=1000+i; resource.allocationId=allocation.allocationId;
+            allocations.push_back(allocation); resources.push_back(resource);
+        }
+    }
 private:
     std::vector<GpuPassWorkingSet> passes;
     std::vector<GpuAnalysisRangeStoreEntry> ranges;
@@ -340,6 +365,31 @@ auto ScanCompact( Scanner& scanner, std::shared_ptr<AnalysisWorkspaceBudget> wor
 
 int main()
 {
+    {
+        MemoryIoSamplingSource source;source.telemetryHistoryCount=200;
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        try {
+            const auto result=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},workspace);
+            if(result.inputTelemetryRecordCount!=200 || result.telemetry.producers.size()!=1 ||
+                result.telemetry.totalEventCount!=398 || result.telemetry.totalCpuTimeNs!=1990 ||
+                !result.telemetry.producerQualityComplete)
+            {std::cerr<<"Telemetry summary changed ordered endpoint counters\n";return 1;}
+        }catch(const std::exception& e){
+            std::cerr<<"Telemetry workspace grew with historical snapshots: "<<e.what()<<'\n';return 1;
+        }
+    }
+    {
+        MemoryIoSamplingSource source; source.PopulateGpuLifetimes(2048);
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(1280*1024,1024*1024);
+        try {
+            const auto result=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},workspace);
+            if(result.inputGpuAllocationCount!=2048 || result.inputGpuResourceCount!=2048 ||
+                result.gpuMemory.physicalBytes!=204800)
+            { std::cerr<<"GPU lifetime release changed exact facts\n";return 1; }
+        }catch(const std::exception& e){
+            std::cerr<<"Finished allocation state overlapped resource scan: "<<e.what()<<'\n';return 1;
+        }
+    }
     {
         MemoryIoSamplingSource source;
         std::map<std::string, uint64_t> completed;
