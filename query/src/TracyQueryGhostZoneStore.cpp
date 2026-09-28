@@ -6,6 +6,7 @@
 #include "TracyQuerySampleStore.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyQueryResourceContext.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cstring>
 #include <cstdio>
@@ -494,6 +495,7 @@ struct QueryGhostZoneStoreReader::Impl
 {
     Impl( std::filesystem::path input, std::string identity, std::filesystem::path globalStrings, analysis::PagedRecordOptions storage )
         : root( std::move( input ) ), source( std::move( identity ) )
+        , workspace( storage.workspace ), cancelled( storage.cancelled )
         , records( root / "records", Identity( source, "query-ghost-zones-v2-global-records" ), sizeof( StoredGhostZone ), storage )
         , strings( std::move(globalStrings), source, QueryDictionaryReadOptions(storage,false) )
     {}
@@ -541,6 +543,8 @@ struct QueryGhostZoneStoreReader::Impl
 
     std::filesystem::path root;
     std::string source;
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace;
+    std::function<bool()> cancelled;
     mutable analysis::PagedRecordReader records;
     mutable QueryStringStoreReader strings;
     mutable std::mutex mutex;
@@ -603,11 +607,67 @@ analysis::PagedRecordReader::ReadStats QueryGhostZoneStoreReader::ReadStatistics
 void QueryGhostZoneStoreReader::ValidateAll()
 {
     std::lock_guard lock( m_impl->mutex );
+    struct Ancestor
+    {
+        uint64_t ordinal;
+        uint64_t thread;
+        int64_t startNs, endNs;
+        uint32_t expectedChildren;
+        uint64_t actualChildren = 0;
+    };
+    analysis::AnalysisWorkspaceReservation hierarchyMemory( m_impl->workspace );
+    std::vector<Ancestor> ancestors;
+    const auto finishAncestor = [&] {
+        if( ancestors.back().actualChildren != ancestors.back().expectedChildren )
+            throw std::runtime_error( "ghost-zone child count mismatch" );
+        ancestors.pop_back();
+    };
     uint64_t ordinal = 0;
     m_impl->records.VisitValidated( [&]( const void* bytes, uint64_t count ) {
         const auto* records = static_cast<const StoredGhostZone*>( bytes );
-        for( uint64_t i = 0; i < count; ++i ) m_impl->CheckRecord( ordinal++, records[i] );
+        for( uint64_t i = 0; i < count; ++i, ++ordinal )
+        {
+            if( ( ordinal & 4095 ) == 0 && m_impl->cancelled && m_impl->cancelled() )
+                throw std::runtime_error( "ghost-zone validation cancelled" );
+            const auto& record = records[i];
+            m_impl->CheckRecord( ordinal, record );
+            if( record.endNs < record.startNs )
+                throw std::runtime_error( "ghost-zone time range invalid" );
+            if( !ancestors.empty() && ancestors.back().thread != record.thread )
+            {
+                const auto previousThread = ancestors.back().thread;
+                while( !ancestors.empty() ) finishAncestor();
+                if( record.thread < previousThread )
+                    throw std::runtime_error( "ghost-zone thread order invalid" );
+            }
+            if( record.depth > ancestors.size() )
+                throw std::runtime_error( "ghost-zone depth missing ancestor" );
+            while( ancestors.size() > record.depth ) finishAncestor();
+            if( record.depth == 0 )
+            {
+                if( record.parent != NoParent )
+                    throw std::runtime_error( "ghost-zone root parent invalid" );
+            }
+            else
+            {
+                auto& parent = ancestors.back();
+                if( record.parent != parent.ordinal || record.thread != parent.thread ||
+                    record.startNs < parent.startNs || record.endNs > parent.endNs )
+                    throw std::runtime_error( "ghost-zone parent hierarchy invalid" );
+                ++parent.actualChildren;
+            }
+            if( ancestors.size() == ancestors.capacity() )
+            {
+                const auto next = std::max<size_t>( 8, ancestors.size() * 2 );
+                hierarchyMemory.Resize( 65536 + ( ancestors.capacity() + next ) * sizeof( Ancestor ) );
+                ancestors.reserve( next );
+                hierarchyMemory.Resize( 65536 + ancestors.capacity() * sizeof( Ancestor ) );
+            }
+            ancestors.push_back( { ordinal, record.thread, record.startNs, record.endNs,
+                record.childCount, 0 } );
+        }
     } );
+    while( !ancestors.empty() ) finishAncestor();
 }
 
 }

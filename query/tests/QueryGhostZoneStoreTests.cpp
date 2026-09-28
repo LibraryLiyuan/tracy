@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -37,6 +38,65 @@ int main( int argc, char** argv )
     using namespace tracy;
     using namespace tracy::analysis;
     using namespace tracy::query;
+
+    if( argc == 7 && std::string( argv[1] ) == "--export-window" )
+    {
+        try
+        {
+            const auto offset = std::stoull( argv[5] );
+            const auto limit = std::stoull( argv[6] );
+            if( limit == 0 || limit > 4000 ) return 2;
+            PagedRecordOptions options;
+            options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+            options.readerCacheBytes = 64ull << 20;
+            QueryGhostZoneStoreReader reader( argv[2], argv[4], argv[3], options );
+            const auto rows = reader.ScanOrdinals( offset, size_t( limit ) );
+            if( rows.size() != limit ) throw std::runtime_error( "Ghost window is short" );
+            for( const auto& row : rows )
+            {
+                nlohmann::json value = {
+                    { "ordinal", std::to_string( row.ordinal ) },
+                    { "thread", std::to_string( row.thread ) },
+                    { "parent", row.parent ? nlohmann::json( std::to_string( *row.parent ) ) : nlohmann::json( nullptr ) },
+                    { "start_ns", std::to_string( row.startNs ) },
+                    { "end_ns", std::to_string( row.endNs ) },
+                    { "name", row.name }, { "file", row.file }, { "line", row.line },
+                    { "address", row.address }, { "depth", row.depth },
+                    { "child_count", row.childCount }, { "inline", row.inlineFrame }
+                };
+                std::cout << value.dump() << '\n';
+            }
+            return 0;
+        }
+        catch( const std::exception& error )
+        { std::cerr << error.what() << '\n'; return 1; }
+    }
+
+    if( argc == 6 && std::string( argv[1] ) == "--validate-existing" )
+    {
+        try
+        {
+            const auto maximumMs = std::stoull( argv[5] );
+            if( maximumMs < 1000 || maximumMs > 300000 ) return 2;
+            const auto began = std::chrono::steady_clock::now();
+            PagedRecordOptions options;
+            options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+            options.readerCacheBytes = 64ull << 20;
+            options.cancelled = [&] {
+                return std::chrono::steady_clock::now() - began >= std::chrono::milliseconds( maximumMs );
+            };
+            QueryGhostZoneStoreReader reader( argv[2], argv[4], argv[3], options );
+            reader.ValidateAll();
+            const auto stats = reader.ReadStatistics();
+            std::cout << "ghost_validation_complete=1 count=" << reader.Count()
+                << " block_loads=" << stats.blockLoads << " decoded_bytes=" << stats.decodedBytes
+                << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - began ).count() << '\n';
+            return 0;
+        }
+        catch( const std::exception& error )
+        { std::cerr << "ghost_validation_complete=0 reason=" << error.what() << '\n'; return 1; }
+    }
 
     if( argc == 7 && std::string( argv[1] ) == "--capacity" )
     {
@@ -297,6 +357,41 @@ int main( int argc, char** argv )
             bool rejectedReference=false;
             try { invalidReader.ValidateAll(); } catch(const std::exception&) { rejectedReference=true; }
             Require(rejectedReference,"deep validation accepted an invalid global name reference");
+        }
+        const auto rejectGhostStructure = [&]( const char* name, std::vector<QueryGhostZoneFact> facts ) {
+            const auto path = root / name;
+            QueryGhostZoneStoreWriter invalid( path, fingerprint, options );
+            invalid.Begin( facts.size() );
+            for( size_t ordinal = 0; ordinal < facts.size(); ++ordinal )
+                invalid.Append( ordinal, facts[ordinal] );
+            invalid.Commit();
+            QueryGhostZoneStoreReader checked( path, fingerprint, root / "strings", options );
+            bool rejected = false;
+            try { checked.ValidateAll(); } catch( const std::exception& ) { rejected = true; }
+            Require( rejected, "deep validation accepted an inconsistent Ghost tree" );
+        };
+        QueryGhostZoneFact rootFact;
+        rootFact.thread = 77; rootFact.startNs = 10; rootFact.endNs = 20;
+        QueryGhostZoneFact childFact = rootFact;
+        childFact.parent = 0; childFact.depth = 1; childFact.startNs = 12; childFact.endNs = 18;
+        {
+            auto broken = rootFact; broken.endNs = 9;
+            rejectGhostStructure( "invalid-time", { broken } );
+        }
+        {
+            auto broken = childFact; broken.depth = 2;
+            rejectGhostStructure( "invalid-depth", { rootFact, broken } );
+        }
+        {
+            auto broken = childFact; broken.thread = 78;
+            rejectGhostStructure( "invalid-thread", { rootFact, broken } );
+        }
+        {
+            rejectGhostStructure( "invalid-child-count", { rootFact, childFact } );
+        }
+        {
+            auto broken = childFact; broken.endNs = 21;
+            rejectGhostStructure( "invalid-parent-time", { rootFact, broken } );
         }
 
         // A long unchanged stack must extend two zones, not rewrite them per sample.
