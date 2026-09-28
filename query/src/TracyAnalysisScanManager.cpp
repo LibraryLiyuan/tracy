@@ -520,7 +520,10 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             throw std::runtime_error("analysis_phase_generation_published");
         const auto statisticsRoot = temporaryRoot / "statistics";
         std::filesystem::create_directories( statisticsRoot );
-        NeutralStatisticsStreamBuilder statistics( statisticsRoot, 65536, 65536, workspace, request.disk );
+        // Fit common frame-scoped distributions in the shared workspace;
+        // the separate 65536-run ingest buffer stays bounded and larger
+        // distributions still spill to disk.
+        NeutralStatisticsStreamBuilder statistics( statisticsRoot, 131072, 65536, workspace, request.disk );
         statistics.SetProgress( [&]( std::string_view stage, uint64_t completed, uint64_t total ) {
             progress( ScanState::Aggregating, completed, total, stage );
             std::cerr << "Query scan-progress stage=" << stage << " completed=" << completed <<
