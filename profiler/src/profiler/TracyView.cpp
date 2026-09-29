@@ -22,6 +22,7 @@
 #include "TracyPrint.hpp"
 #include "TracySourceView.hpp"
 #include "TracyTexture.hpp"
+#include "TracyTimelineItem.hpp"
 #include "TracyView.hpp"
 #include "../server/TracySysUtil.hpp"
 #include "../public/common/TracyStackFrames.hpp"
@@ -110,6 +111,7 @@ View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f
     m_vd.zvEnd = m_worker.GetLastTime();
     m_userData.StateShouldBePreserved();
     m_userData.LoadState( m_vd );
+    m_userData.LoadThreadLayout( m_threadLayout );
     m_userData.LoadAnnotations( m_annotations );
     m_sourceRegexValid = m_userData.LoadSourceSubstitutions( m_sourceSubstitutions );
 
@@ -125,6 +127,11 @@ View::~View()
     m_worker.Shutdown();
 
     m_userData.SaveState( m_vd );
+    if( !m_threadOrder.empty() )
+    {
+        RememberThreadLayoutOrder();
+        m_userData.SaveThreadLayout( m_threadLayout );
+    }
     m_userData.SaveAnnotations( m_annotations );
     m_userData.SaveSourceSubstitutions( m_sourceSubstitutions );
 
@@ -133,6 +140,16 @@ View::~View()
 
     if( m_frameTexture ) FreeTexture( m_frameTexture, m_cbMainThread );
     if( m_playback.texture ) FreeTexture( m_playback.texture, m_cbMainThread );
+}
+
+void View::RememberThreadLayoutOrder()
+{
+    m_threadLayout.threads.clear();
+    m_threadLayout.threads.reserve( m_threadOrder.size() );
+    for( const auto* thread : m_threadOrder )
+    {
+        m_threadLayout.threads.push_back( { thread->id, m_tc.GetItem( thread ).IsVisible() } );
+    }
 }
 
 void View::InitTextEditor()

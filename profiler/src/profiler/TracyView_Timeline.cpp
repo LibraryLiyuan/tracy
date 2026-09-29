@@ -379,8 +379,10 @@ void View::DrawTimeline()
     if( m_vd.drawZones )
     {
         const auto& threadData = m_worker.GetThreadData();
+        bool threadOrderChanged = false;
         if( threadData.size() != m_threadOrder.size() )
         {
+            threadOrderChanged = true;
             m_threadOrder.reserve( threadData.size() );
             // Only new threads are in the end of the worker's ThreadData vector.
             // Threads which get reordered by received thread hints are not new, yet removed from m_threadOrder.
@@ -391,14 +393,27 @@ void View::DrawTimeline()
             for( size_t i = 0; i < numReinsert + numNew; i++ )
             {
                 const ThreadData *td = i < numReinsert ? m_threadReinsert[i] : threadData[m_threadOrder.size()];
-                auto it = std::find_if( m_threadOrder.begin(), m_threadOrder.end(), [td]( const auto t ) { return td->groupHint < t->groupHint; } );
-                m_threadOrder.insert( it, td );
+                m_threadOrder.push_back( td );
             }
             m_threadReinsert.clear();
+        }
+        if( threadOrderChanged || !m_threadLayout.customOrder )
+        {
+            SortThreadLayout( m_threadOrder.begin(), m_threadOrder.end(), m_threadLayout,
+                [this]( const ThreadData* thread ) { return m_worker.GetThreadName( thread->id ); },
+                []( const ThreadData* thread ) { return thread->id; },
+                []( const ThreadData* thread ) { return thread->groupHint; } );
         }
         for( const auto& v : m_threadOrder )
         {
             m_tc.AddItem<TimelineItemThread>( v );
+            if( std::find( m_threadVisibilityApplied.begin(), m_threadVisibilityApplied.end(), v->id ) == m_threadVisibilityApplied.end() )
+            {
+                const auto saved = std::find_if( m_threadLayout.threads.begin(), m_threadLayout.threads.end(),
+                    [v]( const auto& thread ) { return thread.id == v->id; } );
+                if( saved != m_threadLayout.threads.end() ) m_tc.GetItem( v ).SetVisible( saved->visible );
+                m_threadVisibilityApplied.push_back( v->id );
+            }
         }
     }
     if( m_vd.drawPlots )

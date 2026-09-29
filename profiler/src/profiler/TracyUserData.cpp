@@ -21,6 +21,7 @@ constexpr auto FileTimeline = "timeline";
 constexpr auto FileOptions = "options";
 constexpr auto FileAnnotations = "annotations";
 constexpr auto FileSourceSubstitutions = "srcsub";
+constexpr auto FileThreadLayout = "thread-layout";
 
 enum : uint32_t { VersionTimeline = 0 };
 enum : uint32_t { VersionOptions = 7 };
@@ -208,6 +209,25 @@ void UserData::SaveState( const ViewData& data )
 void UserData::StateShouldBePreserved()
 {
     m_preserveState = true;
+}
+
+void UserData::LoadThreadLayout( ThreadLayoutState& data )
+{
+    assert( Valid() );
+    FILE* f = OpenFile( FileThreadLayout, false );
+    if( !f ) return;
+    ReadThreadLayout( f, data );
+    fclose( f );
+}
+
+void UserData::SaveThreadLayout( const ThreadLayoutState& data )
+{
+    if( !m_preserveState ) return;
+    assert( Valid() );
+    FILE* f = OpenFile( FileThreadLayout, true );
+    if( !f ) return;
+    WriteThreadLayout( f, data );
+    fclose( f );
 }
 
 void UserData::LoadAnnotations( std::vector<std::unique_ptr<Annotation>>& data )

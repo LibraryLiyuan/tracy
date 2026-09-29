@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "TracyThreadLayout.hpp"
+
 namespace tracy
 {
 
@@ -28,6 +30,8 @@ public:
 
     void LoadState( ViewData& data );
     void SaveState( const ViewData& data );
+    void LoadThreadLayout( ThreadLayoutState& data );
+    void SaveThreadLayout( const ThreadLayoutState& data );
     void StateShouldBePreserved();
 
     void LoadAnnotations( std::vector<std::unique_ptr<Annotation>>& data );

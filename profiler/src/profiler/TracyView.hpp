@@ -617,6 +617,10 @@ private:
     Vector<const ThreadData*> m_threadOrder;
     Vector<const ThreadData*> m_threadReinsert;
     Vector<float> m_threadDnd;
+    ThreadLayoutState m_threadLayout;
+    std::vector<uint64_t> m_threadVisibilityApplied;
+
+    void RememberThreadLayoutOrder();
 
     tracy_force_inline bool& VisibleMsgThread( uint64_t thread )
     {

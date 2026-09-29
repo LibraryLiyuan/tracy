@@ -698,17 +698,31 @@ void View::DrawOptions()
             }
         }
         ImGui::SameLine();
-        if( ImGui::SmallButton( "Sort" ) )
+        if( ImGui::SmallButton( "Sort by name" ) )
         {
             pdqsort_branchless( m_threadOrder.begin(), m_threadOrder.end(), [this] ( const auto& lhs, const auto& rhs ) {
                 if( lhs->groupHint != rhs->groupHint ) return lhs->groupHint < rhs->groupHint;
                 return strcmp( m_worker.GetThreadName( lhs->id ), m_worker.GetThreadName( rhs->id ) ) < 0;
             } );
+            m_threadLayout.customOrder = true;
+            RememberThreadLayoutOrder();
         }
+        ImGui::SameLine();
+        if( ImGui::SmallButton( "Default order" ) )
+        {
+            m_threadLayout.customOrder = false;
+            SortThreadLayout( m_threadOrder.begin(), m_threadOrder.end(), m_threadLayout,
+                [this]( const ThreadData* thread ) { return m_worker.GetThreadName( thread->id ); },
+                []( const ThreadData* thread ) { return thread->id; },
+                []( const ThreadData* thread ) { return thread->groupHint; } );
+        }
+        ImGui::TextDisabled( "Default: Main Thread, Render Thread, Job Worker, other. Drag or right-click to reorder." );
 
         const auto wposx = ImGui::GetCursorScreenPos().x;
         m_threadDnd.clear();
         int idx = 0;
+        int moveSource = -1;
+        int moveTarget = -1;
         for( const auto& t : m_threadOrder )
         {
             m_threadDnd.push_back( ImGui::GetCursorScreenPos().y );
@@ -718,6 +732,17 @@ void View::DrawOptions()
             SmallColorBox( threadColor );
             ImGui::SameLine();
             m_tc.GetItem( t ).VisibilityCheckbox();
+            if( ImGui::BeginPopupContextItem( "threadOrderMenu" ) )
+            {
+                if( ImGui::MenuItem( "Move to top", nullptr, false, idx > 0 ) ) { moveSource = idx; moveTarget = 0; }
+                if( ImGui::MenuItem( "Move up", nullptr, false, idx > 0 ) ) { moveSource = idx; moveTarget = idx - 1; }
+                if( ImGui::MenuItem( "Move down", nullptr, false, idx + 1 < (int)m_threadOrder.size() ) ) { moveSource = idx; moveTarget = idx + 1; }
+                if( ImGui::MenuItem( "Move to bottom", nullptr, false, idx + 1 < (int)m_threadOrder.size() ) ) { moveSource = idx; moveTarget = int( m_threadOrder.size() ) - 1; }
+                ImGui::Separator();
+                if( ImGui::MenuItem( m_tc.GetItem( t ).IsVisible() ? "Hide thread" : "Show thread" ) )
+                    m_tc.GetItem( t ).SetVisible( !m_tc.GetItem( t ).IsVisible() );
+                ImGui::EndPopup();
+            }
             if( ImGui::BeginDragDropSource( ImGuiDragDropFlags_SourceNoHoldToOpenOthers ) )
             {
                 ImGui::SetDragDropPayload( "ThreadOrder", &idx, sizeof(int) );
@@ -759,6 +784,14 @@ void View::DrawOptions()
             ImGui::TextDisabled( "%s top level zones", RealToString( t->timeline.size() ) );
             idx++;
         }
+        if( moveSource >= 0 )
+        {
+            const auto thread = m_threadOrder[moveSource];
+            m_threadOrder.erase( m_threadOrder.begin() + moveSource );
+            m_threadOrder.insert( m_threadOrder.begin() + moveTarget, thread );
+            m_threadLayout.customOrder = true;
+            RememberThreadLayoutOrder();
+        }
         if( m_threadDnd.size() > 1 )
         {
             const auto w = ImGui::GetContentRegionAvail().x;
@@ -797,6 +830,8 @@ void View::DrawOptions()
                     m_threadOrder.insert( m_threadOrder.begin() + target, srcval );
                     m_threadOrder.erase( m_threadOrder.begin() + source );
                 }
+                m_threadLayout.customOrder = true;
+                RememberThreadLayoutOrder();
             }
         }
         ImGui::TreePop();
