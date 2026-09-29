@@ -1,5 +1,7 @@
 # Query 长数据改造：存储基础检查点
 
+> 2026-09-29：原本地dev合并已按用户要求撤回；dev回到`b840ae76`且Git状态为空。Query继续留在`feature/JNTracy-GpuCatalog-DiskIndex`，完成剩余工作后再合入dev。下方“已合并”属于历史时点，当前状态以本条和[交接文档](Query-LongData-Task-Closure-20260929.zh-CN.md)为准。
+
 > 2026-09-29：用户决定收尾当前批次并合并到dev，性能优化转新对话。R14冷建与R19 Scan/热验收已有通过证据，但大文件恢复、Ghost全量MCP分页、全根目录历史峰值和GPU Frame支持等边界仍明确保留。当前交付与后续事项见[收尾交接](Query-LongData-Task-Closure-20260929.zh-CN.md)和[独立核对数据](Query-LongData-R19-Audit-20260929.json)。下方为历史实施记录。
 
 ## 2026-09-18：修订计划 P0 完成，进入 P1

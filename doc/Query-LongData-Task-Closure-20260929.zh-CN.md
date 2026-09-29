@@ -1,6 +1,6 @@
 # Query 长数据任务收尾与后续交接
 
-日期：2026-09-29。用户决定结束当前实施批次，合并到本地 `dev`；性能优化在新的对话继续。合并不意味着原始全部验收要求均已完成。
+日期：2026-09-29。用户随后决定撤回本地dev合并，让Query在功能分支继续完成，再一次性合入dev。当前本地`dev`已退回`b840ae76`且Git状态为空；此文记录原批次成果和当时合并验证，不能作为dev现已包含Query的证明。性能优化在新的对话继续，原始全部验收要求仍未完成。
 
 ## 交付基线
 
@@ -46,7 +46,7 @@
 
 ## 后续对话入口
 
-性能优化和新功能均以合并后的dev提交建立各自独立分支/工作树。当前功能工作树保留用于追溯，不自动清理或归档。
+Query性能优化从`feature/JNTracy-GpuCatalog-DiskIndex`当前HEAD建立独立工作树；并行的其他功能从合并前`dev`提交`b840ae76`另建分支。当前功能工作树保留用于继续Query，不自动清理或归档。历史整合提交`e13eefa3`仍由Query功能分支保存，本地dev不再指向它。
 
 完整本机证据根目录：`C:\Users\Admin\Documents\JN-Unity-T3\GpuCatalog-DiskIndex\Query-Final-Acceptance-20260929-r19`，包含`Report.zh-CN.md`及`results/final-independent-audit.json`。收尾构建/回归日志位于同级`Task-Closure-20260929`。大型Trace、索引、EXE/PDB和日志不纳入Git。
 
