@@ -1,5 +1,6 @@
 #include "TracyCandidatePolicyCache.hpp"
 #include "TracyCandidatePolicyInternal.hpp"
+#include "TracyCandidatePolicyTopRecord.hpp"
 #include "TracyFrameWindowPolicy.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include "TracyAnalysisCacheKey.hpp"
@@ -361,8 +362,7 @@ struct Builder
                 [&](const frame_window::TopKey& group,frame_window::TopItem item) {
                     Check(options); item.sourceKey=key;
                     const auto groupKey=Field(std::get<0>(group))+Field(std::get<1>(group))+Field(std::get<2>(group))+Field(std::get<3>(group));
-                    auto payload=TopJson(item); payload["group"]=Hex(groupKey);
-                    topInput->Append(groupKey+Unsigned(item.context),payload.dump());
+                    topInput->Append(groupKey+Unsigned(item.context),candidate_policy::top_record::Encode(item));
                 },[&](const std::vector<PolicyFrameEvidence>& series) {
                     const auto bytes=borrowedRoot?FrameStorageBytes(series):FrameBytes(series);
                     if(bytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
@@ -417,12 +417,14 @@ struct Builder
             {
                 Check(options); const auto record=inputTop.GetAt(i);
                 AnalysisWorkspaceReservation decodingWorkspace(options.table.workspace,65536+32ull*record.payload.size());
-                const auto row=json::parse(record.payload);
-                const auto nextGroup=Unhex(row.at("group").get<std::string>());
+                if(record.key.size()<8) Fail("top_input_key");
+                const auto nextGroup=record.key.substr(0,record.key.size()-8);
                 if(nextGroup!=group) { flush(); group=nextGroup; }
                 // Replay original context order through the very same bounded
                 // reservoir, including equivalent-comparator insertion behavior.
-                auto item=ParseTop(row);
+                auto item=candidate_policy::top_record::Decode(record.payload);
+                if(record.key.compare(record.key.size()-8,8,Unsigned(item.context))!=0)
+                    Fail("top_input_context");
                 item.workspaceBytes=4096+4ull*(item.manifestation.size()+item.signature.size()+item.sourceKey.size())+
                     32ull*item.evidence.dump().size();
                 entriesWorkspace.Add(item.workspaceBytes);

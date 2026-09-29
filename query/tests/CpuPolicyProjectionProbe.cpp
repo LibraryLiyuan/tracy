@@ -10,6 +10,7 @@
 #include "TracyPolicyFrameSeries.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include "TracyAnalysisCacheKey.hpp"
+#include "TracyCandidatePolicyTopRecord.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -49,7 +50,9 @@ int main( int argc, char** argv )
 {
     try
     {
-        const bool writePolicyTops=argc==7 && std::string_view(argv[1])=="--policy-context-write";
+        const bool binaryPolicyTops=argc==7 && std::string_view(argv[1])=="--policy-context-write-binary";
+        const bool writePolicyTops=argc==7 && (std::string_view(argv[1])=="--policy-context-write" ||
+            binaryPolicyTops);
         const bool sharedPolicyRead=argc==6 && std::string_view(argv[1])=="--policy-context-shared";
         if((argc==6 && std::string_view(argv[1])=="--policy-context") || writePolicyTops || sharedPolicyRead)
         {
@@ -126,12 +129,17 @@ int main( int argc, char** argv )
                         const auto groupKey=cache_key::Field(std::get<0>(group))+
                             cache_key::Field(std::get<1>(group))+cache_key::Field(std::get<2>(group))+
                             cache_key::Field(std::get<3>(group));
-                        nlohmann::json payload={{"context",item.context},{"frame",item.frame},
-                            {"cost",std::to_string(item.cost)},{"manifestation",item.manifestation},
-                            {"evidence",item.evidence},{"signature",item.signature},
-                            {"source_key",cache_key::Hex(item.sourceKey)},
-                            {"group",cache_key::Hex(groupKey)}};
-                        topWriter->Append(groupKey+cache_key::Unsigned(item.context),payload.dump());
+                        if(binaryPolicyTops)
+                            topWriter->Append(groupKey+cache_key::Unsigned(item.context),
+                                candidate_policy::top_record::Encode(item));
+                        else {
+                            nlohmann::json payload={{"context",item.context},{"frame",item.frame},
+                                {"cost",std::to_string(item.cost)},{"manifestation",item.manifestation},
+                                {"evidence",item.evidence},{"signature",item.signature},
+                                {"source_key",cache_key::Hex(item.sourceKey)},
+                                {"group",cache_key::Hex(groupKey)}};
+                            topWriter->Append(groupKey+cache_key::Unsigned(item.context),payload.dump());
+                        }
                     });
                 samples.push_back({{"source_ordinal",std::to_string(*context.sourceOrdinal)},
                     {"frame_scope",context.frameScope},{"series_rows",std::to_string(context.seriesCount)},
@@ -140,7 +148,8 @@ int main( int argc, char** argv )
             }
             uint64_t commitMs=0;
             if(topWriter){const auto began=std::chrono::steady_clock::now(); topWriter->Commit();commitMs=ElapsedMs(began);}
-            std::cout<<nlohmann::json{{"mode",writePolicyTops?"policy_context_scratch":
+            std::cout<<nlohmann::json{{"mode",binaryPolicyTops?"policy_context_binary_scratch":
+                writePolicyTops?"policy_context_scratch":
                 sharedPolicyRead?"policy_context_shared_reader":"policy_context_read_only"},
                 {"start_ordinal",ordinal},{"top_commit_ms",commitMs},
                 {"scratch_bytes",scratchUsage?scratchUsage->Snapshot().currentBytes:0},

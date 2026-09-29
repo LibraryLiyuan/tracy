@@ -2,6 +2,7 @@
 #include "TracyHash.hpp"
 #include "TracyPolicyFrameSeries.hpp"
 #include "TracyFrameWindowPolicy.hpp"
+#include "TracyCandidatePolicyTopRecord.hpp"
 #include <chrono>
 #include <cctype>
 #include <iostream>
@@ -21,6 +22,27 @@ template<class Action> void Reject(Action action,const char* expected)
     throw std::runtime_error(std::string("expected rejection: ")+expected);
 }
 std::string Sha(const json& j) { const auto s=j.dump(); Sha256Builder h; h.Update(s.data(),s.size()); return h.FinalHex(); }
+void TopInputBinaryRoundTrip()
+{
+    frame_window::TopItem original{123456,17,42,std::string("frame\0cost",10),
+        json{{"nested",json::array({1,"two"})}},std::string("sig\xff",4)};
+    original.sourceKey=std::string("scope\0\xff",7);
+    const auto bytes=candidate_policy::top_record::Encode(original);
+    const auto restored=candidate_policy::top_record::Decode(bytes);
+    Require(restored.cost==original.cost && restored.context==original.context &&
+        restored.frame==original.frame && restored.manifestation==original.manifestation &&
+        restored.evidence==original.evidence && restored.signature==original.signature &&
+        restored.sourceKey==original.sourceKey,"binary Top input changed identity or evidence");
+    auto truncated=bytes;truncated.pop_back();
+    Reject([&]{(void)candidate_policy::top_record::Decode(truncated);},"candidate_policy_top_input_format");
+    frame_window::TopItem empty{-7,0,UINT64_MAX,"",json::object(),""};
+    empty.sourceKey=std::string("\0",1);
+    const auto emptyRestored=candidate_policy::top_record::Decode(candidate_policy::top_record::Encode(empty));
+    Require(emptyRestored.cost==empty.cost && emptyRestored.context==0 &&
+        emptyRestored.frame==empty.frame && emptyRestored.evidence==json::object() &&
+        emptyRestored.sourceKey==empty.sourceKey,"empty or signed Top input changed");
+    Reject([&]{(void)candidate_policy::top_record::Decode(bytes+"extra");},"candidate_policy_top_input_format");
+}
 CandidatePolicyInput Fixture(const std::filesystem::path& root, bool local=false)
 {
     CandidatePolicyInput input; input.aggregateIdentity=Identity;
@@ -980,6 +1002,7 @@ int main(int argc,char** argv)
     try {
         if(argc==2 && std::string(argv[1])=="--scale-dense-series") { DenseSeriesScale(root); std::filesystem::remove_all(root); return 0; }
         if(argc==3 && std::string(argv[1])=="--scale-policy") { Scale(root,std::stoull(argv[2])); std::filesystem::remove_all(root); return 0; }
+        TopInputBinaryRoundTrip();
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
         CandidateJoinWorkspace(root/"candidate-join");
