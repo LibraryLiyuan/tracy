@@ -1675,6 +1675,14 @@ int main(int argc,char** argv)
         const auto started=manager.Start(request);
         WaitFor(manager,started.scanId,ScanState::Complete,6s);
         if(!shared) throw std::runtime_error("Scan did not reuse the indexed Trace resource context");
+        const auto resourceReport=root/"resource-manager"/"scans"/started.scanId/"resource-complete.json";
+        if(!std::filesystem::is_regular_file(resourceReport))
+            throw std::runtime_error("Completed Scan did not persist a shared resource ledger report");
+        std::ifstream resourceInput(resourceReport);
+        const auto reported=json::parse(resourceInput);
+        if(std::stoull(reported.at("disk").at("peak_bytes").get<std::string>())<
+            std::stoull(reported.at("disk").at("current_bytes").get<std::string>()))
+            throw std::runtime_error("Completed Scan resource peak is below its live file usage");
         const auto completedDisk=resources->Snapshot().disk;
         if(completedDisk.currentBytes>=completedDisk.finalLimitBytes)
             throw std::runtime_error("Small completed Scan unexpectedly exhausted its final disk allowance");

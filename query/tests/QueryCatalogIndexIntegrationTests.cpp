@@ -11,6 +11,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -103,7 +104,16 @@ int main( int argc, char** argv )
         original.reset(); catalog.reset();
 
         auto buildResources = query::QueryIndex::CreateResourceContext( input );
-        const auto manifest = query::QueryIndex::Build( input, {}, buildResources );
+        std::ostringstream buildLog;
+        const auto oldError=std::cerr.rdbuf(buildLog.rdbuf());
+        query::QueryIndexManifest manifest;
+        try { manifest=query::QueryIndex::Build( input, {}, buildResources ); }
+        catch(...) { std::cerr.rdbuf(oldError); throw; }
+        std::cerr.rdbuf(oldError);
+        Require( buildLog.str().find("Query gpu-reference-build duration_ms=")!=std::string::npos,
+            "GPU Reference Build phase telemetry missing" );
+        Require( buildLog.str().find("Query gpu-reference-validation duration_ms=")!=std::string::npos,
+            "GPU Reference validation phase telemetry missing" );
         const auto phases = buildResources->Snapshot().phaseHistory;
         const auto loaded = std::find_if( phases.rbegin(), phases.rend(), []( const auto& phase ) {
             return phase.phase == "worker-load:unknown";

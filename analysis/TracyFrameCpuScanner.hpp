@@ -81,6 +81,22 @@ struct CpuFrameSetDenominator
     uint64_t completeFrameCount = 0;
 };
 
+struct CpuFrameScanTimings
+{
+    uint64_t totalNs = 0;
+    uint64_t frameReadNs = 0;
+    uint64_t zoneReadNs = 0;
+    uint64_t zoneProcessNs = 0;
+    uint64_t frameReadCalls = 0;
+    uint64_t zoneReadCalls = 0;
+    uint64_t inputZones = 0;
+    uint64_t frameBoundaryProbes = 0;
+    uint64_t logicalSignatureHashes = 0;
+    uint64_t emittedRuns = 0;
+    uint64_t sinkSamples = 0;
+    uint64_t sinkSampleNs = 0;
+};
+
 struct CpuFrameScanResult
 {
     AnalysisWorkspaceReservation outputWorkspace;
@@ -99,6 +115,7 @@ struct CpuFrameScanResult
     uint64_t frameBoundaryProbeCount = 0;
     uint64_t exactSignatureHashCount = 0;
     uint64_t logicalSignatureHashCount = 0;
+    CpuFrameScanTimings timings;
     bool qualityComplete = true;
     std::vector<CpuSignatureDefinition> signatures;
     std::vector<CpuSignatureFrameRun> runs;
@@ -140,6 +157,8 @@ enum class CpuLogicalSignatureMode : uint8_t
 struct CpuFrameScanOptions
 {
     std::function<bool()> cancelled;
+    bool collectTiming = false;
+    bool useFrameCursor = true;
     bool includeExactSignatures = true;
     bool includeLogicalSignatures = true;
     CpuLogicalSignatureMode logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
@@ -156,6 +175,9 @@ struct CpuFrameScanOptions
     // Throttling belongs to the caller. The scanner reports once per bounded
     // source page and once after closing the final thread stacks.
     std::function<void( uint64_t inputZones, uint64_t emittedRuns )> progress;
+    // Receives a cumulative batch-level snapshot before progress. A bounded
+    // prefix probe can retain timings even when the following page cancels.
+    std::function<void( const CpuFrameScanTimings& )> timingProgress;
     // Shared analysis-owned metadata, signatures, active stacks and returned
     // result storage. Source pages are charged once returned; constructing a
     // native source DTO is not protected by an absolute allocator limit.

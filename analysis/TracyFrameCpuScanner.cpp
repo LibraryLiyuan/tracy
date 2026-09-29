@@ -1,4 +1,5 @@
 #include "TracyFrameCpuScanner.hpp"
+#include <chrono>
 
 #include "TracyHash.hpp"
 #include "TracyAnalysisDictionary.hpp"
@@ -306,6 +307,12 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanView( const CpuSignatureFrameViewSi
 CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSink* sink,
     const CpuSignatureFrameViewSink* viewSink, const CpuFrameScanOptions& options ) const
 {
+    const auto scanStarted=std::chrono::steady_clock::now();
+    const bool timed=options.collectTiming || bool(options.timingProgress);
+    const auto elapsedNs=[](auto started) -> uint64_t {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-started).count());
+    };
     const auto checkCancelled = [&] { CheckCancelled( options.cancelled ); };
     checkCancelled();
     if( !options.includeExactSignatures && !options.includeLogicalSignatures )
@@ -370,7 +377,12 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     {
         checkCancelled();
         AnalysisWorkspaceReservation pageWorkspace( options.workspace );
+        const auto readStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         const auto batch = scanner.Read( frameRequest );
+        if(timed) {
+            result.timings.frameReadNs+=elapsedNs(readStarted);
+            ++result.timings.frameReadCalls;
+        }
         checkCancelled();
         result.maximumBatchObserved = std::max( result.maximumBatchObserved, batch.Count() );
         const auto& frames = std::get<std::vector<FrameDto>>( batch.records );
@@ -453,6 +465,16 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     } );
     std::map<std::string, std::vector<FrameBoundary*>> framesBySet;
     for( auto& frame : completeFrames ) { checkCancelled(); framesBySet[frame.frameSetRef].push_back( &frame ); }
+    // A single bounded cursor set is enough when source rows stay on one
+    // thread. Switching threads or moving backward in time falls back to the
+    // original binary search, so the cache does not retain per-thread state.
+    constexpr size_t MaximumFrameCursors=64;
+    struct FrameSearchCursor { uint64_t generation=0; int64_t startNs=0; size_t first=0; };
+    std::array<FrameSearchCursor,MaximumFrameCursors> frameCursors{};
+    std::array<bool,MaximumFrameCursors> monotoneEnds{};
+    const bool useFrameCursors=options.useFrameCursor && framesBySet.size()<=MaximumFrameCursors;
+    const std::string* cursorThread=nullptr;
+    uint64_t cursorGeneration=1;
     std::vector<std::string> frameSetRefs;
     frameSetRefs.reserve( framesBySet.size() );
     for( auto& [frameSetRef, frames] : framesBySet )
@@ -461,6 +483,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         if( frameSetRefs.size() >= std::numeric_limits<uint32_t>::max() )
             throw BoundedScanError( "frame_cpu_scan_frame_set_limit" );
         const auto ordinal = uint32_t( frameSetRefs.size() );
+        if(useFrameCursors) monotoneEnds[ordinal]=std::is_sorted(frames.begin(),frames.end(),
+            [](const FrameBoundary* left,const FrameBoundary* right){return left->endNs<right->endNs;});
         frameSetRefs.emplace_back( frameSetRef );
         for( auto* frame : frames ) { checkCancelled(); frame->frameSetOrdinal = ordinal; }
     }
@@ -578,7 +602,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     contribution.frame->index, inclusive, directChildUnion,
                     inclusive - directChildUnion, 1,
                     exact && directChildUnion <= inclusive, ref, workClass };
+                const bool sample=timed && (emittedRunCount & 4095u)==0;
+                const auto sampleStarted=sample ? std::chrono::steady_clock::now() : scanStarted;
                 accepted = ( *viewSink )( run );
+                if(sample) { result.timings.sinkSampleNs+=elapsedNs(sampleStarted); ++result.timings.sinkSamples; }
             }
             else
             {
@@ -586,7 +613,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     contribution.frame->ref, contribution.frame->index, inclusive,
                     directChildUnion, inclusive - directChildUnion, 1,
                     exact && directChildUnion <= inclusive, { ref }, workClass };
+                const bool sample=timed && (emittedRunCount & 4095u)==0;
+                const auto sampleStarted=sample ? std::chrono::steady_clock::now() : scanStarted;
                 accepted = ( *sink )( run );
+                if(sample) { result.timings.sinkSampleNs+=elapsedNs(sampleStarted); ++result.timings.sinkSamples; }
             }
             if( !accepted ) throw std::runtime_error( "frame_cpu_scan_sink_cancelled" );
             ++emittedRunCount;
@@ -654,7 +684,13 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     {
         checkCancelled();
         AnalysisWorkspaceReservation pageWorkspace( options.workspace );
+        const auto readStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         const auto batch = scanner.Read( zoneRequest );
+        if(timed) {
+            result.timings.zoneReadNs+=elapsedNs(readStarted);
+            ++result.timings.zoneReadCalls;
+        }
+        const auto processStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         checkCancelled();
         result.maximumBatchObserved = std::max( result.maximumBatchObserved, batch.Count() );
         const auto& zones = std::get<std::vector<CpuZoneDto>>( batch.records );
@@ -664,7 +700,16 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             checkCancelled();
             ++result.inputZoneCount;
             if( !stacks.contains( zone.threadRef ) ) metadataWorkspace.Add( 1024 + 4 * zone.threadRef.size() );
-            auto& storage = stacks.try_emplace( zone.threadRef, options.workspace ).first->second;
+            const auto [threadEntry,insertedThread] = stacks.try_emplace( zone.threadRef, options.workspace );
+            (void)insertedThread;
+            auto& storage = threadEntry->second;
+            if(useFrameCursors && cursorThread!=&threadEntry->first) {
+                cursorThread=&threadEntry->first;
+                if(++cursorGeneration==0) {
+                    frameCursors.fill({});
+                    cursorGeneration=1;
+                }
+            }
             auto& stack = storage.zones;
 
             size_t parentPosition = std::numeric_limits<size_t>::max();
@@ -836,18 +881,33 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             active.beginNs = zone.startNs;
             active.endNs = *zone.endNs;
             active.exact = structuralExact;
+            size_t frameSetIndex=0;
             for( const auto& [frameSet, candidates] : framesBySet )
             {
                 checkCancelled();
                 size_t first = 0;
-                size_t last = candidates.size();
-                while( first < last )
+                const bool cursorReady=useFrameCursors && monotoneEnds[frameSetIndex];
+                if(cursorReady && frameCursors[frameSetIndex].generation==cursorGeneration &&
+                    zone.startNs>=frameCursors[frameSetIndex].startNs)
                 {
-                    ++result.frameBoundaryProbeCount;
-                    const auto middle = first + ( last - first ) / 2;
-                    if( candidates[middle]->endNs <= zone.startNs ) first = middle + 1;
-                    else last = middle;
+                    first=frameCursors[frameSetIndex].first;
+                    while(first<candidates.size()) {
+                        ++result.frameBoundaryProbeCount;
+                        if(candidates[first]->endNs>zone.startNs) break;
+                        ++first;
+                    }
                 }
+                else {
+                    size_t last = candidates.size();
+                    while( first < last )
+                    {
+                        ++result.frameBoundaryProbeCount;
+                        const auto middle = first + ( last - first ) / 2;
+                        if( candidates[middle]->endNs <= zone.startNs ) first = middle + 1;
+                        else last = middle;
+                    }
+                }
+                if(cursorReady) frameCursors[frameSetIndex]={cursorGeneration,zone.startNs,first};
                 for( auto index = first; index < candidates.size(); ++index )
                 {
                     checkCancelled();
@@ -862,6 +922,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                         active.frames.push_back( { &frame, begin, end } );
                     }
                 }
+                ++frameSetIndex;
             }
             if( active.frames.empty() )
             {
@@ -896,6 +957,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             storage.ReserveNext();
             stack.emplace_back( std::move( active ) );
         }
+        if(timed) result.timings.zoneProcessNs+=elapsedNs(processStarted);
+        if(options.timingProgress) {
+            result.timings.inputZones=result.inputZoneCount;
+            result.timings.frameBoundaryProbes=result.frameBoundaryProbeCount;
+            result.timings.logicalSignatureHashes=result.logicalSignatureHashCount;
+            result.timings.emittedRuns=emittedRunCount;
+        }
+        if(options.timingProgress) options.timingProgress(result.timings);
         if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
         if( batch.cursor.complete ) break;
         zoneRequest.cursor = batch.cursor;
@@ -948,6 +1017,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         return lhs.frameSetRef < rhs.frameSetRef;
     } );
     checkCancelled();
+    if(timed) result.timings.totalNs=elapsedNs(scanStarted);
+    if(options.timingProgress) {
+        result.timings.inputZones=result.inputZoneCount;
+        result.timings.frameBoundaryProbes=result.frameBoundaryProbeCount;
+        result.timings.logicalSignatureHashes=result.logicalSignatureHashCount;
+        result.timings.emittedRuns=emittedRunCount;
+    }
+    if(options.timingProgress) options.timingProgress(result.timings);
     return result;
 }
 

@@ -714,6 +714,7 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         CpuFrameScanOptions cpuOptions;
         cpuOptions.cancelled = cancelled;
         cpuOptions.workspace = workspace;
+        cpuOptions.collectTiming = true;
         // Native policy analysis groups CPU work by stable logical path. Raw
         // Zone DTOs retain physical thread identity and every dynamic extra
         // name for point evidence; carrying instance tags into whole-trace
@@ -798,6 +799,21 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
                     throw std::runtime_error( "neutral_cpu_run_ingest_failed" );
                 return true;
             }, cpuOptions );
+        const auto& cpuTiming=cpu.timings;
+        const auto measuredNs=cpuTiming.frameReadNs+cpuTiming.zoneReadNs+cpuTiming.zoneProcessNs;
+        const auto estimatedSinkMs=cpuTiming.sinkSamples ? uint64_t(
+            (static_cast<long double>(cpuTiming.sinkSampleNs)*cpuTiming.emittedRuns/
+                cpuTiming.sinkSamples)/1'000'000.0L) : 0;
+        std::cerr << "Query scan-cpu-timing total_ms=" << cpuTiming.totalNs/1'000'000
+            << " frame_read_ms=" << cpuTiming.frameReadNs/1'000'000
+            << " zone_read_decode_ms=" << cpuTiming.zoneReadNs/1'000'000
+            << " zone_process_ms=" << cpuTiming.zoneProcessNs/1'000'000
+            << " other_ms=" << (cpuTiming.totalNs>=measuredNs ? cpuTiming.totalNs-measuredNs : 0)/1'000'000
+            << " frame_pages=" << cpuTiming.frameReadCalls
+            << " zone_pages=" << cpuTiming.zoneReadCalls
+            << " emitted_runs=" << cpuTiming.emittedRuns
+            << " sink_samples=" << cpuTiming.sinkSamples
+            << " sink_estimated_ms=" << estimatedSinkMs << '\n';
         if( cpu.inputZoneCount >= 1'000'000 )
             std::cerr << "Query scan-cpu-signatures logical_hashes=" << cpu.logicalSignatureHashCount
                 << " exact_hashes=" << cpu.exactSignatureHashCount
@@ -1736,9 +1752,25 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     // this shared workspace. A second fixed 32 MiB admission limit rejects
     // valid long captures before that accounting can decide.
     const uint64_t seriesBudget=workspace->Snapshot().maximumBytes;
-    policy.readFrameSeries = [frameSeriesPath, seriesBudget, identity, cancelled=options.cancelled]( const PolicySignatureContext& context ) {
-        return ReadPolicyFrameSeries( frameSeriesPath, context, seriesBudget,
-            cancelled, identity );
+    std::shared_ptr<PagedRecordReader> seriesReader;
+    if(std::filesystem::is_directory(frameSeriesPath)) {
+        PagedRecordOptions seriesOptions;
+        seriesOptions.workspace=workspace;
+        seriesOptions.cancelled=options.cancelled;
+        seriesOptions.blockBytes=uint32_t(std::min<uint64_t>(4ull*1024*1024,seriesBudget/4));
+        seriesReader=std::make_shared<PagedRecordReader>(frameSeriesPath,identity,
+            sizeof(PolicySeriesRecord),seriesOptions);
+    }
+    uint64_t seriesReadCalls=0,seriesRows=0,seriesReadNs=0;
+    policy.readFrameSeries = [&,seriesReader,frameSeriesPath,seriesBudget,identity,
+        cancelled=options.cancelled]( const PolicySignatureContext& context ) {
+        const auto began=std::chrono::steady_clock::now();
+        auto result=seriesReader ? ReadPolicyFrameSeries(*seriesReader,context,seriesBudget,cancelled) :
+            ReadPolicyFrameSeries(frameSeriesPath,context,seriesBudget,cancelled,identity);
+        seriesReadNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-began).count());
+        ++seriesReadCalls;seriesRows+=context.seriesCount;
+        return result;
     };
     const auto generation=NewGeneration(entry->scanRoot/"policy-generations");
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;
@@ -1751,6 +1783,13 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     policyOptions.frameWorkspaceBytes=workspace->Snapshot().maximumBytes;
     const auto candidateRoot=entry->scanRoot/"policy-generations"/generation/"policy-cache";
     const auto policyIdentity=BuildCandidatePolicyCache(candidateRoot,neutral,policy,policyOptions);
+    if(seriesReader) {
+        const auto statistics=seriesReader->Statistics();
+        std::cerr<<"Query policy-series-read calls="<<seriesReadCalls<<" rows="<<seriesRows
+            <<" duration_ms="<<seriesReadNs/1'000'000
+            <<" block_loads="<<statistics.blockLoads
+            <<" decoded_bytes="<<statistics.decodedBytes<<'\n';
+    }
     ValidateFinalTables(candidateRoot,policyIdentity,true,options);
     CandidatePolicyCacheReader verified(candidateRoot,policyIdentity,policyOptions);
     {
@@ -1770,7 +1809,16 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     { Update( entry, ScanState::CancelledResumable, 3, 4, "cancelled", "cancelled" ); return; }
     memory.Check();
     CleanupPublishedTables(candidateRoot,policyIdentity,true,true,options);
-    if( entry->request.resourceContext ) entry->request.resourceContext->CheckFinalDisk();
+    if( entry->request.resourceContext )
+    {
+        // The same usage ledger accounts for the indexed Trace, neutral cache,
+        // policy generations and scratch. Persist its observed peak on success
+        // as well as on failure; a later directory scan cannot recover a
+        // transient peak after scratch has been removed.
+        entry->request.resourceContext->WriteDiagnostic(
+            entry->scanRoot / "resource-complete.json" );
+        entry->request.resourceContext->CheckFinalDisk();
+    }
     Update( entry, ScanState::Complete, 4, 4, "complete" );
 }
 

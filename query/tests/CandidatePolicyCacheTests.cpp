@@ -3,8 +3,10 @@
 #include "TracyPolicyFrameSeries.hpp"
 #include "TracyFrameWindowPolicy.hpp"
 #include <chrono>
+#include <cctype>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 using namespace tracy::analysis;
 using nlohmann::json;
@@ -141,7 +143,33 @@ void CachedParity(const std::filesystem::path& root, bool local=false, bool fall
     auto metadata=input; metadata.aggregate.signatures.clear(); metadata.aggregate.rankings.clear(); metadata.signatures.clear();
     NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
     CandidatePolicyCacheOptions options; options.table.blockBytes=16384; options.sortBufferBytes=32768;
-    const auto policyId=BuildCandidatePolicyCache(root/"policy",neutral,metadata,options);
+    std::ostringstream phaseLog;
+    const auto oldError=std::cerr.rdbuf(phaseLog.rdbuf());
+    std::string policyId;
+    try { policyId=BuildCandidatePolicyCache(root/"policy",neutral,metadata,options); }
+    catch(...) { std::cerr.rdbuf(oldError); throw; }
+    std::cerr.rdbuf(oldError);
+    const auto log=phaseLog.str();
+    size_t previous=0;
+    for(const auto* stage:{"context-order","frame-prepare","context-scan","local-top","signals"})
+    {
+        const auto marker=std::string("Query policy-local stage=")+stage+" duration_ms=";
+        const auto found=log.find(marker,previous);
+        Require(found!=std::string::npos,"policy local timing missing or out of order");
+        previous=found+marker.size();
+        Require(previous<log.size() && std::isdigit(static_cast<unsigned char>(log[previous])),
+            "policy local duration is not numeric");
+    }
+    previous=0;
+    for(const auto* stage:{"prepare-locals","prepare-rankings","join","reduce","publish"})
+    {
+        const auto marker=std::string("Query policy-phase stage=")+stage+" duration_ms=";
+        const auto found=log.find(marker,previous);
+        Require(found!=std::string::npos,"policy phase timing missing or out of order");
+        const auto start=found+marker.size();
+        Require(start<log.size() && std::isdigit(static_cast<unsigned char>(log[start])),"policy phase duration is not numeric");
+        previous=start+1;
+    }
     Require(policyId==oracle.policyIdentity,"policy identity unchanged");
     CandidatePolicyCacheReader cache(root/"policy",policyId,options);
     json candidates=json::array(),rankings=json::array();

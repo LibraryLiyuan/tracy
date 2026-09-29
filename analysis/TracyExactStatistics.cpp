@@ -1422,6 +1422,7 @@ struct NeutralStatisticsStreamBuilder::Impl
         const std::filesystem::path& outputPath, std::string_view stage,
         const std::function<bool()>& cancelled )
     {
+        const auto started=std::chrono::steady_clock::now();
         AnalysisWorkspaceReservation mergeBudget(workspace,65536+source.size()*16384ull);
         std::vector<Reader> readers;
         readers.reserve( source.size() );
@@ -1476,6 +1477,9 @@ struct NeutralStatisticsStreamBuilder::Impl
         if( pending && !writer.Write( *pending ) ) return false;
         if( !writer.Finish() ) return false;
         if( progress ) progress( stage, processed, expected );
+        std::cerr << "Query statistics-phase stage=merge duration_ms=" <<
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count()
+            << " group=" << stage << " records=" << processed << '\n';
         return true;
     }
 
@@ -1830,8 +1834,13 @@ try
     if( !m_impl || m_impl->finished ) { error = "neutral_stream_builder_already_finished"; return false; }
     m_impl->finished = true;
     if( !m_impl->error.empty() ) { error = m_impl->error; return false; }
+    const auto consolidateStarted=std::chrono::steady_clock::now();
     if( !m_impl->Flush() || !m_impl->Consolidate( cancelled ) )
     { error = m_impl->error; return false; }
+    std::cerr << "Query statistics-phase stage=consolidate duration_ms=" <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-consolidateStarted).count()
+        << '\n';
+    const auto reduceStarted=std::chrono::steady_clock::now();
 
     std::map<SignatureKeyView, uint64_t, SignatureKeyLess> denominators;
     for( const auto& value : m_impl->denominators )
@@ -2025,6 +2034,9 @@ try
     }
     if( m_impl->progress ) m_impl->progress( "neutral_statistics_reduce",
         m_impl->outputSignatureCount, m_impl->signatures.size() );
+    std::cerr << "Query statistics-phase stage=reduce duration_ms=" <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-reduceStarted).count()
+        << " signatures=" << m_impl->outputSignatureCount << '\n';
 
     // Numeric external sorting follows first-observation registry order.
     // Restore the public, input-order-independent lexical order before

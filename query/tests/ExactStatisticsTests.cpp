@@ -12,6 +12,7 @@
 #include <fstream>
 #include <random>
 #include <iostream>
+#include <sstream>
 
 using namespace tracy::analysis;
 
@@ -696,7 +697,10 @@ int main( int argc, char** argv )
         AnalysisCacheTableOptions cacheOptions;
         cacheOptions.blockBytes = 16384;
         AnalysisCacheTableWriter cache(temporary / "streamed-cache", std::string(64,'a'), "neutral-signatures", cacheOptions);
-        const auto ok = streamed.FinishToSink(summary, error, [&](const auto& signature, const auto& frames) {
+        std::ostringstream timingLog;
+        const auto oldError=std::cerr.rdbuf(timingLog.rdbuf());
+        bool ok=false;
+        try { ok = streamed.FinishToSink(summary, error, [&](const auto& signature, const auto& frames) {
             ++received;
             assert(frames.size() == 3 && signature.presentFrameCount == 3);
             assert(signature.exclusive.perCompleteFrame.total == 6);
@@ -707,7 +711,11 @@ int main( int argc, char** argv )
             auto key = std::to_string(received);
             key.insert(0, 20-key.size(), '0');
             cache.Append(key, SerializeNeutralSignatureRecord(signature));
-        });
+        }); } catch(...) { std::cerr.rdbuf(oldError); throw; }
+        std::cerr.rdbuf(oldError);
+        const auto log=timingLog.str();
+        assert(log.find("Query statistics-phase stage=merge duration_ms=")!=std::string::npos);
+        assert(log.find("Query statistics-phase stage=reduce duration_ms=")!=std::string::npos);
         if(!ok || received != Count || summary.signatureCount != Count || !mergeProgress || !reduceProgress ||
             !summary.qualityComplete || summary.materializedResultPeak != 0)
         { std::cerr << "Sink output still retains complete signature results: " << summary.materializedResultPeak << '\n'; return 1; }

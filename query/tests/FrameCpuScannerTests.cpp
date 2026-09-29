@@ -211,6 +211,7 @@ public:
     {
         return Page( zones, range );
     }
+    void SwapZones(size_t left,size_t right) { std::swap(zones[left],zones[right]); }
 
 private:
     template<typename T>
@@ -488,7 +489,24 @@ int main()
     // visible SHA remains unchanged, but it must be computed once per unique
     // exact definition rather than once per occurrence.
     assert( largeResult.exactSignatureHashCount == 1 );
-    assert( largeResult.frameBoundaryProbeCount < 4096 * 16 );
+    assert( largeResult.frameBoundaryProbeCount < 4096 * 5 );
+    LargeCpuFrameSource shuffled( 4096 );
+    shuffled.SwapZones(100,3500);
+    const auto scanRuns=[&](bool cursor) {
+        CpuFrameScanOptions options;
+        options.useFrameCursor=cursor;
+        std::vector<std::string> rows;
+        const auto result=ExactFrameCpuScanner( shuffled, 64 ).ScanView([&](const CpuSignatureFrameRunView& run) {
+            rows.push_back(std::string(run.signatureId)+"|"+std::to_string(run.frameIndex)+"|"+
+                std::to_string(run.inclusiveNs)+"|"+std::to_string(run.exclusiveNs)+"|"+
+                std::string(run.frameRef));
+            return true;
+        },options);
+        return std::pair{std::move(rows),result.frameBoundaryProbeCount};
+    };
+    const auto cachedRuns=scanRuns(true), binaryRuns=scanRuns(false);
+    assert(cachedRuns.first==binaryRuns.first);
+    assert(cachedRuns.second<binaryRuns.second/2);
 
     // Per-occurrence extra names are raw evidence, not stable policy identity.
     // Canonical logical paths retain the source/function and aggregate every
@@ -557,6 +575,13 @@ int main()
     // Removing the definition callback, retaining every full path, changing
     // ancestry, or emitting a definition twice must fail this real scan.
     CpuFrameScanOptions streamedOptions;
+    streamedOptions.collectTiming=true;
+    CpuFrameScanTimings latestTimings;
+    uint64_t timingUpdates=0;
+    streamedOptions.timingProgress=[&](const CpuFrameScanTimings& value) {
+        assert(value.zoneReadCalls>=latestTimings.zoneReadCalls);
+        latestTimings=value; ++timingUpdates;
+    };
     std::map<std::string,CpuSignatureDefinition> definitions;
     streamedOptions.definitionSink=[&](const CpuSignatureDefinition& definition) {
         assert(definitions.emplace(definition.signatureId,definition).second);
@@ -574,6 +599,16 @@ int main()
     },streamedOptions);
     assert(definitionStreamRuns>0 && definitionStream.signatures.empty() && definitionStream.runs.empty());
     assert(progressCalls>1 && progressZones==definitionStream.inputZoneCount && progressRuns==definitionStreamRuns);
+    assert(definitionStream.timings.frameReadCalls>0 && definitionStream.timings.zoneReadCalls>1);
+    assert(definitionStream.timings.zoneReadNs>0 && definitionStream.timings.zoneProcessNs>0);
+    assert(definitionStream.timings.totalNs>=definitionStream.timings.zoneReadNs+
+        definitionStream.timings.zoneProcessNs);
+    assert(timingUpdates>1 && latestTimings.zoneReadCalls==definitionStream.timings.zoneReadCalls);
+    assert(latestTimings.inputZones==definitionStream.inputZoneCount &&
+        latestTimings.frameBoundaryProbes==definitionStream.frameBoundaryProbeCount &&
+        latestTimings.logicalSignatureHashes==definitionStream.logicalSignatureHashCount);
+    assert(latestTimings.emittedRuns==definitionStreamRuns && latestTimings.sinkSamples>0 &&
+        latestTimings.sinkSampleNs>0);
     assert(definitions.size()==result.signatures.size());
     for(const auto& expected:result.signatures)
     {

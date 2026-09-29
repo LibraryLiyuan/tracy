@@ -134,9 +134,19 @@ static void FrameSeriesBulkRead(const std::filesystem::path& root)
     uint64_t cancellationChecks=0;
     const auto restored=ReadPolicyFrameSeries(root/"bulk-series",context,32*1024*1024,
         [&]{++cancellationChecks;return false;},identity);
+    PagedRecordReader shared(root/"bulk-series",identity,sizeof(PolicySeriesRecord),options);
+    const auto reused=ReadPolicyFrameSeries(shared,context,32*1024*1024);
     Require(restored.size()==frames.size() && restored.front().valueNs==30 &&
         restored.back().frameIndex==frames.size()-1 && restored.back().valueNs==30+int64_t(frames.size()-1),
         "bulk frame-series read preserves every ordinal and value");
+    Require(reused.size()==restored.size() && reused.front().valueNs==restored.front().valueNs &&
+        reused.back().frameIndex==restored.back().frameIndex,
+        "reused frame-series reader changed exact values");
+    auto wrongHash=context; wrongHash.seriesSha256=std::string(64,'0');
+    bool rejected=false;
+    try { (void)ReadPolicyFrameSeries(shared,wrongHash,32*1024*1024); }
+    catch(const std::exception& e) {rejected=std::string_view(e.what())=="frame_series_checksum_mismatch";}
+    Require(rejected,"reused frame-series reader omitted the per-extent checksum");
     Require(cancellationChecks<64,
         "sequential frame-series reading must check cancellation per chunk, not per record");
 }

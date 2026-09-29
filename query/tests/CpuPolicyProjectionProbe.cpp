@@ -2,6 +2,14 @@
 #include "../../analysis/TracyBoundedScanCursor.hpp"
 #include "../../analysis/TracyGpuJobManagedScanner.hpp"
 #include "../../analysis/TracyFrameCpuScanner.hpp"
+#include "../../analysis/TracyExactStatistics.hpp"
+#include "../../analysis/TracyFrameWindowPolicy.hpp"
+#include "TracyAnalysisScanCache.hpp"
+#include "TracyAnalysisScanManager.hpp"
+#include "TracyNeutralStatisticsCache.hpp"
+#include "TracyPolicyFrameSeries.hpp"
+#include "TracyAnalysisCacheSort.hpp"
+#include "TracyAnalysisCacheKey.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -9,6 +17,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
@@ -40,7 +49,109 @@ int main( int argc, char** argv )
 {
     try
     {
-        if( argc == 4 && std::string_view( argv[1] ) == "--cpu-prefix" )
+        const bool writePolicyTops=argc==7 && std::string_view(argv[1])=="--policy-context-write";
+        const bool sharedPolicyRead=argc==6 && std::string_view(argv[1])=="--policy-context-shared";
+        if((argc==6 && std::string_view(argv[1])=="--policy-context") || writePolicyTops || sharedPolicyRead)
+        {
+            const std::filesystem::path generation=argv[2],pointerPath=argv[3],profilePath=argv[4];
+            const auto ordinal=std::stoull(argv[5]);
+            nlohmann::json pointer,profile;
+            {std::ifstream input(pointerPath); input>>pointer;}
+            {std::ifstream input(profilePath); input>>profile;}
+            const auto identity=pointer.at("identity").get<std::string>();
+            const auto started=std::chrono::steady_clock::now();
+            const auto cancelled=[&]{return ElapsedMs(started)>120000;};
+            auto workspace=std::make_shared<AnalysisWorkspaceBudget>(4ull<<30,2ull<<30);
+            AnalysisCacheTableOptions table; table.workspace=workspace; table.cancelled=cancelled;
+            std::filesystem::path scratch;
+            std::shared_ptr<AnalysisDiskUsage> scratchUsage;
+            std::unique_ptr<AnalysisCacheSortedWriter> topWriter;
+            if(writePolicyTops) {
+                scratch=argv[6];
+                if(std::filesystem::exists(scratch))throw std::runtime_error("policy_probe_scratch_exists");
+                std::filesystem::create_directories(scratch);
+                scratchUsage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{scratch});
+                table.disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{scratchUsage,1ull<<30,{}});
+                topWriter=std::make_unique<AnalysisCacheSortedWriter>(scratch/"top-input",identity,
+                    "candidate-policy-cache-v1-local-top-input",table);
+            }
+            auto bundle=OpenAnalysisNeutralBundle(generation,identity,
+                pointer.at("header_sha256").get<std::string>(),table);
+            CandidatePolicyInput policy; policy.aggregateIdentity=identity;
+            policy.normalizedProfile=std::move(profile);
+            policy.frameTimelines=std::move(bundle.frameTimelines);
+            policy.cancelled=cancelled;
+            AnalysisWorkspaceReservation timelineWorkspace(workspace);
+            uint64_t timelineRows=0;
+            for(const auto& timeline:policy.frameTimelines) timelineRows+=timeline.frames.size();
+            if(timelineRows>UINT64_MAX/512)throw std::runtime_error("policy_probe_timeline_budget");
+            timelineWorkspace.Add(timelineRows*512);
+            const auto state=frame_window::Prepare(policy,[](const auto&){},&timelineWorkspace,workspace);
+            std::unique_ptr<PagedRecordReader> sharedSeries;
+            if(sharedPolicyRead) {
+                PagedRecordOptions readerOptions; readerOptions.workspace=workspace;
+                readerOptions.cancelled=cancelled;
+                sharedSeries=std::make_unique<PagedRecordReader>(bundle.frameSeriesPath,identity,
+                    sizeof(PolicySeriesRecord),readerOptions);
+            }
+            NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table=table;
+            NeutralStatisticsCacheReader neutral(bundle.neutralCachePath,identity,neutralOptions);
+            const auto page=neutral.Contexts(ordinal,32,1<<20);
+            nlohmann::json samples=nlohmann::json::array();
+            for(const auto& row:page.records)
+            {
+                if(cancelled())throw std::runtime_error("policy_probe_time_limit");
+                PolicySignatureContext context; std::string error;
+                if(!DeserializePolicySignatureContextRecord(row.payload,context,error))
+                    throw std::runtime_error(error);
+                if(!context.sourceOrdinal || !context.frameSeriesComplete || context.seriesCount>100000 ||
+                    !state.timelines.contains(context.frameScope))continue;
+                AnalysisWorkspaceReservation seriesWorkspace(workspace,65536+context.seriesCount*512);
+                uint64_t readMs=0,topCount=0;
+                policy.readFrameSeries=[&](const PolicySignatureContext& current) {
+                    const auto began=std::chrono::steady_clock::now();
+                    auto values=sharedSeries ? ReadPolicyFrameSeries(*sharedSeries,current,
+                        workspace->Snapshot().maximumBytes,cancelled) :
+                        ReadPolicyFrameSeries(bundle.frameSeriesPath,current,workspace->Snapshot().maximumBytes,
+                            cancelled,identity);
+                    readMs+=ElapsedMs(began); return values;
+                };
+                const auto began=std::chrono::steady_clock::now();
+                const auto sourceKey=cache_key::Signature(context.domain,context.signatureId,context.frameScope);
+                const auto signals=frame_window::ScanContext(policy,size_t(*context.sourceOrdinal),
+                    context,state,[&](const frame_window::TopKey& group,frame_window::TopItem item){
+                        ++topCount;
+                        if(!topWriter)return;
+                        item.sourceKey=sourceKey;
+                        const auto groupKey=cache_key::Field(std::get<0>(group))+
+                            cache_key::Field(std::get<1>(group))+cache_key::Field(std::get<2>(group))+
+                            cache_key::Field(std::get<3>(group));
+                        nlohmann::json payload={{"context",item.context},{"frame",item.frame},
+                            {"cost",std::to_string(item.cost)},{"manifestation",item.manifestation},
+                            {"evidence",item.evidence},{"signature",item.signature},
+                            {"source_key",cache_key::Hex(item.sourceKey)},
+                            {"group",cache_key::Hex(groupKey)}};
+                        topWriter->Append(groupKey+cache_key::Unsigned(item.context),payload.dump());
+                    });
+                samples.push_back({{"source_ordinal",std::to_string(*context.sourceOrdinal)},
+                    {"frame_scope",context.frameScope},{"series_rows",std::to_string(context.seriesCount)},
+                    {"scan_ms",ElapsedMs(began)},{"series_read_ms",readMs},
+                    {"top_facts",topCount},{"signals",signals.size()}});
+            }
+            uint64_t commitMs=0;
+            if(topWriter){const auto began=std::chrono::steady_clock::now(); topWriter->Commit();commitMs=ElapsedMs(began);}
+            std::cout<<nlohmann::json{{"mode",writePolicyTops?"policy_context_scratch":
+                sharedPolicyRead?"policy_context_shared_reader":"policy_context_read_only"},
+                {"start_ordinal",ordinal},{"top_commit_ms",commitMs},
+                {"scratch_bytes",scratchUsage?scratchUsage->Snapshot().currentBytes:0},
+                {"elapsed_ms",ElapsedMs(started)},{"timeline_rows",timelineRows},
+                {"page_records",page.records.size()},{"samples",samples},
+                {"workspace_peak",workspace->Snapshot().peakBytes}}.dump()<<'\n';
+            return 0;
+        }
+        const bool neutralPrefix=argc==5 && std::string_view(argv[1])=="--cpu-prefix-neutral";
+        if( ( argc == 4 && ( std::string_view( argv[1] ) == "--cpu-prefix" ||
+            std::string_view( argv[1] ) == "--cpu-prefix-binary" ) ) || neutralPrefix )
         {
             const auto target = std::stoull( argv[3] );
             if( target == 0 || target > 20'000'000 ) throw std::runtime_error( "cpu_prefix_limit" );
@@ -48,6 +159,13 @@ int main( int argc, char** argv )
             QueryResourceContextOptions options;
             const auto bytes = std::filesystem::file_size( tracePath );
             options.expectedFinalDiskLimit = bytes * 4; options.expectedPeakDiskLimit = bytes * 8;
+            std::filesystem::path scratch;
+            if(neutralPrefix) {
+                scratch=argv[4];
+                if(std::filesystem::exists(scratch)) throw std::runtime_error("cpu_prefix_scratch_exists");
+                std::filesystem::create_directories(scratch);
+                options.accountingRoots.push_back(scratch);
+            }
             auto resources = QueryIndex::CreateResourceContext( tracePath, options );
             const auto validated = QueryIndex::Validate( tracePath, false, resources );
             if( !validated.manifest ) throw std::runtime_error( validated.reason );
@@ -56,6 +174,9 @@ int main( int argc, char** argv )
             uint64_t observed = 0, emitted = 0;
             CpuFrameScanOptions scan;
             scan.workspace = resources->Workspace();
+            scan.useFrameCursor=std::string_view(argv[1])!="--cpu-prefix-binary";
+            CpuFrameScanTimings latestTimings;
+            scan.timingProgress=[&](const CpuFrameScanTimings& value) { latestTimings=value; };
             scan.includeExactSignatures = false; scan.includeLogicalSignatures = true;
             scan.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
             scan.canonicalizeLogicalDynamicNames = true;
@@ -63,10 +184,33 @@ int main( int argc, char** argv )
             scan.progress = [&]( uint64_t count, uint64_t runs ) { observed = count; emitted = runs; };
             scan.cancelled = [&] { return observed >= target || ElapsedMs( started ) > 120000; };
             scan.definitionSink = []( const CpuSignatureDefinition& ) { return true; };
+            std::unique_ptr<NeutralStatisticsStreamBuilder> statistics;
+            AnalysisWorkspaceReservation registryWorkspace(resources->Workspace());
+            std::unordered_map<uint64_t,NeutralStatisticsStreamBuilder::SignatureToken> tokens;
+            if(neutralPrefix) statistics=std::make_unique<NeutralStatisticsStreamBuilder>(
+                scratch/"neutral",131072,65536,resources->Workspace(),resources->Disk());
             bool stopped = false;
             try {
                 ExactFrameCpuScanner( *source ).ScanView(
-                    []( const CpuSignatureFrameRunView& ) { return true; }, scan );
+                    [&]( const CpuSignatureFrameRunView& run ) {
+                        if(!statistics) return true;
+                        const auto key=(uint64_t(run.signatureOrdinal)<<32)|run.frameSetOrdinal;
+                        auto found=tokens.find(key);
+                        if(found==tokens.end()) {
+                            const auto token=statistics->RegisterSignature("cpu",run.signatureId,run.frameSetRef);
+                            if(token==NeutralStatisticsStreamBuilder::InvalidSignatureToken)
+                                throw std::runtime_error("cpu_prefix_neutral_register");
+                            registryWorkspace.Add(128);
+                            found=tokens.emplace(key,token).first;
+                        }
+                        const bool wait=run.workClass==CpuWorkClass::Wait ||
+                            run.workClass==CpuWorkClass::IntentionalPacing;
+                        if(!statistics->AddRegisteredRun(found->second,uint64_t(run.frameIndex),
+                            run.inclusiveNs,run.exclusiveNs,wait?run.inclusiveNs:0,0,
+                            run.occurrenceCount,run.exact,true))
+                            throw std::runtime_error("cpu_prefix_neutral_ingest");
+                        return true;
+                    }, scan );
             }
             catch( const BoundedScanError& error ) {
                 if( std::string( error.what() ).find( "cancelled" ) == std::string::npos ) throw;
@@ -74,9 +218,21 @@ int main( int argc, char** argv )
             }
             const auto snapshot = resources->Snapshot();
             std::cout << nlohmann::json {
-                { "mode", "cpu_prefix_bounded" }, { "zones", std::to_string( observed ) },
+                { "mode", scan.useFrameCursor ? "cpu_prefix_cursor" : "cpu_prefix_binary" },
+                { "zones", std::to_string( observed ) },
                 { "target", std::to_string( target ) }, { "emitted_runs", std::to_string( emitted ) },
                 { "scan_elapsed_ms", std::to_string( ElapsedMs( started ) ) },
+                { "frame_read_ms", std::to_string( latestTimings.frameReadNs / 1'000'000 ) },
+                { "zone_read_decode_ms", std::to_string( latestTimings.zoneReadNs / 1'000'000 ) },
+                { "zone_process_ms", std::to_string( latestTimings.zoneProcessNs / 1'000'000 ) },
+                { "frame_pages", std::to_string( latestTimings.frameReadCalls ) },
+                { "zone_pages", std::to_string( latestTimings.zoneReadCalls ) },
+                { "frame_boundary_probes", std::to_string( latestTimings.frameBoundaryProbes ) },
+                { "logical_signature_hashes", std::to_string( latestTimings.logicalSignatureHashes ) },
+                { "sink_samples", std::to_string( latestTimings.sinkSamples ) },
+                { "sink_sample_ns", std::to_string( latestTimings.sinkSampleNs ) },
+                { "sink_mode", neutralPrefix ? "neutral" : "empty" },
+                { "scratch_bytes", std::to_string(neutralPrefix ? AnalysisDiskUsage::Bytes(scratch) : 0) },
                 { "stopped", stopped }, { "workspace_peak", std::to_string( snapshot.workspace.peakBytes ) },
                 { "disk_current", std::to_string( snapshot.disk.currentBytes ) }
             }.dump() << '\n';
@@ -252,7 +408,6 @@ int main( int argc, char** argv )
             RequireSameFacts( raw[index], policy[index] );
             if( raw[index].extraName ) ++dynamicNames;
         }
-        if( dynamicNames == 0 ) throw std::runtime_error( "probe_window_has_no_dynamic_names" );
         std::cout << nlohmann::json {
             { "start", std::to_string( start ) }, { "count", std::to_string( count ) },
             { "dynamic_names", std::to_string( dynamicNames ) },

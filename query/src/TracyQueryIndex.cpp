@@ -5379,15 +5379,42 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             resources->SetPhase( "gpu-reference-reverse-index" );
             if( !catalog.PreparePointerResolutionFastPath() )
                 std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap; using paged lookup\n";
-            QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input, storageOptions );
+            const auto referenceBuildStarted=std::chrono::steady_clock::now();
+            QueryGpuReferenceBuildStatistics referenceBuild;
+            QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input,
+                storageOptions, &referenceBuild );
+            std::cerr << "Query gpu-reference-build duration_ms=" <<
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now()-referenceBuildStarted).count()
+                << " pass_sort_ms=" << referenceBuild.passEventSortMs
+                << " pass_publish_ms=" << referenceBuild.passTimePublishMs
+                << " use_sort_ms=" << referenceBuild.usePassSortMs
+                << " use_partition_write_ms=" << referenceBuild.usePartitionWriteMs
+                << " use_partition_read_ms=" << referenceBuild.usePartitionReadMs
+                << " use_partition_sort_ms=" << referenceBuild.usePartitionSortMs
+                << " use_resolve_emit_ms=" << referenceBuild.useResolveEmitMs
+                << " resource_sort_ms=" << referenceBuild.resourceSortMs
+                << " resource_publish_ms=" << referenceBuild.resourcePublishMs
+                << " catalog_replay_ms=" << referenceBuild.catalogReplayMs
+                << " catalog_sort_ms=" << referenceBuild.catalogSortMs
+                << " catalog_publish_ms=" << referenceBuild.catalogPublishMs << '\n';
             QueryGpuReferenceStoreReader check( temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
             auto referenceValidationScratch = temporaryJn[useIndex];
             referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
                 std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
             resources->IncludeDiskRoots( { referenceValidationScratch } );
-            check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+            const auto referenceValidation=check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                 return catalog.ResolveResourcePointer( pointerToken, time );
             }, referenceValidationScratch );
+            std::cerr << "Query gpu-reference-validation duration_ms=" << referenceValidation.totalMs
+                << " pass_use_ms=" << referenceValidation.passAndUseValidationMs
+                << " resource_source_ms=" << referenceValidation.resourceSourceMs
+                << " resource_sort_ms=" << referenceValidation.resourceSortMs
+                << " resource_compare_ms=" << referenceValidation.resourceCompareMs
+                << " catalog_source_ms=" << referenceValidation.catalogSourceMs
+                << " catalog_sort_ms=" << referenceValidation.catalogSortMs
+                << " catalog_compare_ms=" << referenceValidation.catalogCompareMs
+                << " cleanup_ms=" << referenceValidation.cleanupMs << '\n';
             resources->SetPhase( "gpu-pass-resource-input" );
             const auto linkIndex = size_t( SerializedZoneSink::JnDomain::GfxLink );
             auto linkManifest = result.gfxLinks; linkManifest.path = temporaryJn[linkIndex];

@@ -4,6 +4,8 @@
 #include "TracyAnalysisCacheSort.hpp"
 #include "TracyAnalysisCacheKey.hpp"
 #include <algorithm>
+#include <chrono>
+#include <iostream>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -285,6 +287,13 @@ struct Builder
     }
     void PrepareLocals()
     {
+        auto subphaseStarted=std::chrono::steady_clock::now();
+        const auto reportSubphase=[&](const char* stage) {
+            const auto now=std::chrono::steady_clock::now();
+            std::cerr<<"Query policy-local stage="<<stage<<" duration_ms="<<
+                std::chrono::duration_cast<std::chrono::milliseconds>(now-subphaseStarted).count()<<'\n';
+            subphaseStarted=now;
+        };
         AnalysisWorkspaceReservation timelineWorkspace(options.table.workspace),rootsWorkspace(options.table.workspace);
         uint64_t timelineBytes=0;
         std::set<std::string> supplied;
@@ -313,6 +322,7 @@ struct Builder
         { auto order=Reader("context-order");
           if(order.RecordCount()!=count) Fail("context_order_count");
           for(uint64_t i=0;i<count;++i) if(order.GetAt(i).key!=Unsigned(i)) Fail("context_order_gap"); }
+        reportSubphase("context-order");
         const auto& config=input.normalizedProfile.at("candidate_policy");
         const auto topN=config.value("local_top_n",uint64_t(5));
         if(topN>1000) Fail("local_top_budget");
@@ -330,6 +340,7 @@ struct Builder
             [&](const auto& visit){for(const auto& [_,c]:roots) visit(c);},
             &timelineWorkspace,options.table.workspace);
         roots.clear(); rootsWorkspace.Resize(0);
+        reportSubphase("frame-prepare");
         auto topInput=Sorter("local-top-input"),observations=Sorter("local-observations");
         VisitContexts([&](const PolicySignatureContext& c) {
             if(FrameBytes(c.frames)>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
@@ -384,6 +395,7 @@ struct Builder
             }
         });
         topInput->Commit(); topInput.reset();
+        reportSubphase("context-scan");
         {
             auto inputTop=Reader("local-top-input"); std::string group;
             const auto slotBytes=2ull*sizeof(frame_window::TopItem)*(topN+1);
@@ -422,6 +434,7 @@ struct Builder
             flush();
         }
         observations->Commit(); observations.reset();
+        reportSubphase("local-top");
         {
             auto observationsReader=Reader("local-observations"); auto output=Sorter("local-signals");
             AnalysisWorkspaceReservation keysWorkspace(options.table.workspace),signalWorkspace(options.table.workspace);
@@ -471,6 +484,7 @@ struct Builder
             }
             flush(); output->Commit();
         }
+        reportSubphase("signals");
     }
     void PrepareRankings()
     {
@@ -677,7 +691,19 @@ std::string BuildCandidatePolicyCache(const std::filesystem::path& root,NeutralS
     const CandidatePolicyInput& metadata,CandidatePolicyCacheOptions options)
 {
     Builder builder(root,neutral,metadata,std::move(options));
-    builder.PrepareLocals(); builder.PrepareRankings(); builder.Join(); builder.Reduce(); builder.Publish(); return builder.identity;
+    const auto phase=[&](const char* name,auto&& action)
+    {
+        const auto start=std::chrono::steady_clock::now();
+        action();
+        const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+        std::cerr<<"Query policy-phase stage="<<name<<" duration_ms="<<elapsed<<'\n';
+    };
+    phase("prepare-locals",[&]{builder.PrepareLocals();});
+    phase("prepare-rankings",[&]{builder.PrepareRankings();});
+    phase("join",[&]{builder.Join();});
+    phase("reduce",[&]{builder.Reduce();});
+    phase("publish",[&]{builder.Publish();});
+    return builder.identity;
 }
 struct CandidatePolicyCacheReader::Impl
 {
