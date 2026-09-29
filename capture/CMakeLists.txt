@@ -149,3 +149,8 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-jn-record-reader-tests PRIVATE TracyServer)
     add_test(NAME tracy-jn-record-reader COMMAND tracy-jn-record-reader-tests ${CMAKE_CURRENT_BINARY_DIR}/jn-reader-test)
 endif()
+
+if(WIN32)
+    target_sources(tracy-capture PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsUtf8.manifest)
+    target_sources(tracy-stream-convert PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsUtf8.manifest)
+endif()

@@ -1,5 +1,7 @@
 # Query 长数据改造：存储基础检查点
 
+> 2026-09-29：用户决定收尾当前批次并合并到dev，性能优化转新对话。R14冷建与R19 Scan/热验收已有通过证据，但大文件恢复、Ghost全量MCP分页、全根目录历史峰值和GPU Frame支持等边界仍明确保留。当前交付与后续事项见[收尾交接](Query-LongData-Task-Closure-20260929.zh-CN.md)和[独立核对数据](Query-LongData-R19-Audit-20260929.json)。下方为历史实施记录。
+
 ## 2026-09-18：修订计划 P0 完成，进入 P1
 
 当前执行基线为 `2acd13ed674ba04ab87948ba959e15524d707085`、索引 schema19。r8 JNTRACYX v1 Trace 已冻结为 12,428,310,213 字节、SHA256 `DA845BBC88E15688F262F979529E5904FCFD560B4FF0936CD8B6E525C3C5935A`；旧 `1ce08c45` 只作为历史源码基线。

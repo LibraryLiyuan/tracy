@@ -152,7 +152,7 @@ unordered_flat_map<uint32_t, View::MemPathData> View::GetCallstackPaths( const M
 unordered_flat_map<uint32_t, View::MemPathData> View::GetCallstackPaths( const std::vector<const MemEvent*>& events ) const
 {
     unordered_flat_map<uint32_t, MemPathData> pathSum;
-    pathSum.reserve( std::min( events.size(), m_worker.GetCallstackPayloadCount() ) );
+    pathSum.reserve( std::min<uint64_t>( events.size(), m_worker.GetCallstackPayloadCount() ) );
     for( const auto* event : events )
     {
         if( !event || event->CsAlloc() == 0 ) continue;

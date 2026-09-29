@@ -711,6 +711,7 @@ bool View::DrawImpl()
         return keepOpen;
     }
 
+    ReportViewTick();
     if( m_achievements )
     {
         if( m_worker.IsConnected() ) Achieve( "connectToClient" );
@@ -1498,6 +1499,7 @@ void View::SelectThread( uint64_t thread )
 bool View::WasActive() const
 {
     return m_wasActive ||
+        m_reportLayoutFrames > 0 ||
         m_zoomAnim.active ||
         m_notificationTime > 0 ||
         !m_playback.pause ||

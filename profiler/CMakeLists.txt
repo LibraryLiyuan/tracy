@@ -7,6 +7,9 @@ option(NO_ISA_EXTENSIONS "Disable ISA extensions (don't pass -march=native or -m
 option(NO_STATISTICS "Disable calculation of statistics" OFF)
 option(SELF_PROFILE "Enable self-profiling" OFF)
 option(SANITIZE "Sanitizer parameters" OFF)
+option(TRACY_LOCAL_REPORT_VIEWER "Build the runtime-loaded local report Web Profiler" OFF)
+set(TRACY_HOST_EMBED "" CACHE FILEPATH "Native embed executable for cross-compilation")
+set(TRACY_REPORT_REVISION "unknown" CACHE STRING "Source identity for local report viewer build")
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)
 
@@ -34,12 +37,18 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
 include(ExternalProject)
+if(EMSCRIPTEN AND TRACY_HOST_EMBED)
+add_custom_target(embed)
+set(TRACY_EMBED_EXECUTABLE "${TRACY_HOST_EMBED}")
+else()
 ExternalProject_Add(embed
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/helpers
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}
 )
+set(TRACY_EMBED_EXECUTABLE "${CMAKE_CURRENT_BINARY_DIR}/embed")
+endif()
 
 add_custom_command(
     OUTPUT data
@@ -49,7 +58,7 @@ add_custom_command(
 function(Embed LIST NAME FILE)
     add_custom_command(
         OUTPUT data/${NAME}.cpp data/${NAME}.hpp
-        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/embed ${NAME} ${CMAKE_CURRENT_LIST_DIR}/${FILE} data/${NAME}
+        COMMAND ${TRACY_EMBED_EXECUTABLE} ${NAME} ${CMAKE_CURRENT_LIST_DIR}/${FILE} data/${NAME}
         DEPENDS data embed ${CMAKE_CURRENT_LIST_DIR}/${FILE}
     )
     list(APPEND ${LIST} data/${NAME}.cpp)
@@ -108,6 +117,7 @@ set(SERVER_FILES
     TracyView_Memory.cpp
     TracyView_Messages.cpp
     TracyView_Navigation.cpp
+    TracyView_ReportNavigation.cpp
     TracyView_NotificationArea.cpp
     TracyView_Options.cpp
     TracyView_Playback.cpp
@@ -274,6 +284,12 @@ if(NOT DEFINED GIT_REV)
     set(GIT_REV "HEAD")
 endif()
 
+if(TRACY_LOCAL_REPORT_VIEWER)
+    if(NOT EMSCRIPTEN OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "Local report viewer requires Emscripten MEMORY64=1 for C and CXX")
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/GitRef.hpp" "#pragma once\nnamespace tracy { static inline const char* GitRef = \"${TRACY_REPORT_REVISION}\"; }\n")
+else()
 find_package(Git)
 if(Git_FOUND)
     add_custom_target(git-ref
@@ -294,6 +310,7 @@ else()
     )
     target_sources(${PROJECT_NAME} PUBLIC GitRef.hpp)
 endif()
+endif()
 
 if(NOT EMSCRIPTEN)
     if(NOT NO_FILESELECTOR)
@@ -305,11 +322,18 @@ if(NOT EMSCRIPTEN)
 endif()
 
 if(EMSCRIPTEN)
+  if(TRACY_LOCAL_REPORT_VIEWER)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TRACY_LOCAL_REPORT_VIEWER=1)
+    target_link_options(${PROJECT_NAME} PRIVATE -pthread -g2 -O0 -sASSERTIONS=1 -sABORTING_MALLOC=1 -sSTACK_OVERFLOW_CHECK=2 -sINITIAL_MEMORY=384mb -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=16gb -sSTACK_SIZE=1048576 -sWASM_BIGINT=1 -sPTHREAD_POOL_SIZE=64 -sEXPORTED_FUNCTIONS=_main,_nativeOpenFile,_tracyReportBindCapture,_tracyReportState,_tracyReportNavigate,_tracyReportSelectEvent -sEXPORTED_RUNTIME_METHODS=ccall,callMain,FS -sENVIRONMENT=web,worker)
+    configure_file(${CMAKE_CURRENT_LIST_DIR}/local-report-viewer/web/index.html ${CMAKE_CURRENT_BINARY_DIR}/index.html COPYONLY)
+    configure_file(${CMAKE_CURRENT_LIST_DIR}/local-report-viewer/web/report-viewer.js ${CMAKE_CURRENT_BINARY_DIR}/report-viewer.js COPYONLY)
+  else()
     target_link_options(${PROJECT_NAME} PRIVATE -pthread -sASSERTIONS=0 -sINITIAL_MEMORY=384mb -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4gb -sSTACK_SIZE=1048576 -sWASM_BIGINT=1 -sPTHREAD_POOL_SIZE=8 -sEXPORTED_FUNCTIONS=_main,_nativeOpenFile -sEXPORTED_RUNTIME_METHODS=ccall -sENVIRONMENT=web,worker --preload-file embed.tracy)
 
     file(DOWNLOAD https://share.nereid.pl/i/embed.tracy ${CMAKE_CURRENT_BINARY_DIR}/embed.tracy EXPECTED_MD5 ca0fa4f01e7b8ca5581daa16b16c768d)
     file(COPY ${CMAKE_CURRENT_LIST_DIR}/wasm/index.html DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
     file(COPY ${CMAKE_CURRENT_LIST_DIR}/wasm/httpd.py DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+  endif()
     file(COPY_FILE ${CMAKE_CURRENT_LIST_DIR}/../icon/icon.svg ${CMAKE_CURRENT_BINARY_DIR}/favicon.svg)
 endif()
 

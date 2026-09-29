@@ -13,6 +13,7 @@
 #include "ConversionFiles.hpp"
 #include "../../analysis/TracyProcessCommitLimit.hpp"
 
+#include "CaptureStatus.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -2459,7 +2460,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     return 0;
 }
 
-int main(int argc,char** argv)
+int ConvertMain(int argc,char** argv)
 {
     Options options;if(!ParseArguments(argc,argv,options)){Usage();return 1;}
     options.threads=ResolveThreadCount(options.threads);
@@ -2608,3 +2609,9 @@ int main(int argc,char** argv)
     if(!options.cancelFile.empty()){std::error_code ignored;std::filesystem::remove(tracy::analysis::AnalysisIoPath(options.cancelFile),ignored);}
     return (CancelRequested()||cancelled)?130:code;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) { auto args = CaptureUtf8Arguments(argc, argv); std::vector<char*> pointers; for(auto& a: args) pointers.push_back(a.data()); pointers.push_back(nullptr); return ConvertMain(argc,pointers.data()); }
+#else
+int main(int argc,char** argv) { return ConvertMain(argc,argv); }
+#endif

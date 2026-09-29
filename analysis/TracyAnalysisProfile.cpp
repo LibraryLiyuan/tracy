@@ -88,7 +88,7 @@ std::optional<uint64_t> QuantityBytes( const json& value, const std::string& pat
         return std::nullopt;
     }
     const long double bytes = value["value"].get<long double>() * found->second;
-    if( bytes > long double( std::numeric_limits<uint64_t>::max() ) )
+    if( bytes > static_cast<long double>( std::numeric_limits<uint64_t>::max() ) )
     {
         AddError( result, path + ".value", "byte quantity exceeds uint64" );
         return std::nullopt;

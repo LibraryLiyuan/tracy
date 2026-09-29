@@ -168,12 +168,39 @@ void TimelineController::End( double pxns, const ImVec2& wpos, bool hover, bool 
         yOffset = std::max( yOffset, minHeight );
     }
 
+    if( m_reportFocusKey )
+    {
+        int offset = 0;
+        for( const auto& item : m_items )
+        {
+            if( item->GetKey() == m_reportFocusKey )
+            {
+                ImGui::SetScrollY( std::max( 0, offset - 8 ) );
+                m_centerItemkey = nullptr;
+                break;
+            }
+            offset += item->GetHeight();
+        }
+        m_reportFocusKey = nullptr;
+    }
+    m_reportViewportHeight = ImGui::GetWindowHeight();
     const auto scrollPos = ImGui::GetScrollY();
     if( ( scrollPos == 0 && m_scroll != 0 ) || yOffset > m_height )
     {
         m_height = yOffset;
     }
     m_scroll = scrollPos;
+}
+
+bool TimelineController::IsItemHeaderVisible( const void* key ) const
+{
+    float offset = 0;
+    for( const auto& item : m_items )
+    {
+        if( item->GetKey() == key ) return item->IsVisible() && offset >= m_scroll - 1 && offset < m_scroll + m_reportViewportHeight - 16;
+        offset += item->GetHeight();
+    }
+    return false;
 }
 
 }
