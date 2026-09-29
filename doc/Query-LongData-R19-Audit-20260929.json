@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "audited_at": "2026-09-29T08:32:39+08:00",
+  "basis": "R14 published schema49 index, R19 Native Scan and hot-continuation receipts; no second Scan or cold build",
+  "identity": {
+    "commit": "ea6ebfbe641828e36a3398172e883a7930760237",
+    "trace_sha256": "da845bbc88e15688f262f979529e5904fcfd560b4ff0936cd8b6e525c3c5935a",
+    "index_manifest_sha256": "570f5ffe13b09269b31d5dfadec50801139ca2c0e21c8f9ab01262e7904b246e",
+    "exe_sha256_rechecked": "5ed5d16ac20e254386c13d09e6a9d6624c8c727f47441d2880b0659bdc5e9858",
+    "index_schema": 49
+  },
+  "execution": {
+    "r14_cold_build_ms": 3483567,
+    "r19_native_scan_ms": 3574523,
+    "r19_native_scan_ms_scope": "Legacy field: whole Native Scan script including initial hot open; use native_scan_stage_ms for the stage deadline",
+    "native_scan_stage_ms": 3541484,
+    "native_scan_stage_deadline_margin_ms": 58516,
+    "r19_full_flow_ms": 6042975,
+    "r19_profile_recompute_ms": 930944,
+    "native_scan_query_exit_code": 0,
+    "continuation_query_exit_code": 0,
+    "original_hot_controller_exit_code": 1,
+    "original_hot_controller_failure": "Client SQLite audit key omitted signature domain and frame scope; focused continuation used the correct triple"
+  },
+  "pagination_audit": {
+    "original_sqlite_quick_check": "ok",
+    "original_resource_rows": 2528691,
+    "original_candidate_rows": 94168,
+    "continuation_sqlite_quick_check": "ok",
+    "continuation_resource_rows": 2528691,
+    "continuation_signature_rows": 66283,
+    "association_pass_objects": 1000,
+    "association_resource_windows": 32,
+    "association_pages": 1034,
+    "association_status": "passed",
+    "ghost_total_backend_validated": 945327458,
+    "ghost_mcp_windows": 8,
+    "ghost_mcp_full_pagination": false
+  },
+  "profile": {
+    "native_aggregate_content_sha256": "6b55071dc1d513a207cf88a6071432abbbcf96c21d59e5e1815fac91065d7c17",
+    "recompute_aggregate_content_sha256": "6b55071dc1d513a207cf88a6071432abbbcf96c21d59e5e1815fac91065d7c17",
+    "native_candidate_content_sha256": "18757c4a5d023b65ae59ce34da7e7948ef9f8e8668408b4c7d54ce45da711a28",
+    "recompute_candidate_content_sha256": "3ac545ddeca3bd61f0616fa7f9145921c92e2adcc22a55f080e562d649bb4f21",
+    "candidate_count": 94168,
+    "selected_count": 28270,
+    "quality_complete": true,
+    "unreported_gap_count": 0
+  },
+  "disk": {
+    "final_limit_bytes": 49713240852,
+    "live_peak_limit_bytes": 99426481704,
+    "measured_final_derived_bytes": 46172826297,
+    "final_headroom_bytes": 3540414555,
+    "parts_bytes": {
+      "r14_published_index": 40324284637,
+      "r15_existing_analysis": 2945235267,
+      "r4_output": 81300148,
+      "r4_fan_in_output": 155478045,
+      "r4_frame_series_output": 39921767,
+      "r19_analysis": 2626606433
+    },
+    "r14_cold_build_reported_peak_bytes": 80449152815,
+    "r19_continuous_all_root_peak_measurement": null,
+    "r19_analysis_temporary_name_matches": 0,
+    "r14_index_reader_lock_bytes": 0,
+    "note": "Final size measured by recursive file lengths. The R14 cold-build peak is a separate earlier run. R19 has no independent continuous all-root peak sample, so the 8S peak gate is not asserted as proven. Client receipt files are accounted separately."
+  },
+  "memory": {
+    "r14_cold_build_peak_private_bytes": 7913672704,
+    "r19_native_scan_peak_private_bytes": 3401097216,
+    "r19_profile_peak_private_bytes": 3592888320,
+    "r19_native_scan_min_system_commit_headroom_bytes": 665993216,
+    "r19_profile_min_system_commit_headroom_bytes": 379289600
+  },
+  "open_requirements": [
+    "real large-trace cold-build checkpoint and restart acceptance",
+    "full Ghost MCP pagination across 945327458 rows",
+    "continuous all-root disk peak proof for R19",
+    "single continuous cold-build plus Scan plus hot acceptance; R19 reused the R14 cold index",
+    "GPU Frame association remains explicitly unsupported"
+  ]
+}

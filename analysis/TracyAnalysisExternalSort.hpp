@@ -3,8 +3,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <string>
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 namespace tracy::analysis
 {
@@ -17,6 +20,82 @@ struct AnalysisUInt64Pair
 
 static_assert( sizeof( AnalysisUInt64Pair ) == 16 );
 
+struct AnalysisKeyMetadataRecord
+{
+    uint64_t keyHigh = 0;
+    uint64_t keyLow = 0;
+    uint64_t metadata = 0;
+    uint32_t auxiliary = 0;
+    uint8_t kind = 0;
+    uint8_t reserved[3] {};
+};
+
+static_assert( sizeof( AnalysisKeyMetadataRecord ) == 32 );
+
+// Logical bytes processed by this sort, not operating-system physical I/O.
+// On failure, only completed phases are reflected in these counters.
+struct AnalysisExternalSortStatistics
+{
+    uint64_t inputRecords = 0;
+    uint64_t initialRuns = 0;
+    uint64_t mergePasses = 0;
+    uint64_t mergedGroups = 0;
+    uint64_t sourceReadBytes = 0;
+    uint64_t initialRunWriteBytes = 0;
+    uint64_t mergeReadBytes = 0;
+    uint64_t mergeWriteBytes = 0;
+};
+
+// Streaming counterpart of SortAnalysisUInt64PairsGenerated. Records are
+// emitted once as the producer scans its source; sorted runs stay bounded by
+// the shared workspace and are merged when Finish is called.
+class AnalysisUInt64PairRunCollector
+{
+public:
+    AnalysisUInt64PairRunCollector( std::filesystem::path output,
+        std::filesystem::path temporaryRoot, std::string prefix,
+        uint64_t maximumBufferedPairs,
+        std::shared_ptr<AnalysisDiskBudget> disk = {},
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace = {},
+        std::function<bool()> cancelled = {},
+        AnalysisExternalSortStatistics* statistics = nullptr );
+    ~AnalysisUInt64PairRunCollector();
+    AnalysisUInt64PairRunCollector( const AnalysisUInt64PairRunCollector& ) = delete;
+    AnalysisUInt64PairRunCollector& operator=( const AnalysisUInt64PairRunCollector& ) = delete;
+    void Emit( const AnalysisUInt64Pair& value );
+    bool Finish( std::string& error );
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+// Keeps sorted runs for one metadata stream while the caller emits records.
+// Multiple collectors can share one producer and the same workspace budget.
+class AnalysisKeyMetadataRunCollector
+{
+public:
+    AnalysisKeyMetadataRunCollector( std::filesystem::path output,
+        std::filesystem::path temporaryRoot, std::string prefix,
+        uint64_t maximumBufferedRecords,
+        std::shared_ptr<AnalysisDiskBudget> disk = {},
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace = {},
+        std::function<bool()> cancelled = {},
+        AnalysisExternalSortStatistics* statistics = nullptr );
+    ~AnalysisKeyMetadataRunCollector();
+    AnalysisKeyMetadataRunCollector( const AnalysisKeyMetadataRunCollector& ) = delete;
+    AnalysisKeyMetadataRunCollector& operator=( const AnalysisKeyMetadataRunCollector& ) = delete;
+    void Emit( const AnalysisKeyMetadataRecord& value );
+    bool Finish( std::string& error );
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+// Choose a bounded run length that aims for one 64-way merge while leaving
+// at least half of the currently available shared workspace for other users.
+uint64_t ChooseAnalysisExternalSortBufferRecords( uint64_t inputRecords, uint32_t recordBytes,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
+
 bool SortAnalysisUInt64Pairs(
     const std::filesystem::path& source,
     const std::filesystem::path& output,
@@ -24,7 +103,46 @@ bool SortAnalysisUInt64Pairs(
     const std::string& prefix,
     uint64_t expectedCount,
     uint64_t maximumBufferedPairs,
-    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {} );
+
+bool SortAnalysisUInt64PairsGenerated(
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t maximumBufferedPairs,
+    const std::function<void(const std::function<void(const AnalysisUInt64Pair&)>& emit)>& produce,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
+
+bool SortAnalysisKeyMetadataRecords(
+    const std::filesystem::path& source,
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t expectedCount,
+    uint64_t maximumBufferedRecords,
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
+
+// Generate sorted runs as records arrive, avoiding a complete unsorted source
+// file for high-volume joins. The producer must call emit exactly once per
+// record; exceptions propagate so the owner can clean its scratch directory.
+bool SortAnalysisKeyMetadataRecordsGenerated(
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t maximumBufferedRecords,
+    const std::function<void(const std::function<void(const AnalysisKeyMetadataRecord&)>& emit)>& produce,
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
 
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,

@@ -2,9 +2,11 @@
 #define __TRACYGPUJOBMANAGEDSCANNER_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -199,6 +201,7 @@ struct GpuJobManagedScanResult
     uint64_t jobCount = 0;
     uint64_t managedZoneCount = 0;
     uint64_t relationCount = 0;
+    bool gpuFrameEvidenceEvaluated = true;
     bool qualityComplete = true;
     std::vector<GpuSignatureDefinition> gpuSignatures;
     std::vector<GpuZoneScanFact> gpuZones;
@@ -226,6 +229,16 @@ struct GpuJobManagedScanOptions
     // definitions are not also retained in result.gpuSignatures.
     std::function<bool( const GpuSignatureDefinition& )> definitionSink;
     bool retainDetails = true;
+    // Native policy aggregation consumes GPU timings/L0 ordinals, not the
+    // separate Frame/GfxEntity/GfxLink evidence graph. Disabling this avoids
+    // rebuilding a whole-capture association snapshot.
+    bool includeGpuFrameEvidence = true;
+    bool includeJobDetails = true;
+    // When set, single-valued Relation ambiguity is validated by bounded
+    // external sort instead of retaining every Relation target in memory.
+    std::filesystem::path temporaryRoot;
+    std::shared_ptr<AnalysisDiskBudget> disk;
+    std::function<void( std::string_view, uint64_t, uint64_t )> progress;
     bool includeExactGpuSignatures = true;
     bool includeLogicalGpuSignatures = true;
     GpuLogicalSignatureMode logicalSignatureMode = GpuLogicalSignatureMode::FullPath;

@@ -101,11 +101,17 @@ public:
         }
         return Page( matching, range );
     }
+    std::vector<CpuZoneDto> ScanCpuZonesForPolicy( const ScanRange& range ) const override
+    {
+        ++policyReads;
+        return TraceSource::ScanCpuZonesForPolicy( range );
+    }
 
     std::string cancelAt;
     std::function<void( std::string_view )> readHook;
     mutable bool cancellationRequested = false;
     mutable size_t readsAfterCancel = 0;
+    mutable size_t policyReads = 0;
     void ReadBoundary( std::string_view domain ) const
     {
         if( readHook ) readHook( domain );
@@ -205,6 +211,7 @@ public:
     {
         return Page( zones, range );
     }
+    void SwapZones(size_t left,size_t right) { std::swap(zones[left],zones[right]); }
 
 private:
     template<typename T>
@@ -478,7 +485,62 @@ int main()
     // the single physical path and single logical site remain two definitions.
     // Cache partitioning must never "fix" cardinality by merging other paths.
     assert( largeResult.signatures.size() == 2 );
-    assert( largeResult.frameBoundaryProbeCount < 4096 * 16 );
+    // All 4096 root occurrences have the same exact identity.  The externally
+    // visible SHA remains unchanged, but it must be computed once per unique
+    // exact definition rather than once per occurrence.
+    assert( largeResult.exactSignatureHashCount == 1 );
+    assert( largeResult.frameBoundaryProbeCount < 4096 * 5 );
+    LargeCpuFrameSource shuffled( 4096 );
+    shuffled.SwapZones(100,3500);
+    const auto scanRuns=[&](bool cursor) {
+        CpuFrameScanOptions options;
+        options.useFrameCursor=cursor;
+        std::vector<std::string> rows;
+        const auto result=ExactFrameCpuScanner( shuffled, 64 ).ScanView([&](const CpuSignatureFrameRunView& run) {
+            rows.push_back(std::string(run.signatureId)+"|"+std::to_string(run.frameIndex)+"|"+
+                std::to_string(run.inclusiveNs)+"|"+std::to_string(run.exclusiveNs)+"|"+
+                std::string(run.frameRef));
+            return true;
+        },options);
+        return std::pair{std::move(rows),result.frameBoundaryProbeCount};
+    };
+    const auto cachedRuns=scanRuns(true), binaryRuns=scanRuns(false);
+    assert(cachedRuns.first==binaryRuns.first);
+    assert(cachedRuns.second<binaryRuns.second/2);
+
+    // Per-occurrence extra names are raw evidence, not stable policy identity.
+    // Canonical logical paths retain the source/function and aggregate every
+    // dynamic label without changing the source DTOs.
+    CpuTreeSource dynamicNames;
+    const auto dynamicTemplate = dynamicNames.zones.front();
+    dynamicNames.zones.assign( 10000, dynamicTemplate );
+    for( size_t index = 0; index < dynamicNames.zones.size(); ++index )
+    {
+        auto& zone = dynamicNames.zones[index];
+        zone.ref = "dynamic:" + std::to_string( index );
+        zone.parentRef.reset();
+        zone.sourceLocationRef = "source:dynamic";
+        zone.name = "Resource tag:" + std::to_string( index );
+        zone.extraName = zone.name;
+        zone.function = "StableResourceSite";
+    }
+    CpuFrameScanOptions canonicalLogical;
+    canonicalLogical.includeExactSignatures = false;
+    canonicalLogical.includeLogicalSignatures = true;
+    canonicalLogical.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+    canonicalLogical.canonicalizeLogicalDynamicNames = true;
+    canonicalLogical.includeLogicalThreadRole = true;
+    uint64_t dynamicRuns = 0;
+    const auto dynamicResult = ExactFrameCpuScanner( dynamicNames, 128 ).Scan(
+        [&]( const CpuSignatureFrameRun& ) { ++dynamicRuns; return true; }, canonicalLogical );
+    assert( dynamicRuns == 10000 );
+    assert( dynamicResult.signatures.size() == 1 );
+    assert( dynamicResult.signatures.front().logical );
+    assert( dynamicResult.signatures.front().name == "StableResourceSite" );
+    assert( dynamicResult.signatures.front().path == "StableResourceSite" );
+    assert( dynamicResult.signatures.front().threadRef == "Main" );
+    assert( dynamicResult.logicalSignatureHashCount == 1 );
+    assert( dynamicNames.policyReads > 0 );
 
     // The policy scan consumes the stable logical rollup only.  Physical
     // thread/path occurrences remain available from TraceSource for targeted
@@ -513,10 +575,22 @@ int main()
     // Removing the definition callback, retaining every full path, changing
     // ancestry, or emitting a definition twice must fail this real scan.
     CpuFrameScanOptions streamedOptions;
+    streamedOptions.collectTiming=true;
+    CpuFrameScanTimings latestTimings;
+    uint64_t timingUpdates=0;
+    streamedOptions.timingProgress=[&](const CpuFrameScanTimings& value) {
+        assert(value.zoneReadCalls>=latestTimings.zoneReadCalls);
+        latestTimings=value; ++timingUpdates;
+    };
     std::map<std::string,CpuSignatureDefinition> definitions;
     streamedOptions.definitionSink=[&](const CpuSignatureDefinition& definition) {
         assert(definitions.emplace(definition.signatureId,definition).second);
         return true;
+    };
+    uint64_t progressCalls=0,progressZones=0,progressRuns=0;
+    streamedOptions.progress=[&](uint64_t zones,uint64_t runs) {
+        assert(zones>=progressZones && runs>=progressRuns);
+        ++progressCalls; progressZones=zones; progressRuns=runs;
     };
     uint64_t definitionStreamRuns=0;
     const auto definitionStream=scanner.ScanView([&](const CpuSignatureFrameRunView& run) {
@@ -524,6 +598,17 @@ int main()
         ++definitionStreamRuns; return true;
     },streamedOptions);
     assert(definitionStreamRuns>0 && definitionStream.signatures.empty() && definitionStream.runs.empty());
+    assert(progressCalls>1 && progressZones==definitionStream.inputZoneCount && progressRuns==definitionStreamRuns);
+    assert(definitionStream.timings.frameReadCalls>0 && definitionStream.timings.zoneReadCalls>1);
+    assert(definitionStream.timings.zoneReadNs>0 && definitionStream.timings.zoneProcessNs>0);
+    assert(definitionStream.timings.totalNs>=definitionStream.timings.zoneReadNs+
+        definitionStream.timings.zoneProcessNs);
+    assert(timingUpdates>1 && latestTimings.zoneReadCalls==definitionStream.timings.zoneReadCalls);
+    assert(latestTimings.inputZones==definitionStream.inputZoneCount &&
+        latestTimings.frameBoundaryProbes==definitionStream.frameBoundaryProbeCount &&
+        latestTimings.logicalSignatureHashes==definitionStream.logicalSignatureHashCount);
+    assert(latestTimings.emittedRuns==definitionStreamRuns && latestTimings.sinkSamples>0 &&
+        latestTimings.sinkSampleNs>0);
     assert(definitions.size()==result.signatures.size());
     for(const auto& expected:result.signatures)
     {

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 namespace tracy::analysis
@@ -18,8 +19,9 @@ class AnalysisWorkspaceBudget
 {
 public:
     explicit AnalysisWorkspaceBudget(uint64_t maximumBytes=4ull*1024*1024*1024,
-        uint64_t targetBytes=2ull*1024*1024*1024)
-        :m_maximum(maximumBytes),m_target(targetBytes)
+        uint64_t targetBytes=2ull*1024*1024*1024,std::function<void(uint64_t)> beforeAcquire={},
+        std::function<void(uint64_t)> onReject={})
+        :m_maximum(maximumBytes),m_target(targetBytes),m_beforeAcquire(std::move(beforeAcquire)),m_onReject(std::move(onReject))
     {
         if(!maximumBytes || maximumBytes>4ull*1024*1024*1024 || targetBytes>maximumBytes)
             throw std::runtime_error("analysis_workspace_configuration");
@@ -28,12 +30,17 @@ public:
     { return {m_target,m_maximum,m_current.load(),m_peak.load(),m_rejected.load()}; }
 private:
     friend class AnalysisWorkspaceReservation;
-    [[noreturn]] void Reject()
-    { ++m_rejected; throw std::runtime_error("analysis_workspace_budget"); }
+    [[noreturn]] void Reject(uint64_t requested=0)
+    {
+        ++m_rejected;
+        if(m_onReject) try { m_onReject(requested); } catch(...) {}
+        throw std::runtime_error("analysis_workspace_budget");
+    }
     void Acquire(uint64_t bytes)
     {
+        if(m_beforeAcquire) m_beforeAcquire(bytes);
         auto current=m_current.load(std::memory_order_relaxed);
-        do { if(bytes>m_maximum-current) Reject(); }
+        do { if(bytes>m_maximum-current) Reject(bytes); }
         while(!m_current.compare_exchange_weak(current,current+bytes,std::memory_order_relaxed));
         const auto next=current+bytes;
         auto peak=m_peak.load(std::memory_order_relaxed);
@@ -41,6 +48,7 @@ private:
     }
     void Release(uint64_t bytes) noexcept { m_current.fetch_sub(bytes,std::memory_order_relaxed); }
     const uint64_t m_maximum,m_target;
+    std::function<void(uint64_t)> m_beforeAcquire,m_onReject;
     std::atomic<uint64_t> m_current=0,m_peak=0,m_rejected=0;
 };
 class AnalysisWorkspaceReservation
@@ -69,7 +77,7 @@ public:
     void Add(uint64_t bytes)
     {
         if(bytes>UINT64_MAX-m_bytes) {
-            if(m_budget) m_budget->Reject();
+            if(m_budget) m_budget->Reject(bytes);
             throw std::runtime_error("analysis_workspace_budget");
         }
         Resize(m_bytes+bytes);

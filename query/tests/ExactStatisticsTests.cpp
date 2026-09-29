@@ -12,6 +12,7 @@
 #include <fstream>
 #include <random>
 #include <iostream>
+#include <sstream>
 
 using namespace tracy::analysis;
 
@@ -183,14 +184,338 @@ void DiskStatistics(const std::filesystem::path& root)
             throw std::runtime_error("Replacing a prior sort output with an empty result must release its old disk charge");
         }
     }
+    {
+        const auto streaming=root/"streaming-pair-sort";
+        std::filesystem::create_directories(streaming);
+        auto pairUsage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{streaming});
+        AnalysisDiskActivity pairActivity(pairUsage);
+        auto pairDisk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{pairUsage,256*1024,{}});
+        auto pairWorkspace=std::make_shared<AnalysisWorkspaceBudget>(256*1024,128*1024);
+        AnalysisExternalSortStatistics statistics;
+        AnalysisUInt64PairRunCollector collector(streaming/"output",streaming,"pairs",2,
+            pairDisk,pairWorkspace,{},&statistics);
+        collector.Emit({2,1}); collector.Emit({1,3}); collector.Emit({1,2});
+        if(!collector.Finish(error)) throw std::runtime_error(error);
+        std::ifstream input(streaming/"output",std::ios::binary);
+        std::vector<AnalysisUInt64Pair> values(3);
+        input.read(reinterpret_cast<char*>(values.data()),std::streamsize(values.size()*sizeof(values[0])));
+        if(!input || values[0].key!=1 || values[0].value!=2 || values[1].key!=1 ||
+            values[1].value!=3 || values[2].key!=2 || values[2].value!=1 ||
+            statistics.inputRecords!=3 || statistics.initialRuns!=2)
+            throw std::runtime_error("Streaming pair collector changed key/value ordering or statistics");
+        input.close();
+        std::error_code cleanupError;
+        AnalysisDiskRemove(streaming,pairDisk,cleanupError,true);
+        if(cleanupError || pairUsage->Current()!=0 || pairWorkspace->Snapshot().currentBytes!=0)
+            throw std::runtime_error("Streaming pair collector did not release its disk/workspace charge");
+    }
+}
+
+template<class Builder> bool CheckpointRoundTrip(const std::filesystem::path& root)
+{
+    const std::string identity(64,'c');
+    if constexpr(requires(Builder& b) { b.SaveCheckpoint(root,identity); b.RestoreCheckpoint(root,identity); })
+    {
+        const auto populate=[](auto& b,uint64_t first,uint64_t last) {
+            for(uint64_t f=first;f<last;++f) for(const auto* id:{"z","a"})
+                assert(b.AddRun(Input(id,f,int64_t(f+1),int64_t(f))));
+        };
+        const auto metadata=[](auto& b) {
+            for(const auto* id:{"z","a"})b.AddDenominator(Denominator(id,4));
+            b.AddDomainAudit({"cpu",true,"complete",8,8,2,std::string(64,'f'),std::string(64,'f'),true,{}});
+        };
+        NeutralStatisticsResult expected;std::string error;
+        {Builder b(root/"baseline",8,2);populate(b,0,4);metadata(b);assert(b.Finish(expected,error));}
+        {
+            Builder b(root/"resume",8,2);populate(b,0,2);metadata(b);
+            b.SaveCheckpoint(root/"resume"/"checkpoint",identity);
+        }
+        const auto abandoned=root/"resume"/"neutral-run-9999.work";
+        const auto unrelated=root/"resume"/"unrelated.work";
+        {std::ofstream file(abandoned,std::ios::binary);file<<"partial";}
+        {std::ofstream file(unrelated,std::ios::binary);file<<"keep";}
+        for(int attempt=0;attempt<2;++attempt) {
+            Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",identity);
+            if constexpr(requires {b.CleanupUnreferencedRuns();})b.CleanupUnreferencedRuns();
+            if(std::filesystem::exists(abandoned) || !std::filesystem::exists(unrelated))
+            {std::cerr<<"restored phase must retire only abandoned owned runs"<<std::endl;return false;}
+            assert(b.InputRunCount()==4 && b.FindSignatureToken("cpu","z","Player.Frame")==0 &&
+                b.FindSignatureToken("cpu","a","Player.Frame")==1);
+            populate(b,2,4); NeutralStatisticsResult result;assert(b.Finish(result,error));
+            assert(result.qualityComplete && result.contentSha256==expected.contentSha256);
+        }
+        bool wrong=false;
+        try {Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",std::string(64,'d'));}
+        catch(const std::exception&){wrong=true;}
+        assert(wrong);
+        std::filesystem::path run;
+        for(const auto& file:std::filesystem::directory_iterator(root/"resume"))
+            if(file.path().filename().string().starts_with("neutral-run-") && file.path().extension()==".work") {run=file.path();break;}
+        assert(!run.empty()); {std::ofstream output(run,std::ios::binary|std::ios::trunc);output<<'x';}
+        bool corrupt=false;
+        try {Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",identity);}
+        catch(const std::exception&){corrupt=true;}
+        assert(corrupt);return true;
+    }
+    else {std::cerr<<"statistics has no complete resumable checkpoint"<<std::endl;return false;}
 }
 
 }
 
 int main( int argc, char** argv )
 {
+    if(argc>1 && std::string_view(argv[1])=="--checkpoint-only")
+    {
+        const auto root=TemporaryRoot();const auto ok=CheckpointRoundTrip<NeutralStatisticsStreamBuilder>(root);
+        std::filesystem::remove_all(root);return ok?0:1;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--constant-distribution-only")
+    {
+        const auto root=TemporaryRoot(); auto disk=std::make_shared<AnalysisDiskBudget>();
+        disk->checkSpace=[] {throw std::runtime_error("constant distribution wrote sort scratch");};
+        try {
+            for(const int64_t value:{0,3,9}) for(const uint64_t zeros:{0,7,4096,6000}) {
+                const std::vector<int64_t> values(4096,value);
+                const auto actual=ComputeExactDistributionExternal(values,zeros,root,"constant",128,disk);
+                AssertDistribution(actual,DistributionOracle(values,zeros));
+            }
+            const auto maximum=std::numeric_limits<int64_t>::max();
+            const auto large=ComputeExactDistributionExternal({maximum},1,root,"large",1,disk);
+            assert(large.exact && large.total==maximum && large.median==double(maximum)/2 && large.mad==double(maximum)/2);
+            const auto overflow=ComputeExactDistributionExternal({maximum,maximum},0,root,"overflow",1,disk);
+            assert(!overflow.exact && overflow.unavailableReason=="statistics_total_overflow");
+            assert(!std::filesystem::exists(root)); return 0;
+        } catch(const std::exception& e) {std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc>1 && std::string_view(argv[1])=="--equal-distribution-only")
+    {
+        const auto root=TemporaryRoot();
+        auto disk=std::make_shared<AnalysisDiskBudget>(); uint64_t writes=0;
+        disk->checkSpace=[&]{++writes;};
+        std::vector<int64_t> values(512);
+        for(size_t i=0;i<values.size();++i) values[i]=(i*47)%1009;
+        const auto expected=ComputeExactDistributionExternal(values,0,root,"oracle",128,disk);
+        const auto singleWrites=writes;
+        NeutralStatisticsStreamBuilder stream(root/"stream",128,512,{},disk);
+        for(size_t i=0;i<values.size();++i) assert(stream.AddRun(Input("equal",i,values[i],values[i],values[i],values[i])));
+        stream.AddDenominator(Denominator("equal",values.size()));
+        writes=0; NeutralStatisticsStreamSummary summary; std::string error; uint64_t outputs=0;
+        assert(stream.FinishToSink(summary,error,[&](const auto& stat,const auto&) {
+            ++outputs;
+            for(const auto* metric:{&stat.inclusive,&stat.exclusive,&stat.wait,&stat.criticalPath}) {
+                AssertDistribution(metric->whenPresent,expected); AssertDistribution(metric->perCompleteFrame,expected);
+            }
+        }));
+        assert(outputs==1);
+        if(writes>4*singleWrites)
+        {std::cerr<<"identical complete/present distributions sorted twice: writes="<<writes<<" single="<<singleWrites<<std::endl;return 1;}
+        std::filesystem::remove_all(root); return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--distribution-cancel-only")
+    {
+        const auto root=TemporaryRoot();
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+        AnalysisDiskActivity activity(usage);
+        auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage;
+        std::vector<int64_t> values(8192);
+        for(size_t i=0;i<values.size();++i) values[i]=(i*47)%1009;
+        for(const uint64_t buffer:{128,65536})
+        {
+            size_t checks=0;
+            const auto result=ComputeExactDistributionExternal(values,7,root,"cancel",buffer,disk,[&]{return ++checks==16;});
+            if(result.exact || result.unavailableReason!="cancelled" || checks!=16)
+            {std::cerr<<"distribution failed cancellation buffer="<<buffer<<" checks="<<checks<<std::endl;return 1;}
+            assert(usage->Snapshot().currentBytes==0 && AnalysisDiskUsage::Bytes(root)==0);
+        }
+        std::filesystem::remove_all(root); return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--reduce-cancel-only")
+    {
+        const auto root=TemporaryRoot();
+        NeutralStatisticsStreamBuilder stream(root,128,1024);
+        for(uint64_t i=0;i<256;++i) assert(stream.AddRun(Input("cancel",i,i,i)));
+        stream.AddDenominator(Denominator("cancel",256));
+        bool cancel=false; uint64_t outputs=0, classified=0;
+        stream.SetCompleteFrameFilter([&](auto,auto,auto){ ++classified; cancel=true; return true; });
+        NeutralStatisticsStreamSummary result; std::string error;
+        const auto ok=stream.FinishToSink(result,error,[&](auto&,auto&){++outputs;},[&]{return cancel;});
+        if(ok || error!="cancelled" || outputs!=0 || classified>128)
+        { std::cerr<<"reduce ignored cancellation inside one signature: outputs="<<outputs<<" classified="<<classified<<std::endl;return 1; }
+        std::filesystem::remove_all(root);
+        return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--distribution-disk-only")
+    {
+        const auto root=TemporaryRoot();
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+        AnalysisDiskActivity activity(usage);
+        auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage;
+        std::vector<int64_t> values;
+        for(int i=0;i<4096;++i) values.push_back((i*47)%1009);
+        const auto actual=ComputeExactDistributionExternal(values,701,root,"bounded",128,disk);
+        AssertDistribution(actual,DistributionOracle(values,701));
+        const auto state=usage->Snapshot();
+        std::cout<<"distribution_disk_peak="<<state.peakBytes<<" remaining="<<state.currentBytes<<'\n';
+        if(state.peakBytes>3*values.size()*sizeof(AnalysisUInt64Pair))
+        { std::cerr<<"distribution retains redundant unsorted source files; peak="<<state.peakBytes<<std::endl; return 1; }
+        assert(state.currentBytes==0 && AnalysisDiskUsage::Bytes(root)==0);
+        {
+            const auto zeroRoot=root/"zero-dominant";
+            auto zeroUsage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{zeroRoot});
+            AnalysisDiskActivity zeroActivity(zeroUsage);
+            auto zeroDisk=std::make_shared<AnalysisDiskBudget>();zeroDisk->usage=zeroUsage;
+            const auto zeroResult=ComputeExactDistributionExternal(values,3*values.size(),zeroRoot,"zero",128,zeroDisk);
+            AssertDistribution(zeroResult,DistributionOracle(values,3*values.size()));
+            if(zeroUsage->Snapshot().peakBytes>2*values.size()*sizeof(AnalysisUInt64Pair))
+            {std::cerr<<"zero median rebuilt an unnecessary deviation sort; peak="<<zeroUsage->Snapshot().peakBytes<<std::endl;return 1;}
+            assert(zeroUsage->Current()==0 && AnalysisDiskUsage::Bytes(zeroRoot)==0);
+        }
+        std::filesystem::remove_all(root);
+        return 0;
+    }
     const auto temporary = TemporaryRoot();
+    {
+        constexpr uint64_t Count=1025;
+        for(const uint64_t maximum:{256ull*1024*1024,16ull*1024*1024})
+        {
+            auto workspace=std::make_shared<AnalysisWorkspaceBudget>(maximum,maximum/2);
+            NeutralStatisticsStreamBuilder stream(temporary/("adaptive-"+std::to_string(maximum)),16,1,workspace);
+            uint64_t mergedRecords=0;
+            stream.SetProgress([&](std::string_view stage,uint64_t done,uint64_t total){
+                if(stage.starts_with("neutral_statistics_merge_pass_") && done==total)mergedRecords+=done;
+            });
+            for(uint64_t frame=0;frame<Count;++frame)assert(stream.AddRun(Input("adaptive",frame,1,1)));
+            stream.AddDenominator(Denominator("adaptive",Count));
+            stream.AddDomainAudit({"cpu",true,"complete",Count,Count,1,std::string(64,'a'),std::string(64,'a'),true,{}});
+            NeutralStatisticsStreamSummary result;std::string error;uint64_t signatures=0;
+            const bool ok=stream.FinishToSink(result,error,[&](const auto& value,const auto& frames){
+                ++signatures;assert(frames.size()==Count && value.exclusive.perCompleteFrame.total==Count &&
+                    value.exclusive.perCompleteFrame.median==1);
+            });
+            if(!ok || !result.qualityComplete || signatures!=1){std::cerr<<"Adaptive merge failed: "<<error<<'\n';return 1;}
+            if(maximum>=256ull*1024*1024 && mergedRecords>2*Count)
+            {std::cerr<<"Statistics merge reread an avoidable third pass despite available workspace\n";return 1;}
+            assert(workspace->Snapshot().peakBytes<=maximum);
+        }
+        if(argc>1 && std::string_view(argv[1])=="--adaptive-merge-only")
+        {std::filesystem::remove_all(temporary);return 0;}
+    }
     std::filesystem::create_directories( temporary );
+
+    {
+        const auto compressedRoot = temporary / "compressed-multiblock-run";
+        NeutralStatisticsStreamBuilder source( compressedRoot, 64, 5000 );
+        const auto token = source.RegisterSignature( "cpu", "compressed", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        for( uint64_t frame = 0; frame < 5000; frame++ )
+            assert( source.AddRegisteredRun( token, frame, int64_t( frame % 17 ), int64_t( frame % 13 ),
+                int64_t( frame % 5 ), int64_t( frame % 7 ), 1, true, false ) );
+        source.AddDenominator( { "cpu", "compressed", "Player.Frame", 5000 } );
+        source.AddDomainAudit( { "cpu", true, "complete", 5000, 5000, 1,
+            std::string( 64, 'a' ), std::string( 64, 'a' ), true, {} } );
+        const auto run = *std::filesystem::directory_iterator( compressedRoot );
+        std::ifstream header( run.path(), std::ios::binary );
+        char magic[8] {};
+        header.read( magic, sizeof( magic ) );
+        const auto runBytes = std::filesystem::file_size( run.path() );
+        if( header.gcount() != sizeof( magic ) || std::memcmp( magic, "JNNRUN2", 8 ) != 0 ||
+            runBytes >= 64 + 5000 * 56 / 2 )
+        {
+            std::cerr << "Neutral run is not the bounded compressed v2 format: bytes=" << runBytes << '\n';
+            return 1;
+        }
+        size_t sinkCalls = 0;
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        if( !source.FinishToSink( summary, error, [&]( const auto& aggregate, const auto& frames ) {
+                ++sinkCalls;
+                assert( aggregate.signatureId == "compressed" && frames.size() == 5000 );
+            } ) || sinkCalls != 1 )
+        {
+            std::cerr << "Compressed multi-block run failed: " << error << '\n';
+            return 1;
+        }
+    }
+    {
+        NeutralStatisticsStreamBuilder source( temporary / "compressed-multilevel-merge", 64, 64 );
+        const auto token = source.RegisterSignature( "cpu", "multilevel", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        for( uint64_t frame = 0; frame < 5000; frame++ )
+            assert( source.AddRegisteredRun( token, frame, int64_t( frame ), int64_t( frame ),
+                0, 0, 1, true, false ) );
+        source.AddDenominator( { "cpu", "multilevel", "Player.Frame", 5000 } );
+        source.AddDomainAudit( { "cpu", true, "complete", 5000, 5000, 1,
+            std::string( 64, 'b' ), std::string( 64, 'b' ), true, {} } );
+        size_t frameCount = 0;
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        if( !source.FinishToSink( summary, error, [&]( const auto&, const auto& frames ) {
+                frameCount += frames.size();
+            } ) || frameCount != 5000 )
+        {
+            std::cerr << "Compressed 32-way multi-level merge failed: " << error << '\n';
+            return 1;
+        }
+    }
+
+    const auto rejectDamagedRun = [&]( std::string_view label, const auto& damage,
+        std::string_view expectedError ) {
+        const auto root = temporary / std::string( label );
+        NeutralStatisticsStreamBuilder source( root, 4, 2 );
+        const auto token = source.RegisterSignature( "cpu", "damaged", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        assert( source.AddRegisteredRun( token, 0, 1, 1, 0, 0, 1, true, false ) );
+        assert( source.AddRegisteredRun( token, 1, 2, 2, 0, 0, 1, true, false ) );
+        const auto run = *std::filesystem::directory_iterator( root );
+        damage( run.path() );
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        const auto ok = source.FinishToSink( summary, error, []( const auto&, const auto& ) {} );
+        if( ok || error != expectedError )
+        {
+            std::cerr << "Damaged neutral run was accepted: case=" << label << " ok=" << ok <<
+                " error=" << error << " expected=" << expectedError << '\n';
+            return false;
+        }
+        return true;
+    };
+    if( !rejectDamagedRun( "truncated-neutral-run", []( const auto& path ) {
+            const auto bytes = std::filesystem::file_size( path );
+            assert( bytes > 1 );
+            std::filesystem::resize_file( path, bytes - 1 );
+        }, "neutral_run_truncated" ) ||
+        !rejectDamagedRun( "missing-record-neutral-run", []( const auto& path ) {
+            const auto bytes = std::filesystem::file_size( path );
+            assert( bytes > 64 + 56 );
+            std::filesystem::resize_file( path, bytes - 56 );
+        }, "neutral_run_truncated" ) ||
+        !rejectDamagedRun( "extra-data-neutral-run", []( const auto& path ) {
+            std::ofstream output( path, std::ios::binary | std::ios::app );
+            output.put( '\x01' );
+        }, "neutral_run_extra_data" ) ||
+        !rejectDamagedRun( "header-neutral-run", []( const auto& path ) {
+            std::fstream file( path, std::ios::binary | std::ios::in | std::ios::out );
+            file.seekp( 0 );
+            file.put( 'X' );
+            file.flush();
+        }, "neutral_run_header_invalid" ) ||
+        !rejectDamagedRun( "checksum-neutral-run", []( const auto& path ) {
+            std::fstream file( path, std::ios::binary | std::ios::in | std::ios::out );
+            file.seekg( -1, std::ios::end );
+            char value = 0;
+            file.read( &value, 1 );
+            value ^= char( 0x80 );
+            file.seekp( -1, std::ios::end );
+            file.write( &value, 1 );
+            file.flush();
+        }, "neutral_run_checksum_mismatch" ) ||
+        !rejectDamagedRun( "missing-neutral-run", []( const auto& path ) {
+            std::filesystem::remove( path );
+        }, "neutral_final_run_open_failed" ) ) return 1;
+    {
+        if( argc > 1 && std::string( argv[1] ) == "--run-integrity-only" )
+        { std::filesystem::remove_all( temporary ); return 0; }
+    }
 
     if(argc == 3 && std::string(argv[1]) == "--scale-streamed")
     {
@@ -267,13 +592,13 @@ int main( int argc, char** argv )
 
     {
         bool allRejected = true;
-        auto workspace = std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+        auto workspace = std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
         if(!BudgetRejected([&] { auto source = BudgetedBuilder(temporary / "budget-raw",workspace,65536); }))
         { std::cerr << "Statistics raw buffers bypassed shared workspace budget\n"; allRejected = false; }
         assert(workspace->Snapshot().currentBytes == 0);
         {
             auto source = BudgetedBuilder(temporary / "budget-denominator",workspace);
-            AnalysisWorkspaceReservation occupied(workspace,1024*1024-workspace->Snapshot().currentBytes-128);
+            AnalysisWorkspaceReservation occupied(workspace,2*1024*1024-workspace->Snapshot().currentBytes-128);
             if(!BudgetRejected([&] { source.AddDenominator(Denominator(std::string(1024,'d').c_str(),5)); }))
             { std::cerr << "Statistics denominators bypassed shared workspace budget\n"; allRejected = false; }
             if(!BudgetRejected([&] { source.AddDomainAudit({std::string(1024,'a'),true,"complete"}); }))
@@ -281,8 +606,8 @@ int main( int argc, char** argv )
         }
         assert(workspace->Snapshot().currentBytes == 0);
         {
-            // One large signature must not bypass the budget just because
-            // its raw input was externally merged in small batches.
+            // A streaming finish must not bypass the budget just because its
+            // raw input was externally merged in small batches.
             auto source = BudgetedBuilder(temporary / "budget-merged-frames",workspace,256);
             const auto token = source.RegisterSignature("cpu","large","Player.Frame");
             for(uint64_t frame=0; frame<8192; ++frame)
@@ -299,7 +624,7 @@ int main( int argc, char** argv )
                     throw std::runtime_error(error);
             });
             if(!rejected || emitted != 0)
-            { std::cerr << "Per-signature statistics workspace bypassed budget\n"; allRejected = false; }
+            { std::cerr << "Streaming statistics finish bypassed workspace budget\n"; allRejected = false; }
         }
         assert(workspace->Snapshot().currentBytes == 0);
         if(!allRejected) return 1;
@@ -308,11 +633,11 @@ int main( int argc, char** argv )
     {
         // Shared scope text must not be copied into every registry and
         // denominator key. Removing dictionary use breaks this bounded scan.
-        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(8*1024*1024,4*1024*1024);
         const char* dictionaryStage="construct"; uint64_t insertedKeys=0;
         try {
             // This test isolates registry/string retention. Four-record raw
-            // batches would create 256 runs and legitimately exceed 2 MiB
+            // batches would create 256 runs and legitimately exceed 8 MiB
             // when opening 32 merge readers; use bounded 64-record batches.
             auto source=BudgetedBuilder(temporary/"dictionary-scope-sharing",workspace,64);
             const std::string scope="Frame-"+std::string(64*1024,'x');
@@ -350,6 +675,12 @@ int main( int argc, char** argv )
         // A disk consumer receives one signature at a time. Completed result
         // objects must not also accumulate behind that consumer's back.
         NeutralStatisticsStreamBuilder streamed(temporary / "sink-output", 64, 64);
+        bool mergeProgress = false, reduceProgress = false;
+        streamed.SetProgress([&](std::string_view stage,uint64_t completed,uint64_t total) {
+            assert(completed<=total);
+            mergeProgress = mergeProgress || stage.starts_with("neutral_statistics_merge_pass_");
+            reduceProgress = reduceProgress || stage=="neutral_statistics_reduce";
+        });
         constexpr uint64_t Count = 256;
         for(uint64_t i = 0; i < Count; ++i)
         {
@@ -366,7 +697,10 @@ int main( int argc, char** argv )
         AnalysisCacheTableOptions cacheOptions;
         cacheOptions.blockBytes = 16384;
         AnalysisCacheTableWriter cache(temporary / "streamed-cache", std::string(64,'a'), "neutral-signatures", cacheOptions);
-        const auto ok = streamed.FinishToSink(summary, error, [&](const auto& signature, const auto& frames) {
+        std::ostringstream timingLog;
+        const auto oldError=std::cerr.rdbuf(timingLog.rdbuf());
+        bool ok=false;
+        try { ok = streamed.FinishToSink(summary, error, [&](const auto& signature, const auto& frames) {
             ++received;
             assert(frames.size() == 3 && signature.presentFrameCount == 3);
             assert(signature.exclusive.perCompleteFrame.total == 6);
@@ -377,8 +711,12 @@ int main( int argc, char** argv )
             auto key = std::to_string(received);
             key.insert(0, 20-key.size(), '0');
             cache.Append(key, SerializeNeutralSignatureRecord(signature));
-        });
-        if(!ok || received != Count || summary.signatureCount != Count ||
+        }); } catch(...) { std::cerr.rdbuf(oldError); throw; }
+        std::cerr.rdbuf(oldError);
+        const auto log=timingLog.str();
+        assert(log.find("Query statistics-phase stage=merge duration_ms=")!=std::string::npos);
+        assert(log.find("Query statistics-phase stage=reduce duration_ms=")!=std::string::npos);
+        if(!ok || received != Count || summary.signatureCount != Count || !mergeProgress || !reduceProgress ||
             !summary.qualityComplete || summary.materializedResultPeak != 0)
         { std::cerr << "Sink output still retains complete signature results: " << summary.materializedResultPeak << '\n'; return 1; }
         assert(summary.domains.size() == 1 && summary.domains[0].actualOutputCount == Count);

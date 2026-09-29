@@ -1,0 +1,53 @@
+#include <cstdio>
+#if __has_include("../../server/TracyFileWriteHooks.hpp")
+#include "../../server/TracyFileWrite.hpp"
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+static void Check(bool v){if(!v)throw std::runtime_error("file-write hook invariant");}
+int main(int argc,char** argv)
+{
+    if(argc!=2)return 2;const auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
+    uint64_t charged=0;bool notified=false;
+    auto hooks=std::make_shared<tracy::FileWriteHooks>();
+    hooks->beforeWrite=[&](uint64_t bytes){if(bytes>8192)throw std::runtime_error("test_disk_limit");charged=bytes;};
+    hooks->failed=[&](const char*){notified=true;};
+    std::vector<char> bytes(2*1024*1024);uint32_t state=7;
+    for(auto& c:bytes){state=state*1664525+1013904223;c=char(state>>24);}
+    bool rejected=false;
+    try {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"bounded.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));out->Write(bytes.data(),bytes.size());out->Finish();}
+    catch(const std::exception&){rejected=true;}
+    Check(rejected&&notified&&charged<=8192&&std::filesystem::file_size(root/"bounded.tracy")<=8192);
+    hooks=std::make_shared<tracy::FileWriteHooks>();notified=false;
+    hooks->failed=[&](const char*){notified=true;};
+    hooks->write=[](const void* p,size_t n,FILE* f){return n?std::fwrite(p,1,n-1,f):0;};
+    rejected=false;
+    try{std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"short.tracy").string().c_str(),tracy::FileCompression::Zstd,1,1,hooks));}
+    catch(const std::exception&){rejected=true;}
+    Check(rejected&&notified);
+    uint64_t checkCalls=0,writeCalls=0;
+    hooks=std::make_shared<tracy::FileWriteHooks>();
+    hooks->check=[&]{++checkCalls;};
+    hooks->write=[&](const void* p,size_t n,FILE* f){++writeCalls;return std::fwrite(p,1,n,f);};
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open((root/"batched.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));for(uint32_t i=0;i<100000;++i)writer->Write(&i,sizeof(i));writer->Finish();const auto stats=writer->GetPipelineStatistics();Check(stats.logicalWriteCalls==100000&&stats.logicalBlocks==7&&stats.physicalWrites==writeCalls&&stats.physicalBytes==std::filesystem::file_size(root/"batched.tracy")&&stats.compressionWorkerNanoseconds>0);}
+    Check(checkCalls<100&&writeCalls<8);
+    const auto directPath=root/"direct-fields.tracy",bufferedPath=root/"buffered-fields.tracy";
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open(directPath.string().c_str(),tracy::FileCompression::Zstd,1,2));std::vector<uint32_t> values(100000);for(uint32_t i=0;i<values.size();++i)values[i]=i*17+3;writer->Write(values.data(),values.size()*sizeof(uint32_t));writer->Finish();}
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open(bufferedPath.string().c_str(),tracy::FileCompression::Zstd,1,2));tracy::BufferedFileWrite buffered(*writer);for(uint32_t i=0;i<100000;++i){const uint32_t value=i*17+3;buffered.Write(&value,sizeof(value));}buffered.Flush();writer->Finish();const auto stats=writer->GetPipelineStatistics();Check(stats.logicalWriteCalls==1&&stats.bufferedInputCalls==100000&&stats.bufferedFlushes==1);}
+    {std::ifstream direct(directPath,std::ios::binary),buffered(bufferedPath,std::ios::binary);const std::vector<char> a((std::istreambuf_iterator<char>(direct)),{}),b((std::istreambuf_iterator<char>(buffered)),{});Check(a==b);}
+    hooks=std::make_shared<tracy::FileWriteHooks>();notified=false;const auto mainThread=std::this_thread::get_id();
+    hooks->check=[&]{if(std::this_thread::get_id()!=mainThread)throw std::runtime_error("injected_compressor_thread_failure");};
+    hooks->failed=[&](const char*){notified=true;};rejected=false;
+    try{std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open((root/"thread.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));writer->Write(bytes.data(),bytes.size());writer->Finish();}
+    catch(const std::exception&){rejected=true;}Check(rejected&&notified);
+    // Default output and repeated explicit finish remain supported.
+    std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"normal.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2));
+    Check(bool(out));out->Write("abcd",4);out->Finish();out->Finish();Check(std::filesystem::file_size(root/"normal.tracy")>8);
+    std::puts("file-write hooks passed");
+}
+#else
+int main(){std::puts("FAIL: checked budgeted FileWrite unavailable");return 1;}
+#endif

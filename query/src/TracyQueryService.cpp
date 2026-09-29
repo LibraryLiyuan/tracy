@@ -1,4 +1,9 @@
 #include "TracyQueryService.hpp"
+#include "TracyQueryCorrelationStore.hpp"
+#include "TracyQuerySpillStatistics.hpp"
+#include <array>
+#include "TracyQueryCatalogStore.hpp"
+#include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyAnalysisProfile.hpp"
 #include "TracyHash.hpp"
@@ -691,6 +696,7 @@ struct PageRequest
     size_t offset = 0;
     size_t rawOffset = 0;
     bool rawOffsetBound = false;
+    std::optional<uint64_t> matchedTotal;
     size_t limit = DefaultPageSize;
     std::string binding;
 };
@@ -715,25 +721,36 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
     bound.erase( "max_cpu_ms" );
     bound.erase( "max_nodes" );
     bound.erase( "max_groups" );
-    page.binding = Hex16( Fnv1a( bound.dump() ) );
+    // Sample v2 raw offsets used to count time-filtered rows. Reject those
+    // opaque cursors instead of interpreting them as logical view ordinals.
+    page.binding = Hex16( Fnv1a( bound.dump() +
+        ( method == "sample.list" ? "\nsample-view-ordinal-v1" : "" ) ) );
     if( params.contains( "cursor" ) )
     {
         if( !params["cursor"].is_string() ) throw QueryError( "INVALID_PARAMS", "cursor must be a string" );
         const auto parts = Split( Base64UrlDecode( params["cursor"].get<std::string>() ), '|' );
         const bool legacy = parts.size() == 7 && parts[0] == "v1";
         const bool current = parts.size() == 8 && parts[0] == "v2";
-        if( ( !legacy && !current ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
+        const bool counted = parts.size() == 9 && parts[0] == "v3" &&
+            ( method == "gpu.resource.search" || method == "gpu.pass.search" );
+        if( ( !legacy && !current && !counted ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
         {
             throw QueryError( "STALE_CURSOR", "cursor does not match the trace, revision, method, or filters" );
         }
         try
         {
             page.offset = size_t( std::stoull( parts[5] ) );
-            if( current )
+            if( current || counted )
             {
                 page.rawOffset = size_t( std::stoull( parts[6] ) );
                 page.rawOffsetBound = true;
-                if( parts[7] != "stable" ) throw std::invalid_argument( "tie breaker" );
+                if( counted ) {
+                    size_t consumed=0;
+                    if(parts[7].empty() || parts[7][0]=='-') throw std::invalid_argument("total");
+                    page.matchedTotal=std::stoull(parts[7],&consumed);
+                    if(consumed!=parts[7].size() || *page.matchedTotal<page.offset) throw std::invalid_argument("total");
+                }
+                if( parts[counted ? 8 : 7] != "stable" ) throw std::invalid_argument( "tie breaker" );
             }
             else if( parts[6] != "stable" ) throw std::invalid_argument( "tie breaker" );
         }
@@ -758,6 +775,15 @@ std::string NextCursorAt( const PageRequest& page, const std::string& method, co
     if( !hasMore ) return {};
     const std::string value = "v2|" + trace.id + '|' + Decimal( trace.revision ) + '|' + method + '|' + page.binding + '|' + std::to_string( nextOffset ) + '|' + std::to_string( nextRawOffset ) + "|stable";
     return Base64UrlEncode( value );
+}
+
+std::string NextResourceCursor( const PageRequest& page, const std::string& method,
+    const TraceSessionSnapshot& trace, size_t returned, size_t nextRawOffset, uint64_t total )
+{
+    const auto nextOffset=page.offset+returned;
+    if(nextOffset>=total) return {};
+    return Base64UrlEncode("v3|"+trace.id+'|'+Decimal(trace.revision)+'|'+method+'|'+page.binding+'|'+
+        std::to_string(nextOffset)+'|'+std::to_string(nextRawOffset)+'|'+std::to_string(total)+"|stable");
 }
 
 json PageJson( const PageRequest& page, size_t returned, const std::string& nextCursor, bool truncated = false )
@@ -829,10 +855,23 @@ json FieldAvailabilityJson( const analysis::FieldAvailabilityDto& value )
     };
 }
 
-json TraceInfoJson( const analysis::TraceInfoDto& value )
+json AppInfoSummaryJson( const analysis::AppInfoSummaryDto& value )
 {
     return {
+        { "present", value.recordCount != 0 },
+        { "record_count", Decimal( value.recordCount ) },
+        { "total_bytes", Decimal( value.totalBytes ) },
+        { "maximum_record_bytes", Decimal( value.maximumRecordBytes ) },
+        { "available_via", "trace.app_info" }
+    };
+}
+
+json TraceInfoJson( const analysis::TraceInfoDto& value, bool includeAppInfo = true,
+    std::optional<analysis::AppInfoSummaryDto> appInfoSummary = std::nullopt )
+{
+    json result = {
         { "fingerprint", value.fingerprint }, { "capture_name", value.captureName }, { "capture_program", value.captureProgram },
+        { "trace_format", { { "family", value.traceFormatName }, { "version", value.traceFormatVersion }, { "base_layout", value.traceVersion }, { "string_index_bits", value.stringIndexBits } } },
         { "host_info", value.hostInfo }, { "capture_time", Decimal( value.captureTime ) }, { "executable_time", Decimal( value.executableTime ) },
         { "process_id", Decimal( value.processId ) }, { "trace_version", value.traceVersion }, { "resolution", Decimal( value.resolution ) },
         { "first_time_ns", Decimal( value.firstTimeNs ) }, { "last_time_ns", Decimal( value.lastTimeNs ) },
@@ -843,8 +882,44 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
         { "legacy_queue_delay_ns", value.legacyQueueDelayNs ? json( Decimal( *value.legacyQueueDelayNs ) ) : json( nullptr ) },
         { "field_availability", { { "legacy_queue_delay_ns", FieldAvailabilityJson( value.legacyQueueDelayAvailability ) } } },
         { "has_crash", value.hasCrash }, { "samples_inconsistent", value.samplesInconsistent },
-        { "counts", CountsJson( value.counts ) }, { "app_info", value.appInfo }, { "trust", "untrusted_trace_data" }
+        { "counts", CountsJson( value.counts ) }, { "trust", "untrusted_trace_data" }
     };
+    if( includeAppInfo ) result["app_info"] = value.appInfo;
+    else
+    {
+        if( !appInfoSummary )
+        {
+            analysis::AppInfoSummaryDto summary;
+            summary.recordCount = value.appInfo.size();
+            for( const auto& record : value.appInfo )
+            {
+                if( record.size() > std::numeric_limits<uint64_t>::max() - summary.totalBytes )
+                    throw std::runtime_error( "trace_app_info_size_overflow" );
+                summary.totalBytes += record.size();
+                summary.maximumRecordBytes = std::max<uint64_t>( summary.maximumRecordBytes, record.size() );
+            }
+            appInfoSummary = summary;
+        }
+        result["app_info_summary"] = AppInfoSummaryJson( *appInfoSummary );
+    }
+    return result;
+}
+
+uint64_t ConservativeJsonStringBytes( std::string_view value )
+{
+    uint64_t result = 2;
+    for( const auto byte : value )
+    {
+        uint64_t add = 1;
+        const auto ch = uint8_t( byte );
+        if( ch == '"' || ch == '\\' || ch == '\b' || ch == '\f' || ch == '\n' || ch == '\r' || ch == '\t' ) add = 2;
+        else if( ch < 0x20 ) add = 6;
+        else if( ch >= 0x80 ) add = 3;
+        if( add > std::numeric_limits<uint64_t>::max() - result )
+            throw std::runtime_error( "trace_app_info_size_overflow" );
+        result += add;
+    }
+    return result;
 }
 
 json CapabilityJson( const analysis::Capability& value )
@@ -3030,6 +3105,78 @@ ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source,
     const std::vector<analysis::GfxLinkDto>* linkOverride = nullptr )
 {
     ExplicitGpuPassSet result;
+    std::optional<QueryIndexedGfxEvidence> indexedEvidence;
+    if( !entityOverride && !linkOverride )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryExplicitPassSource*>( &source ) )
+        {
+            QueryCorrelationReadControl control;
+            control.check = [] { if( ActiveBudget ) ActiveBudget->CheckCancelled(); };
+            control.allowance = []( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass projection scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = []( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto total = indexed->GetIndexedExplicitPassCount();
+            for( uint64_t offset = 0; offset < total; )
+            {
+                const auto page = indexed->ScanIndexedExplicitPasses( offset,
+                    size_t( std::min<uint64_t>( 256, total - offset ) ), control );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "Explicit GPU Pass projection page is incomplete" );
+                for( const auto& value : page )
+                {
+                    ExplicitGpuPassMatch match;
+                    match.pass = value.pass;
+                    match.segment = value.segment;
+                    match.zone = value.zone;
+                    match.commandListId = value.commandListId;
+                    match.frameId = value.frameId;
+                    match.cameraId = value.cameraId;
+                    match.viewId = value.viewId;
+                    match.referenceToken = value.referenceToken;
+                    match.taxonomyId = value.taxonomyId;
+                    match.taxonomyStableId = value.taxonomyStableId;
+                    result.matches.emplace_back( std::move( match ) );
+                }
+                offset += page.size();
+            }
+            for( size_t index = 0; index < result.matches.size(); index++ )
+                if( result.matches[index].segment )
+                    result.byGpuQuery[ExplicitGpuQueryKey( result.matches[index].segment->gpuContext,
+                        result.matches[index].segment->gpuQueryId )].emplace_back( index );
+            return result;
+        }
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( &source ) )
+        {
+            QueryCorrelationReadControl control;
+            control.check = [] { if( ActiveBudget ) ActiveBudget->CheckCancelled(); };
+            control.allowance = []( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass index scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = []( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            if( ActiveBudget )
+            {
+                control.maximumEdges = size_t( ActiveBudget->maxEdges );
+                control.maximumNodes = size_t( ActiveBudget->maxNodes );
+            }
+            indexedEvidence = indexed->GetIndexedExplicitGpuPassEvidence( control );
+            if( indexedEvidence->edgeLimitExceeded || indexedEvidence->nodeLimitExceeded )
+                throw QueryError( "RESOURCE_LIMIT", indexedEvidence->edgeLimitExceeded ?
+                    "Explicit GPU Pass edge budget exhausted" : "Explicit GPU Pass node budget exhausted", true );
+            entityOverride = &indexedEvidence->value.entities;
+            linkOverride = &indexedEvidence->value.links;
+        }
+    }
     std::vector<uint32_t> taxonomyIds;
     if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
     {
@@ -3114,6 +3261,22 @@ void MatchExplicitGpuPassZone( const analysis::TraceSource& source, ExplicitGpuP
         match.bestDistance = distance;
         match.zone = zone;
     }
+}
+
+ExplicitGpuPassMatch IndexedExplicitGpuPassMatch( const QueryIndexedExplicitPass& value )
+{
+    ExplicitGpuPassMatch result;
+    result.pass = value.pass;
+    result.segment = value.segment;
+    result.zone = value.zone;
+    result.commandListId = value.commandListId;
+    result.frameId = value.frameId;
+    result.cameraId = value.cameraId;
+    result.viewId = value.viewId;
+    result.referenceToken = value.referenceToken;
+    result.taxonomyId = value.taxonomyId;
+    result.taxonomyStableId = value.taxonomyStableId;
+    return result;
 }
 
 json ExplicitGpuPassJson( const analysis::TraceSource& source, const ExplicitGpuPassMatch& match,
@@ -4568,6 +4731,25 @@ json QueryService::Execute( const json& request, const std::optional<std::string
             if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
             QueryBudgetState budget( params, stopToken );
             QueryBudgetScope budgetScope( budget );
+            std::shared_ptr<QueryResourceContext> resources;
+            analysis::AnalysisWorkspaceReservation responseWorkspace;
+            const bool traceControlMethod = method == "trace.open" || method == "trace.list" ||
+                method == "trace.status" || method == "trace.wait" || method == "trace.close";
+            if( !traceControlMethod && ( params.contains( "trace_id" ) || defaultTraceId ) )
+            {
+                const auto traceId=ResolveTraceId(params,defaultTraceId);
+                const auto source=m_sessions.GetReadySource(traceId);
+                if(const auto owner=std::dynamic_pointer_cast<QueryResourceContextSource>(source))
+                {
+                    resources=owner->GetQueryResourceContext();
+                    if(resources)
+                    {
+                        resources->SetPhase("query-response:"+method);
+                        resources->CheckMemory(false);
+                        responseWorkspace=analysis::AnalysisWorkspaceReservation(resources->Workspace(),MaximumResponseBytes);
+                    }
+                }
+            }
             auto response = Dispatch( id, method, params, defaultTraceId, stopToken );
             budget.Attach( response );
             if( DumpProtocolJson( response ).size() > MaximumResponseBytes )
@@ -4588,12 +4770,24 @@ json QueryService::Execute( const json& request, const std::optional<std::string
     {
         return Failure( id, error );
     }
+    catch( const QueryResourceError& error )
+    {
+        return Failure( id, error.Code(), error.what(), true );
+    }
+    catch( const std::bad_alloc& )
+    {
+        return Failure( id, "RESOURCE_LIMIT", "query allocation failed", true );
+    }
     catch( const json::exception& error )
     {
         return Failure( id, "INVALID_PARAMS", error.what() );
     }
     catch( const std::exception& error )
     {
+        const std::string message=error.what();
+        if(message.find("workspace_budget")!=std::string::npos || message.find("disk_budget")!=std::string::npos ||
+            message.find("process_memory_budget")!=std::string::npos)
+            return Failure(id,"RESOURCE_LIMIT",message,true);
         return Failure( id, "INTERNAL_ERROR", error.what() );
     }
 }
@@ -4667,6 +4861,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 request.traceSessionId = traceId;
                 request.tracePath = trace.path;
                 request.source = std::move( source );
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( request.source ) )
+                    request.resourceContext = owner->GetQueryResourceContext();
                 request.normalizedProfile = validation.normalized;
                 request.profileIdentity = validation.profileSha256;
                 return snapshot( m_scanManager->Start( request ) );
@@ -4772,7 +4968,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         auto limits = DescribeData()["limits"];
         limits["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         return Success( id, {
-            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.2-JN" } },
+            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "JNTRACYX/1" } },
             { "source_kinds", { "snapshot", "segment" } }, { "statistics_required", true },
             { "limits", std::move( limits ) }
         } );
@@ -4821,9 +5017,63 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     const auto info = [&] { return source->GetTraceInfo(); };
-    if( method == "trace.info" ) return Success( id, TraceInfoJson( info() ), trace );
-    if( method == "trace.counts" ) return Success( id, CountsJson( info().counts ), trace );
-    if( method == "trace.app_info" ) return Success( id, { { "app_info", info().appInfo }, { "trust", "untrusted_trace_data" } }, trace );
+    const auto metadataInfo = [&] { return source->GetTraceInfoMetadata(); };
+    if( method == "trace.info" )
+    {
+        auto metadata = metadataInfo();
+        const auto summary = source->GetAppInfoSummary();
+        bool includeAppInfo = summary.recordCount <= MaximumPageSize &&
+            summary.totalBytes <= MaximumResponseBytes / 2;
+        if( includeAppInfo )
+        {
+            const auto page = source->ReadAppInfo( 0, size_t( summary.recordCount ), MaximumResponseBytes / 2 );
+            uint64_t encodedBytes = 0;
+            for( const auto& record : page.records )
+            {
+                const auto bytes = ConservativeJsonStringBytes( record ) + 1;
+                if( bytes > MaximumResponseBytes - 1024 * 1024 - encodedBytes )
+                { includeAppInfo = false; break; }
+                encodedBytes += bytes;
+            }
+            if( page.oversizedRecordBytes != 0 || page.records.size() != summary.recordCount ) includeAppInfo = false;
+            if( includeAppInfo ) metadata.appInfo = page.records;
+        }
+        return Success( id, TraceInfoJson( metadata, includeAppInfo, summary ), trace );
+    }
+    if( method == "trace.counts" ) return Success( id, CountsJson( metadataInfo().counts ), trace );
+    if( method == "trace.app_info" )
+    {
+        const auto page = ParsePage( params, method, trace );
+        constexpr uint64_t PayloadBudget = MaximumResponseBytes - 1024 * 1024;
+        const auto values = source->ReadAppInfo( page.rawOffset, page.limit, PayloadBudget );
+        if( values.summary.recordCount > std::numeric_limits<size_t>::max() )
+            throw QueryError( "RESOURCE_LIMIT", "AppInfo record count exceeds the pagination range" );
+        if( values.oversizedRecordBytes != 0 )
+            throw QueryError( "RESOURCE_LIMIT", "a single AppInfo record exceeds the 8 MiB response budget and cannot be split by the record-paged API" );
+        json records = json::array();
+        uint64_t encodedBytes = 0;
+        for( const auto& record : values.records )
+        {
+            const auto bytes = ConservativeJsonStringBytes( record ) + 1;
+            if( bytes > PayloadBudget - encodedBytes )
+            {
+                if( records.empty() )
+                    throw QueryError( "RESOURCE_LIMIT", "a single AppInfo record exceeds the 8 MiB encoded response budget" );
+                break;
+            }
+            encodedBytes += bytes;
+            records.push_back( record );
+        }
+        if( records.empty() && page.rawOffset < values.summary.recordCount )
+            throw QueryError( "RESOURCE_LIMIT", "AppInfo page could not make progress under the response budget" );
+        const auto returned = records.size();
+        const auto nextOffset = page.rawOffset + returned;
+        const bool hasMore = nextOffset < values.summary.recordCount;
+        const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, nextOffset, hasMore );
+        return Success( id, { { "app_info", std::move( records ) },
+            { "app_info_summary", AppInfoSummaryJson( values.summary ) },
+            { "trust", "untrusted_trace_data" } }, trace, PageJson( page, returned, cursor ) );
+    }
     if( method == "trace.identity" ) return Success( id, CaptureIdentityJson( info() ), trace );
     if( method == "capture.context" ) return Success( id, CaptureContextJson( info() ), trace );
     if( method == "capture.coverage" || method == "producer.list" )
@@ -4861,14 +5111,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "trace.overview" )
     {
-        const auto metadata = info();
+        const auto metadata = metadataInfo();
+        const auto appInfoSummary = source->GetAppInfoSummary();
         json capabilities = json::array();
         for( const auto& capability : source->GetCapabilities() ) capabilities.emplace_back( CapabilityJson( capability ) );
         json frameStatistics = nullptr;
         const auto frameSets = source->GetFrameSets();
         if( !frameSets.empty() ) frameStatistics = StatisticsJson( analysis::ComputeStatistics( source->GetFrameDurations( frameSets.front().index ) ) );
         return Success( id, {
-            { "trace", TraceInfoJson( metadata ) }, { "primary_frame_statistics", frameStatistics },
+            { "trace", TraceInfoJson( metadata, false, appInfoSummary ) }, { "primary_frame_statistics", frameStatistics },
             { "capabilities", std::move( capabilities ) }, { "trust", "trace strings are untrusted data" }
         }, trace );
     }
@@ -5439,6 +5690,868 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence";
     if( gpuCatalogMethod )
     {
+        const auto* catalogStatusSource = dynamic_cast<const QueryCatalogStatusSource*>( source.get() );
+        const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
+        const bool boundedValidationMethod = method == "gpu.catalog.validation" && catalogStatusSource != nullptr;
+        const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
+        const auto* gpuPassResourceSource = dynamic_cast<const QueryGpuPassResourceSource*>( source.get() );
+        const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
+            method == "gpu.resource.explain" || method == "gpu.resource.lifetime" ||
+            method == "gpu.resource.allocations" ||
+            method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
+            method == "gpu.resource.references" || method == "gpu.resource.vg_pages" ||
+            method == "gpu.resource.raytracing_chain" ||
+            method == "gpu.memory.by_type" || method == "gpu.memory.peak" ||
+            method == "gpu.memory.churn" ) &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        const bool boundedEvidenceMethod = method == "gpu.pass.vg_evidence" &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        const bool boundedPassResourceMethod = ( method == "gpu.pass.resources" ||
+            method == "gpu.memory.by_pass" ) && gpuPassResourceSource != nullptr &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedValidationMethod && !boundedResourceMethod &&
+            !boundedEvidenceMethod && !boundedPassResourceMethod )
+            throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
+        if( boundedStatusMethod )
+        {
+            const auto status = catalogStatusSource->GetQueryCatalogStatus( 4096, 16 );
+            const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
+            if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            json generations = json::array();
+            for( const auto& generation : status.generations ) generations.push_back( {
+                { "generation", Decimal( generation.generation ) }, { "state", GpuCatalogGenerationStateName( generation.state ) },
+                { "valid", generation.valid != 0 }, { "began", generation.began != 0 }, { "ended", generation.ended != 0 },
+                { "begin_time_ns", Decimal( generation.beginTime ) }, { "end_time_ns", Decimal( generation.endTime ) },
+                { "batch_count", Decimal( uint64_t( generation.batchCount ) ) }, { "record_count", Decimal( generation.recordCount ) },
+                { "payload_bytes", Decimal( generation.payloadBytes ) }, { "unresolved_count", Decimal( generation.unresolvedCount ) },
+                { "last_sequence", generation.lastSequence }
+            } );
+            json evidencePreview = json::array();
+            for( const auto& value : status.evidencePreview ) evidencePreview.push_back( {
+                { "evidence_frame_id", Decimal( value.evidenceFrameId ) }, { "frame_id", Decimal( value.frameId ) },
+                { "source_id", Decimal( value.sourceId ) }, { "request_id", Decimal( value.requestId ) },
+                { "state", GpuEvidenceStateName( value.state ) }, { "kind", value.kind }
+            } );
+            json qualityFindings = json::array();
+            for( const auto& finding : validation.findings ) qualityFindings.push_back( {
+                { "code", finding.code }, { "count", Decimal( finding.count ) }
+            } );
+            const bool present = validation.present;
+            const bool valid = present && validation.healthy;
+            const std::string state = !present ? "absent" : valid ? ( status.building ? "building" : "complete" ) : "invalid_core_gap";
+            const json reason = !present ? json( "trace predates N27 or contains no GPU Resource Catalog" ) :
+                !valid ? json( "Catalog disk semantic validation failed; dependent evidence is unavailable" ) :
+                status.unresolvedCount != 0 ? json( "Catalog Core is valid; some enrichment records remain unresolved" ) : json( nullptr );
+            return Success( id, {
+                { "present", present }, { "valid", valid }, { "status", state },
+                { "partial", valid && status.unresolvedCount != 0 },
+                { "enrichment_complete", valid && status.unresolvedCount == 0 }, { "reason", reason },
+                { "catalog_schema", status.metadata[2] }, { "detailed_evidence_schema", status.metadata[3] },
+                { "generation_count", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogGeneration )] ) },
+                { "record_count", Decimal( status.recordCount ) }, { "payload_bytes", Decimal( status.payloadBytes ) },
+                { "unresolved_count", Decimal( status.unresolvedCount ) }, { "generations", std::move( generations ) },
+                { "generations_truncated", status.generationsTruncated },
+                { "detailed_evidence_checkpoint_preview", std::move( evidencePreview ) },
+                { "detailed_evidence_preview_truncated", status.evidencePreviewTruncated },
+                { "quality", { { "revalidated", validation.complete }, { "original_valid", validation.originalValid },
+                    { "findings", std::move( qualityFindings ) } } },
+                { "counts", {
+                    { "resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogResource )] ) },
+                    { "allocations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogAllocation )] ) },
+                    { "views", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogView )] ) },
+                    { "logical_resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogLogical )] ) },
+                    { "parts", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogPart )] ) },
+                    { "relations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRelation )] ) },
+                    { "vg_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogVg )] ) },
+                    { "range_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRangeSet )] ) },
+                    { "detailed_evidence", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogDetailedEvidence )] ) }
+                } }
+            }, trace );
+        }
+        if( boundedValidationMethod )
+        {
+            const auto status = catalogStatusSource->GetQueryCatalogStatus( 4096, 16 );
+            const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
+            if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            const auto findingCount = [&]( std::string_view code ) {
+                uint64_t count = 0;
+                for( const auto& finding : validation.findings )
+                    if( finding.code == code )
+                    {
+                        if( finding.count > std::numeric_limits<uint64_t>::max() - count )
+                            throw QueryError( "RESOURCE_LIMIT", "Catalog validation finding count overflow" );
+                        count += finding.count;
+                    }
+                return count;
+            };
+            json findings = json::array();
+            for( const auto& finding : validation.findings ) findings.push_back( {
+                { "code", finding.code }, { "count", Decimal( finding.count ) }
+            } );
+            json generations = json::array();
+            for( const auto& generation : status.generations ) generations.push_back( {
+                { "generation", Decimal( generation.generation ) },
+                { "state", GpuCatalogGenerationStateName( generation.state ) },
+                { "valid", generation.valid != 0 }, { "began", generation.began != 0 },
+                { "ended", generation.ended != 0 }, { "begin_time_ns", Decimal( generation.beginTime ) },
+                { "end_time_ns", Decimal( generation.endTime ) },
+                { "batch_count", Decimal( uint64_t( generation.batchCount ) ) },
+                { "record_count", Decimal( generation.recordCount ) },
+                { "payload_bytes", Decimal( generation.payloadBytes ) },
+                { "unresolved_count", Decimal( generation.unresolvedCount ) },
+                { "last_sequence", generation.lastSequence }
+            } );
+            json evidencePreview = json::array();
+            for( const auto& value : status.evidencePreview ) evidencePreview.push_back( {
+                { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) },
+                { "request_id", Decimal( value.requestId ) },
+                { "state", GpuEvidenceStateName( value.state ) }, { "kind", value.kind }
+            } );
+            const auto batchCount = status.counts[size_t( OfflineCatalogDomain::CatalogBatch )];
+            const auto invalidBatches = findingCount( "CATALOG_BATCH_ORIGINAL_INVALID" );
+            const auto missingTransport = findingCount( "CATALOG_TRANSPORT_CHECKSUM_MISSING" );
+            const auto storedChecksumFailures = findingCount( "CATALOG_STORED_CHECKSUM" );
+            const bool present = validation.present;
+            const bool valid = present && validation.healthy;
+            const std::string validationState = !present ? "absent" : valid ?
+                ( status.building ? "building" : "complete" ) : "invalid_core_gap";
+            const json reason = !present ? json( "trace predates N27 or contains no GPU Resource Catalog" ) :
+                !valid ? json( "Catalog disk semantic validation failed; dependent evidence is unavailable" ) :
+                status.unresolvedCount != 0 ? json( "Catalog Core is valid; some enrichment records remain unresolved" ) : json( nullptr );
+            return Success( id, {
+                { "present", present }, { "valid", valid }, { "status", validationState },
+                { "partial", valid && status.unresolvedCount != 0 },
+                { "enrichment_complete", valid && status.unresolvedCount == 0 }, { "reason", reason },
+                { "catalog_schema", status.metadata[2] }, { "detailed_evidence_schema", status.metadata[3] },
+                { "generation_count", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogGeneration )] ) },
+                { "record_count", Decimal( status.recordCount ) }, { "payload_bytes", Decimal( status.payloadBytes ) },
+                { "unresolved_count", Decimal( status.unresolvedCount ) }, { "generations", std::move( generations ) },
+                { "generations_truncated", status.generationsTruncated },
+                { "detailed_evidence_checkpoint_preview", std::move( evidencePreview ) },
+                { "detailed_evidence_preview_truncated", status.evidencePreviewTruncated },
+                { "quality", { { "revalidated", validation.complete }, { "original_valid", validation.originalValid },
+                    { "findings", std::move( findings ) } } },
+                { "counts", {
+                    { "resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogResource )] ) },
+                    { "allocations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogAllocation )] ) },
+                    { "views", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogView )] ) },
+                    { "logical_resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogLogical )] ) },
+                    { "parts", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogPart )] ) },
+                    { "relations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRelation )] ) },
+                    { "vg_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogVg )] ) },
+                    { "range_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRangeSet )] ) },
+                    { "detailed_evidence", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogDetailedEvidence )] ) }
+                } },
+                { "transport", {
+                    { "batch_count", Decimal( batchCount ) }, { "invalid_batches", Decimal( invalidBatches ) },
+                    { "checksum_failures", nullptr },
+                    { "checksum_mismatch", Decimal( storedChecksumFailures ) },
+                    { "transport_checksums_verified", Decimal( batchCount >= missingTransport ? batchCount - missingTransport : 0 ) },
+                    { "canonical_checksums_verified", Decimal( batchCount >= storedChecksumFailures ? batchCount - storedChecksumFailures : 0 ) },
+                    { "canonicalization_changes", nullptr }, { "sequence_gaps", nullptr },
+                    { "sequence_duplicates", nullptr }, { "sequence_gap_details", json::array() },
+                    { "completed_lifecycle_unresolved", Decimal( status.unresolvedCount ) },
+                    { "core_unresolved", nullptr }, { "enrichment_unresolved", nullptr },
+                    { "detail_status", "aggregate_only" }
+                } },
+                { "unresolved_breakdown", {
+                    { "view", nullptr }, { "logical", nullptr }, { "virtual_geometry", nullptr },
+                    { "range_set", nullptr }, { "relation_source", nullptr }, { "relation_target", nullptr },
+                    { "detailed_evidence_source", nullptr }, { "detailed_evidence_target", nullptr },
+                    { "total", Decimal( status.unresolvedCount ) }, { "matches_generation_total", true },
+                    { "detail_status", "not_persisted" }
+                } },
+                { "complete", valid }, { "diagnostic_details_available", false },
+                { "diagnostic_details_reason", "legacy per-record samples and gap classification are not persisted in the bounded index" }
+            }, trace );
+        }
+        if( boundedResourceMethod || boundedEvidenceMethod || boundedPassResourceMethod )
+        {
+            const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
+            if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            if( !validation.present ) return Success( id, { { "present", false }, { "status", "absent" },
+                { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
+            if( !validation.healthy ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
+                { "reason", "Catalog disk semantic validation failed; dependent evidence is unavailable" } }, trace );
+            if( boundedPassResourceMethod )
+            {
+                const auto passId = UnsignedParameter( params, "pass_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                const auto page = ParsePage( params, method, trace );
+                const auto storedSummary = gpuPassResourceSource->GetQueryGpuPassResourceSummary( passId );
+                QueryGpuPassResourceSummary summary {};
+                summary.passId = passId;
+                if( storedSummary ) summary = *storedSummary;
+                const auto rangePage = gpuPassResourceSource->GetQueryGpuPassRanges(
+                    passId, page.offset, page.limit );
+                const auto usePage = gpuPassResourceSource->GetQueryGpuPassUses(
+                    passId, page.offset, page.limit );
+                const auto evidencePage = gpuPassResourceSource->GetQueryGpuPassEvidenceIds(
+                    passId, page.offset, page.limit );
+                json evidenceIds = json::array();
+                for( const auto value : evidencePage.values ) evidenceIds.push_back( Decimal( value ) );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& range = item.record;
+                    ranges.push_back( {
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", range.resourceId ) },
+                        { "resource_id", Decimal( range.resourceId ) },
+                        { "view_id", range.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.viewDefinitionId ) ) },
+                        { "range_kind", range.rangeKind }, { "offset_bytes", Decimal( range.offsetBytes ) },
+                        { "length_bytes", Decimal( range.lengthBytes ) },
+                        { "first_subresource", range.firstSubresource }, { "subresource_count", range.subresourceCount },
+                        { "usage_mask", range.usageMask }, { "exactness", GpuExactnessName( range.exactness ) }
+                    } );
+                }
+                json uses = json::array();
+                for( const auto& use : usePage.values )
+                {
+                    const auto resourceId = catalogResourceSource->ResolveQueryCatalogResourcePointer(
+                        use.resourceId, use.passEnd );
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
+                    const auto allocationId = state ? state->latest.allocationId : 0;
+                    uses.push_back( {
+                        { "allocation_id", allocationId == 0 ? json( nullptr ) : json( Decimal( allocationId ) ) },
+                        { "logical_resource_id", Decimal( use.resourceId ) },
+                        { "catalog_resource_id", resourceId == 0 ? json( nullptr ) : json( Decimal( resourceId ) ) },
+                        { "resolved_physical_allocation_id", allocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocationId ) ) },
+                        { "resource_set_id", use.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "usage_mask", use.usageMask }, { "resolved_resource_count", resourceId == 0 ? "0" : "1" },
+                        { "resolution", resourceId == 0 ? "unresolved_logical_resource" : "pointer_lifetime_exact" }
+                    } );
+                }
+                const auto returned = std::max( { ranges.size(), uses.size(), evidenceIds.size() } );
+                const bool hasMore = page.offset + ranges.size() < rangePage.total ||
+                    page.offset + uses.size() < usePage.total ||
+                    page.offset + evidenceIds.size() < evidencePage.total;
+                const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+                return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
+                    { "evidence_pass_ids", std::move( evidenceIds ) },
+                    { "evidence_pass_ids_truncated", page.offset + evidencePage.values.size() < evidencePage.total },
+                    { "sample_status", "continuous_exact" },
+                    { "resource_count", Decimal( summary.resourceCount ) },
+                    { "allocation_count", Decimal( summary.allocationCount ) },
+                    { "direct_range_bytes", Decimal( summary.directRangeBytes ) },
+                    { "referenced_physical_bytes", Decimal( summary.referencedPhysicalBytes ) },
+                    { "range_coverage", summary.resourceCount == 0 ? 1.0 :
+                        double( summary.rangedResourceCount ) / double( summary.resourceCount ) },
+                    { "unknown_range_resource_count", Decimal( summary.resourceCount - summary.rangedResourceCount ) },
+                    { "ranges", std::move( ranges ) }, { "resource_set_uses", std::move( uses ) },
+                    { "ranges_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", rangePage.values.size() }, { "total", Decimal( rangePage.total ) },
+                        { "has_more", page.offset + rangePage.values.size() < rangePage.total } } },
+                    { "resource_set_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", usePage.values.size() }, { "total", Decimal( usePage.total ) },
+                        { "has_more", page.offset + usePage.values.size() < usePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.pass.vg_evidence" )
+            {
+                const auto passId = UnsignedParameter( params, "pass_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                const auto page = ParsePage( params, method, trace );
+                const auto evidencePage = catalogResourceSource->GetQueryCatalogPassEvidence(
+                    passId, page.offset, page.limit );
+                json records = json::array();
+                for( const auto& item : evidencePage.values )
+                {
+                    const auto& value = item.record;
+                    records.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "request_id", Decimal( value.requestId ) },
+                        { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                        { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) },
+                        { "target_id", Decimal( value.targetId ) }, { "kind", value.kind },
+                        { "state", GpuEvidenceStateName( value.state ) }, { "sequence", value.sequence },
+                        { "time_ns", Decimal( value.time ) }
+                    } );
+                }
+                const auto returned = records.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < evidencePage.total );
+                const std::string sampleStatus = evidencePage.hasState ?
+                    GpuEvidenceStateName( evidencePage.lastState ) : "not_sampled";
+                return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
+                    { "sample_status", sampleStatus }, { "sampled", sampleStatus != "not_sampled" },
+                    { "records", std::move( records ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( evidencePage.total ) },
+                        { "has_more", page.offset + returned < evidencePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.search" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto filter = params.value( "filter", json::object() );
+                const auto nameFilter = filter.value( "name", std::string() );
+                const auto kindFilter = filter.value( "primary_kind", std::string() );
+                const auto classFilter = filter.value( "resource_class", std::string() );
+                const auto requireMeshParts = filter.value( "has_mesh_parts", false );
+                const auto requireRanges = filter.value( "has_ranges", false );
+                const auto requireLogicalBindings = filter.value( "has_logical_bindings", false );
+                const auto requireAliasGroup = filter.value( "has_alias_group", false );
+                const auto requireSharedAllocation = filter.value( "has_shared_allocation", false );
+                const bool requireAssociations = requireMeshParts || requireRanges || requireLogicalBindings ||
+                    requireAliasGroup || requireSharedAllocation;
+                const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
+                const bool unfiltered=nameFilter.empty() && kindFilter.empty() && classFilter.empty() && !requireAssociations;
+                const auto knownTotal=unfiltered ? std::optional<uint64_t>(count) : page.matchedTotal;
+                if(page.matchedTotal && (*page.matchedTotal>count || (unfiltered && *page.matchedTotal!=count)))
+                    throw QueryError("STALE_CURSOR","cursor total does not match the resource index");
+                if( page.rawOffsetBound && page.rawOffset > count )
+                    throw QueryError( "STALE_CURSOR", "cursor raw offset is outside the resource index" );
+                if(knownTotal && (*knownTotal>count || page.offset>*knownTotal ||
+                    (unfiltered && page.rawOffsetBound && page.rawOffset!=page.offset)))
+                    throw QueryError("STALE_CURSOR","cursor count is outside the resource index");
+                const uint64_t start = page.rawOffsetBound ? page.rawOffset : unfiltered ? page.offset : 0;
+                uint64_t matched = page.rawOffsetBound || unfiltered ? page.offset : 0;
+                size_t returned = 0;
+                size_t nextRawOffset = size_t( start );
+                json values = json::array();
+                for( uint64_t ordinal = start; ordinal < count; ordinal++ )
+                {
+                    if(knownTotal && (returned>=page.limit || page.offset+returned>=*knownTotal)) break;
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceStateAt( ordinal );
+                    const auto& value = state.latest;
+                    std::string name;
+                    if( !nameFilter.empty() ) {
+                        name=catalogResourceSource->GetQueryCatalogResourceName(state.generation,value.nameId).value_or(std::string());
+                        if(name.find(nameFilter)==std::string::npos) continue;
+                    }
+                    if( !kindFilter.empty() && kindFilter != GpuPrimaryKindName( value.primaryKind ) ) continue;
+                    if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
+                    QueryCatalogResourceAssociationData associations {};
+                    if( requireAssociations )
+                    {
+                        associations = catalogResourceSource->GetQueryCatalogResourceAssociationsAt( ordinal );
+                        if( associations.resourceId != value.resourceId )
+                            throw QueryError( "INTERNAL_ERROR", "GPU resource association index identity mismatch" );
+                        if( requireMeshParts && associations.meshPartCount == 0 ) continue;
+                        if( requireRanges && associations.rangeCount == 0 ) continue;
+                        if( requireLogicalBindings && associations.logicalBindingCount == 0 ) continue;
+                        if( requireAliasGroup && associations.hasAliasGroup == 0 ) continue;
+                        if( requireSharedAllocation && associations.allocationResourceCount <= 1 ) continue;
+                    }
+                    const auto logicalPosition = matched++;
+                    if( !page.rawOffsetBound && !unfiltered && logicalPosition < page.offset ) continue;
+                    if( returned >= page.limit ) continue;
+                    if(nameFilter.empty()) name=catalogResourceSource->GetQueryCatalogResourceName(state.generation,value.nameId).value_or(std::string());
+                    json result = {
+                        { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
+                        { "resource_id", Decimal( value.resourceId ) }, { "generation", Decimal( state.generation ) },
+                        { "definition_revision", value.definitionRevision },
+                        { "resource_class", GpuResourceClassName( value.resourceClass ) },
+                        { "primary_kind", GpuPrimaryKindName( value.primaryKind ) },
+                        { "name", name.empty() ? json( nullptr ) : json( name ) }, { "name_id", value.nameId },
+                        { "name_provenance", value.nameProvenance }, { "name_truncated", value.nameOriginalLength > name.size() },
+                        { "capacity_bytes", Decimal( value.capacityBytes ) },
+                        { "allocation_id", value.allocationId == 0 ? json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                        { "allocation_offset_bytes", Decimal( value.allocationOffsetBytes ) }, { "memory_domain", value.memoryDomain },
+                        { "allocation_kind", value.allocationKind }, { "exactness", GpuExactnessName( value.exactness ) },
+                        { "create_time_ns", state.openBoundary ? json( nullptr ) : json( Decimal( state.createTime ) ) },
+                        { "create_time_boundary", state.openBoundary ? "open" : "closed" },
+                        { "destroy_time_ns", state.destroyTime == 0 ? json( nullptr ) : json( Decimal( state.destroyTime ) ) },
+                        { "alive_at_capture_end", state.aliveAtEnd },
+                        { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
+                        { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
+                        { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) }
+                    };
+                    if( requireMeshParts ) result["mesh_part_count"] = Decimal( associations.meshPartCount );
+                    if( requireRanges ) result["pass_range_count"] = Decimal( associations.rangeCount );
+                    if( requireLogicalBindings || requireAliasGroup )
+                        result["logical_binding_count"] = Decimal( associations.logicalBindingCount );
+                    if( requireSharedAllocation )
+                        result["allocation_resource_count"] = Decimal( associations.allocationResourceCount );
+                    values.push_back( std::move( result ) );
+                    returned++;
+                    nextRawOffset = size_t( ordinal + 1 );
+                }
+                const auto total=knownTotal.value_or(matched);
+                if(knownTotal && returned<page.limit && page.offset+returned!=total)
+                    throw QueryError("STALE_CURSOR","cursor resource count no longer matches the index");
+                const auto cursor = NextResourceCursor( page, method, trace, returned, nextRawOffset, total );
+                return Success( id, { { "present", true }, { "resources", std::move( values ) },
+                    { "total", Decimal( total ) } }, trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.memory.by_type" )
+            {
+                struct Totals { uint64_t count = 0; uint64_t capacity = 0; };
+                std::map<std::string, Totals> totals;
+                const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
+                for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+                {
+                    checkCancelled();
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceStateAt( ordinal );
+                    if( !state.aliveAtEnd ) continue;
+                    auto& value = totals[GpuPrimaryKindName( state.latest.primaryKind )];
+                    value.count++;
+                    if( state.latest.capacityBytes > std::numeric_limits<uint64_t>::max() - value.capacity )
+                        throw QueryError( "DATA_CORRUPT", "GPU resource capacity total overflow" );
+                    value.capacity += state.latest.capacityBytes;
+                }
+                json values = json::array();
+                for( const auto& [kind, value] : totals ) values.push_back( {
+                    { "primary_kind", kind }, { "live_resource_count", Decimal( value.count ) },
+                    { "resource_capacity_bytes", Decimal( value.capacity ) }
+                } );
+                return Success( id, { { "present", true }, { "groups", std::move( values ) },
+                    { "note", "resource capacity is not physical allocation ownership and must not be summed across aliases" } }, trace );
+            }
+            if( method == "gpu.memory.peak" || method == "gpu.memory.churn" )
+            {
+                const auto summary = catalogResourceSource->GetQueryCatalogGpuMemorySummary();
+                if( method == "gpu.memory.peak" ) return Success( id, {
+                    { "present", true },
+                    { "engine_known_physical_peak_bytes", Decimal( summary.peakPhysicalBytes ) },
+                    { "peak_time_ns", Decimal( summary.peakTime ) }, { "peak_provenance", "event_exact" },
+                    { "dxgi_peak", nullptr },
+                    { "dxgi_peak_provenance", "sampled_4hz_unavailable_in_catalog_section" }
+                }, trace );
+                return Success( id, { { "present", true },
+                    { "create_count", Decimal( summary.allocationCreateCount ) },
+                    { "destroy_count", Decimal( summary.allocationDestroyCount ) },
+                    { "allocated_bytes", Decimal( summary.allocatedPhysicalBytes ) },
+                    { "freed_bytes", Decimal( summary.freedPhysicalBytes ) },
+                    { "live_bytes_at_end", Decimal( summary.livePhysicalBytes ) },
+                    { "semantics", "snapshot/open-boundary allocations are included in baseline and are not proof of within-capture churn" }
+                }, trace );
+            }
+            uint64_t resourceId = 0;
+            if( params.contains( "resource_id" ) )
+                resourceId = UnsignedParameter( params, "resource_id", 0, std::numeric_limits<uint64_t>::max() );
+            else
+            {
+                if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "ref or resource_id is required" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "gpu-resource" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "resource ref does not belong to this trace" );
+                resourceId = *parsed;
+            }
+            const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
+            if( !state ) throw QueryError( "ENTITY_NOT_FOUND", "GPU resource was not found" );
+            if( method == "gpu.resource.references" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto rangePage = catalogResourceSource->GetQueryCatalogResourceRanges(
+                    resourceId, page.offset, page.limit );
+                const auto usePage = catalogResourceSource->GetQueryCatalogResourceUses(
+                    resourceId, page.offset, page.limit );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& value = item.record;
+                    ranges.push_back( {
+                        { "pass_id", Decimal( value.passInstanceId ) },
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "view_id", value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( value.viewDefinitionId ) ) },
+                        { "range_kind", value.rangeKind }, { "offset_bytes", Decimal( value.offsetBytes ) },
+                        { "length_bytes", Decimal( value.lengthBytes ) },
+                        { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
+                        { "usage_mask", value.usageMask }, { "exactness", GpuExactnessName( value.exactness ) }
+                    } );
+                }
+                json uses = json::array();
+                const auto physicalAllocationId = state->latest.allocationId;
+                for( const auto& value : usePage.values )
+                {
+                    uses.push_back( {
+                        { "pass_id", Decimal( value.passId ) },
+                        { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.passId ) },
+                        { "allocation_id", Decimal( physicalAllocationId ) },
+                        { "logical_resource_id", Decimal( value.resourceId ) },
+                        { "catalog_resource_id", Decimal( resourceId ) },
+                        { "resolved_physical_allocation_id", physicalAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( physicalAllocationId ) ) },
+                        { "usage_mask", value.usageMask },
+                        { "resource_set_id", value.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( value.resourceSetId ) ) ) },
+                        { "encoding", value.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "resolution", "pointer_lifetime_exact" },
+                        { "range_status", "query_gpu_range_set_for_exact_range" }
+                    } );
+                }
+                const auto returned = std::max( ranges.size(), uses.size() );
+                const auto rangeTotal = size_t( std::min<uint64_t>( rangePage.total,
+                    std::numeric_limits<size_t>::max() ) );
+                const auto useTotal = size_t( std::min<uint64_t>( usePage.total,
+                    std::numeric_limits<size_t>::max() ) );
+                const bool hasMore = page.offset + ranges.size() < rangePage.total ||
+                    page.offset + uses.size() < usePage.total;
+                const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "ranges", std::move( ranges ) }, { "resource_set_uses", std::move( uses ) },
+                    { "ranges_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", rangePage.values.size() }, { "total", rangeTotal },
+                        { "has_more", page.offset + rangePage.values.size() < rangePage.total } } },
+                    { "resource_set_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", usePage.values.size() }, { "total", useTotal },
+                        { "has_more", page.offset + usePage.values.size() < usePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.allocations" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto allocationPage = catalogResourceSource->GetQueryCatalogResourceAllocations(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : allocationPage.values )
+                {
+                    const auto& allocation = item.record;
+                    values.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-allocation", allocation.allocationId ) },
+                        { "allocation_id", Decimal( allocation.allocationId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "heap_id", allocation.heapId == 0 ? json( nullptr ) : json( Decimal( allocation.heapId ) ) },
+                        { "parent_allocation_id", allocation.parentAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocation.parentAllocationId ) ) },
+                        { "size_bytes", Decimal( allocation.sizeBytes ) },
+                        { "offset_bytes", Decimal( allocation.offsetBytes ) },
+                        { "resident_bytes", Decimal( allocation.residentBytes ) },
+                        { "alignment_bytes", Decimal( allocation.alignmentBytes ) },
+                        { "primary_kind", GpuPrimaryKindName( allocation.primaryKind ) },
+                        { "memory_domain", allocation.memoryDomain },
+                        { "allocation_kind", allocation.allocationKind },
+                        { "residency_state", allocation.residencyState },
+                        { "exactness", GpuExactnessName( allocation.exactness ) },
+                        { "operation", GpuCatalogOperationName( allocation.operation ) },
+                        { "time_ns", Decimal( allocation.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < allocationPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "allocations", std::move( values ) }, { "total", Decimal( allocationPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.views" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto viewPage = catalogResourceSource->GetQueryCatalogResourceViews(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : viewPage.values )
+                {
+                    const auto& view = item.record;
+                    values.push_back( {
+                        { "view_id", Decimal( view.viewId ) }, { "generation", Decimal( item.generation ) },
+                        { "operation", GpuCatalogOperationName( view.operation ) }, { "view_kind", view.viewKind },
+                        { "format", view.format }, { "buffer_offset_bytes", Decimal( view.bufferOffsetBytes ) },
+                        { "buffer_length_bytes", Decimal( view.bufferLengthBytes ) },
+                        { "first_subresource", view.firstSubresource }, { "subresource_count", view.subresourceCount },
+                        { "stride_bytes", view.strideBytes }, { "exactness", GpuExactnessName( view.exactness ) },
+                        { "time_ns", Decimal( view.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < viewPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "views", std::move( values ) }, { "total", Decimal( viewPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.mesh_buffers" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto partPage = catalogResourceSource->GetQueryCatalogResourceMeshParts(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : partPage.values )
+                {
+                    const auto& part = item.record;
+                    values.push_back( {
+                        { "part_id", Decimal( part.partId ) }, { "generation", Decimal( item.generation ) },
+                        { "part_kind", part.partKind }, { "operation", GpuCatalogOperationName( part.operation ) },
+                        { "offset_bytes", Decimal( part.offsetBytes ) }, { "length_bytes", Decimal( part.lengthBytes ) },
+                        { "first_subresource", part.firstSubresource }, { "subresource_count", part.subresourceCount },
+                        { "semantic_index", part.semanticIndex }, { "element_count", part.elementCount },
+                        { "stride_bytes", part.strideBytes }, { "format", part.format },
+                        { "definition_revision", part.definitionRevision },
+                        { "exactness", GpuExactnessName( part.exactness ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < partPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "parts", std::move( values ) }, { "total", Decimal( partPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.vg_pages" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto vgPage = catalogResourceSource->GetQueryCatalogResourceVgPages(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : vgPage.values )
+                {
+                    const auto& value = item.record;
+                    values.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "runtime_resource_id", Decimal( value.runtimeResourceId ) },
+                        { "page_definition_id", Decimal( value.pageDefinitionId ) },
+                        { "episode_id", Decimal( value.episodeId ) }, { "page_index", value.pageIndex },
+                        { "gpu_page_index", value.gpuPageIndex }, { "cluster_index", value.clusterIndex },
+                        { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
+                        { "frame_id", Decimal( value.frameId ) }, { "page_kind", value.pageKind },
+                        { "operation", GpuCatalogOperationName( value.operation ) },
+                        { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < vgPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "pages", std::move( values ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( vgPage.total ) },
+                        { "has_more", page.offset + returned < vgPage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.raytracing_chain" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto relationPage = catalogResourceSource->GetQueryCatalogResourceRtasRelations(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : relationPage.values )
+                {
+                    const auto& value = item.record;
+                    values.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+                        { "relation", "rtas_uses" }, { "time_ns", Decimal( value.time ) },
+                        { "exactness", GpuExactnessName( value.exactness ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < relationPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "relations", std::move( values ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( relationPage.total ) },
+                        { "has_more", page.offset + returned < relationPage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            const auto& value = state->latest;
+            const auto nameValue = catalogResourceSource->GetQueryCatalogResourceName( state->generation, value.nameId );
+            const std::string name = nameValue.value_or( std::string() );
+            json result = {
+                { "ref", source->MakeEntityRef( "gpu-resource", resourceId ) }, { "resource_id", Decimal( resourceId ) },
+                { "generation", Decimal( state->generation ) }, { "definition_revision", value.definitionRevision },
+                { "resource_class", GpuResourceClassName( value.resourceClass ) }, { "primary_kind", GpuPrimaryKindName( value.primaryKind ) },
+                { "name", name.empty() ? json( nullptr ) : json( name ) }, { "name_id", value.nameId },
+                { "name_provenance", value.nameProvenance }, { "name_truncated", value.nameOriginalLength > name.size() },
+                { "capacity_bytes", Decimal( value.capacityBytes ) },
+                { "allocation_id", value.allocationId == 0 ? json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                { "allocation_offset_bytes", Decimal( value.allocationOffsetBytes ) }, { "memory_domain", value.memoryDomain },
+                { "allocation_kind", value.allocationKind }, { "exactness", GpuExactnessName( value.exactness ) },
+                { "create_time_ns", state->openBoundary ? json( nullptr ) : json( Decimal( state->createTime ) ) },
+                { "create_time_boundary", state->openBoundary ? "open" : "closed" },
+                { "destroy_time_ns", state->destroyTime == 0 ? json( nullptr ) : json( Decimal( state->destroyTime ) ) },
+                { "alive_at_capture_end", state->aliveAtEnd },
+                { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
+                { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
+                { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) },
+                { "present", true }
+            };
+            if( method == "gpu.resource.get" || method == "gpu.resource.explain" ) result["description"] = {
+                { "width", Decimal( value.width ) }, { "height", value.height },
+                { "depth_or_array_size", value.depthOrArraySize }, { "mip_levels", value.mipLevels },
+                { "format", value.format }, { "sample_count", value.sampleCount },
+                { "declared_usage_mask", value.declaredUsageMask }, { "observed_usage_mask", value.observedUsageMask },
+                { "backend_flags", value.backendFlags }, { "classification_provenance", value.classificationProvenance }
+            };
+            if( method == "gpu.resource.explain" )
+            {
+                const auto allocationPage = catalogResourceSource->GetQueryCatalogResourceAllocations(
+                    resourceId, 0, DefaultPageSize );
+                json allocations = json::array();
+                for( const auto& item : allocationPage.values )
+                {
+                    const auto& allocation = item.record;
+                    allocations.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-allocation", allocation.allocationId ) },
+                        { "allocation_id", Decimal( allocation.allocationId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "heap_id", allocation.heapId == 0 ? json( nullptr ) : json( Decimal( allocation.heapId ) ) },
+                        { "parent_allocation_id", allocation.parentAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocation.parentAllocationId ) ) },
+                        { "size_bytes", Decimal( allocation.sizeBytes ) }, { "offset_bytes", Decimal( allocation.offsetBytes ) },
+                        { "resident_bytes", Decimal( allocation.residentBytes ) },
+                        { "alignment_bytes", Decimal( allocation.alignmentBytes ) },
+                        { "primary_kind", GpuPrimaryKindName( allocation.primaryKind ) },
+                        { "memory_domain", allocation.memoryDomain }, { "allocation_kind", allocation.allocationKind },
+                        { "residency_state", allocation.residencyState },
+                        { "exactness", GpuExactnessName( allocation.exactness ) },
+                        { "operation", GpuCatalogOperationName( allocation.operation ) },
+                        { "time_ns", Decimal( allocation.time ) }
+                    } );
+                }
+                const auto viewPage = catalogResourceSource->GetQueryCatalogResourceViews(
+                    resourceId, 0, DefaultPageSize );
+                json views = json::array();
+                for( const auto& item : viewPage.values )
+                {
+                    const auto& view = item.record;
+                    views.push_back( {
+                        { "view_id", Decimal( view.viewId ) }, { "generation", Decimal( item.generation ) },
+                        { "operation", GpuCatalogOperationName( view.operation ) }, { "view_kind", view.viewKind },
+                        { "format", view.format }, { "buffer_offset_bytes", Decimal( view.bufferOffsetBytes ) },
+                        { "buffer_length_bytes", Decimal( view.bufferLengthBytes ) },
+                        { "first_subresource", view.firstSubresource }, { "subresource_count", view.subresourceCount },
+                        { "stride_bytes", view.strideBytes }, { "exactness", GpuExactnessName( view.exactness ) },
+                        { "time_ns", Decimal( view.time ) }
+                    } );
+                }
+                const auto partPage = catalogResourceSource->GetQueryCatalogResourceParts(
+                    resourceId, 0, DefaultPageSize );
+                json parts = json::array();
+                for( const auto& item : partPage.values )
+                {
+                    const auto& part = item.record;
+                    parts.push_back( {
+                        { "part_id", Decimal( part.partId ) }, { "generation", Decimal( item.generation ) },
+                        { "part_kind", part.partKind }, { "operation", GpuCatalogOperationName( part.operation ) },
+                        { "offset_bytes", Decimal( part.offsetBytes ) }, { "length_bytes", Decimal( part.lengthBytes ) },
+                        { "first_subresource", part.firstSubresource }, { "subresource_count", part.subresourceCount },
+                        { "semantic_index", part.semanticIndex }, { "element_count", part.elementCount },
+                        { "stride_bytes", part.strideBytes }, { "format", part.format },
+                        { "definition_revision", part.definitionRevision },
+                        { "exactness", GpuExactnessName( part.exactness ) }
+                    } );
+                }
+                const auto rangePage = catalogResourceSource->GetQueryCatalogResourceRanges(
+                    resourceId, 0, DefaultPageSize );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& range = item.record;
+                    ranges.push_back( {
+                        { "pass_id", Decimal( range.passInstanceId ) },
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", range.resourceId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "view_id", range.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.viewDefinitionId ) ) },
+                        { "range_kind", range.rangeKind }, { "offset_bytes", Decimal( range.offsetBytes ) },
+                        { "length_bytes", Decimal( range.lengthBytes ) },
+                        { "first_subresource", range.firstSubresource }, { "subresource_count", range.subresourceCount },
+                        { "usage_mask", range.usageMask }, { "exactness", GpuExactnessName( range.exactness ) }
+                    } );
+                }
+                const auto usePage = catalogResourceSource->GetQueryCatalogResourceUses(
+                    resourceId, 0, DefaultPageSize );
+                json uses = json::array();
+                for( const auto& use : usePage.values )
+                {
+                    uses.push_back( {
+                        { "pass_id", Decimal( use.passId ) },
+                        { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", use.passId ) },
+                        { "allocation_id", Decimal( value.allocationId ) },
+                        { "logical_resource_id", Decimal( use.resourceId ) },
+                        { "catalog_resource_id", Decimal( resourceId ) },
+                        { "resolved_physical_allocation_id", value.allocationId == 0 ?
+                            json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                        { "usage_mask", use.usageMask },
+                        { "resource_set_id", use.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "resolution", "pointer_lifetime_exact" },
+                        { "range_status", "query_gpu_range_set_for_exact_range" }
+                    } );
+                }
+                const auto logicalPage = catalogResourceSource->GetQueryCatalogResourceLogicals(
+                    resourceId, 0, DefaultPageSize );
+                json logicals = json::array();
+                for( const auto& item : logicalPage.values )
+                {
+                    const auto& binding = item.record;
+                    const auto definition = catalogResourceSource->ResolveQueryCatalogLogical(
+                        binding.logicalResourceId, binding.time );
+                    const auto* resolved = definition ? &definition->record : nullptr;
+                    const auto definitionGeneration = definition ? definition->generation : item.generation;
+                    const auto nameId = binding.nameId != 0 ? binding.nameId : ( resolved ? resolved->nameId : 0 );
+                    const auto nameGeneration = binding.nameId != 0 ? item.generation : definitionGeneration;
+                    const auto logicalName = catalogResourceSource->GetQueryCatalogResourceName( nameGeneration, nameId );
+                    const auto stableKey = binding.stableKey != 0 ? binding.stableKey : ( resolved ? resolved->stableKey : 0 );
+                    const auto familyId = binding.familyId != 0 ? binding.familyId : ( resolved ? resolved->familyId : 0 );
+                    const auto physicalOffset = binding.physicalOffsetBytes != 0 ? binding.physicalOffsetBytes :
+                        ( resolved ? resolved->physicalOffsetBytes : 0 );
+                    const auto length = binding.lengthBytes != 0 ? binding.lengthBytes : ( resolved ? resolved->lengthBytes : 0 );
+                    const auto aliasGroupId = binding.aliasGroupId != 0 ? binding.aliasGroupId :
+                        ( resolved ? resolved->aliasGroupId : 0 );
+                    const auto primaryKind = binding.primaryKind != 0 ? binding.primaryKind :
+                        ( resolved ? resolved->primaryKind : 0 );
+                    const auto definitionRevision = binding.definitionRevision != 0 ? binding.definitionRevision :
+                        ( resolved ? resolved->definitionRevision : 0 );
+                    logicals.push_back( {
+                        { "logical_resource_id", Decimal( binding.logicalResourceId ) },
+                        { "stable_key", Decimal( stableKey ) }, { "generation", Decimal( item.generation ) },
+                        { "definition_generation", Decimal( definitionGeneration ) }, { "family_id", Decimal( familyId ) },
+                        { "operation", GpuCatalogOperationName( binding.operation ) },
+                        { "name", logicalName && !logicalName->empty() ? json( *logicalName ) : json( nullptr ) },
+                        { "name_provenance", binding.nameId != 0 ? binding.nameProvenance :
+                            ( resolved ? resolved->nameProvenance : 0 ) },
+                        { "physical_offset_bytes", Decimal( physicalOffset ) }, { "length_bytes", Decimal( length ) },
+                        { "alias_group_id", aliasGroupId == 0 ? json( nullptr ) : json( Decimal( aliasGroupId ) ) },
+                        { "frame_id", binding.frameId == 0 ? json( nullptr ) : json( Decimal( binding.frameId ) ) },
+                        { "definition_revision", definitionRevision },
+                        { "primary_kind", GpuPrimaryKindName( primaryKind ) },
+                        { "definition_status", definition ? "resolved" : "unavailable" },
+                        { "exactness", GpuExactnessName( binding.exactness ) },
+                        { "time_ns", Decimal( binding.time ) }
+                    } );
+                }
+                const auto relationPage = catalogResourceSource->GetQueryCatalogResourceRelations(
+                    resourceId, 0, DefaultPageSize );
+                json relations = json::array();
+                for( const auto& item : relationPage.values )
+                {
+                    const auto& relation = item.record;
+                    relations.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "source_id", Decimal( relation.sourceId ) }, { "target_id", Decimal( relation.targetId ) },
+                        { "relation", GpuCatalogRelationName( relation.relation ) },
+                        { "operation", GpuCatalogOperationName( relation.operation ) },
+                        { "frame_id", relation.frameId == 0 ? json( nullptr ) : json( Decimal( relation.frameId ) ) },
+                        { "value0", Decimal( relation.value0 ) }, { "value1", Decimal( relation.value1 ) },
+                        { "exactness", GpuExactnessName( relation.exactness ) },
+                        { "time_ns", Decimal( relation.time ) }
+                    } );
+                }
+                result["allocations"] = std::move( allocations );
+                result["views"] = std::move( views );
+                result["parts"] = std::move( parts );
+                result["pass_ranges"] = std::move( ranges );
+                result["resource_set_uses"] = std::move( uses );
+                result["logical_bindings"] = std::move( logicals );
+                result["relations"] = std::move( relations );
+                result["allocation_count"] = Decimal( allocationPage.total );
+                result["view_count"] = Decimal( viewPage.total );
+                result["part_count"] = Decimal( partPage.total );
+                result["pass_range_count"] = Decimal( rangePage.total );
+                result["resource_set_use_count"] = Decimal( usePage.total );
+                result["logical_binding_count"] = Decimal( logicalPage.total );
+                result["relation_count"] = Decimal( relationPage.total );
+                result["allocations_truncated"] = allocationPage.total > allocationPage.values.size();
+                result["views_truncated"] = viewPage.total > viewPage.values.size();
+                result["parts_truncated"] = partPage.total > partPage.values.size();
+                result["pass_ranges_truncated"] = rangePage.total > rangePage.values.size();
+                result["resource_set_uses_truncated"] = usePage.total > usePage.values.size();
+                result["logical_bindings_truncated"] = logicalPage.total > logicalPage.values.size();
+                result["relations_truncated"] = relationPage.total > relationPage.values.size();
+                result["provenance"] = { { "identity", "exact_gpu_resource_lifetime" },
+                    { "high_level_owner", "unavailable_n27_gpu_layer_only" } };
+                result["unavailable"] = { "unity_object", "asset_guid", "asset_path", "prefab", "scene", "load_instance" };
+            }
+            return Success( id, std::move( result ), trace );
+        }
         const auto catalog = source->GetGpuCatalogData();
         const bool present = catalog && catalog->gpuCatalogPresent;
         const auto statusJson = [&]() {
@@ -5626,7 +6739,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 // trace-domain count as the authoritative count and retain
                 // materialized IDs only for diagnostics that need identity.
                 gpuReferencePassCount = std::max<uint64_t>( referencePassIds.size(),
-                    source->GetTraceInfo().counts.gpuReferencePasses );
+                    source->GetTraceInfoMetadata().counts.gpuReferencePasses );
                 const auto gfxLinks = source->GetGfxLinks();
                 gfxLinkCount = gfxLinks.size();
                 std::unordered_set<uint64_t> explicitPassesWithReferenceLink;
@@ -6256,7 +7369,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( size_t index = 0; index < catalog->gpuCatalogRelations.size(); ++index )
             {
                 const auto& value = catalog->gpuCatalogRelations[index];
-                if( value.sourceId != resourceId && value.targetId != resourceId ) continue;
+                const bool sourceMatch = ( value.flags & 1 ) == 0 && value.sourceId == resourceId;
+                const bool targetMatch = value.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
+                    ( value.flags & 2 ) == 0 && value.targetId == resourceId;
+                if( !sourceMatch && !targetMatch ) continue;
                 ++total;
                 if( values.size() >= limit ) continue;
                 values.push_back( {
@@ -6390,8 +7506,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto page = ParsePage( params, method, trace );
             json relations = json::array();
             size_t total = 0;
-            for( const auto& value : catalog->gpuCatalogRelations ) if( value.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
-                ( value.sourceId == resourceId || value.targetId == resourceId ) )
+            for( const auto& value : catalog->gpuCatalogRelations ) if(
+                value.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
+                ( value.flags & 1 ) == 0 && value.sourceId == resourceId )
             {
                 const auto position = total++;
                 if( position < page.offset || relations.size() >= page.limit ) continue;
@@ -6721,6 +7838,252 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
     if( method == "gpu.pass.search" || method == "gpu.pass.get" )
     {
+        if( const auto* indexed = dynamic_cast<const QueryExplicitPassSource*>( source.get() ) )
+        {
+            const auto taxonomy = GpuTaxonomyCatalogJson( info() );
+            std::map<uint32_t, json> taxonomyDefinitions;
+            if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
+                for( const auto& definition : taxonomy["definitions"] )
+                {
+                    const auto taxonomyId = definition.contains( "taxonomy_id" ) ?
+                        DecimalStringValue( definition["taxonomy_id"] ) : std::nullopt;
+                    if( taxonomyId && *taxonomyId <= UINT32_MAX )
+                        taxonomyDefinitions.emplace( uint32_t( *taxonomyId ), definition );
+                }
+            QueryCorrelationReadControl control;
+            control.check = checkCancelled;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass projection scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto toMatch = [&]( const QueryIndexedExplicitPass& value ) {
+                ExplicitGpuPassMatch result;
+                result.pass = value.pass;
+                result.segment = value.segment;
+                result.zone = value.zone;
+                result.commandListId = value.commandListId;
+                result.frameId = value.frameId;
+                result.cameraId = value.cameraId;
+                result.viewId = value.viewId;
+                result.referenceToken = value.referenceToken;
+                result.taxonomyId = value.taxonomyId;
+                result.taxonomyStableId = value.taxonomyStableId;
+                return result;
+            };
+
+            const auto coverage = CaptureCoverageJson( info() );
+            json nativeProducer = nullptr, managedProducer = nullptr;
+            if( coverage.value( "present", false ) ) for( const auto& value : coverage["producers"] )
+            {
+                if( value.value( "key", "" ) == "gpu.pass.explicit" ) nativeProducer = value;
+                else if( value.value( "key", "" ) == "gpu.pass.managed" ) managedProducer = value;
+            }
+            const auto passCount = indexed->GetIndexedExplicitPassCount();
+            const auto managedPassCount = indexed->GetIndexedManagedExplicitPassCount();
+            const auto nativePassCount = passCount - managedPassCount;
+            const auto missingGpuZoneCount = indexed->GetIndexedExplicitPassMissingGpuZoneCount();
+            const auto unresolvedTaxonomyCount = indexed->GetIndexedExplicitPassUnresolvedTaxonomyCount();
+            const bool hasProducer = nativeProducer.is_object() || managedProducer.is_object();
+            const bool present = hasProducer || passCount != 0;
+            const bool effective = hasProducer ?
+                ( ( nativeProducer.is_object() && nativeProducer.value( "effective", false ) ) ||
+                  ( managedProducer.is_object() && managedProducer.value( "effective", false ) ) ) : passCount != 0;
+            std::string producerState = passCount == 0 ? "absent" : "persisted_entities_without_producer_record";
+            if( nativeProducer.is_object() && managedProducer.is_object() )
+            {
+                const auto nativeState = nativeProducer.value( "state", "unknown" );
+                const auto managedState = managedProducer.value( "state", "unknown" );
+                producerState = nativeState == managedState ? nativeState : "mixed";
+            }
+            else if( nativeProducer.is_object() ) producerState = nativeProducer.value( "state", "unknown" );
+            else if( managedProducer.is_object() ) producerState = managedProducer.value( "state", "unknown" );
+            const std::string aggregateSourceMode = nativePassCount != 0 && managedPassCount != 0 ? "mixed" :
+                ( managedPassCount != 0 ? "managed-command-buffer" :
+                  ( nativePassCount != 0 ? "cpp-marker-command-list" :
+                    ( nativeProducer.is_object() && managedProducer.is_object() ? "mixed" :
+                      ( managedProducer.is_object() ? "managed-command-buffer" : "cpp-marker-command-list" ) ) ) );
+            const bool aggregateComplete = present && taxonomy.value( "present", false ) && !BudgetPartial() &&
+                missingGpuZoneCount == 0 && unresolvedTaxonomyCount == 0 &&
+                ( !nativeProducer.is_object() || nativeProducer.value( "complete", false ) ) &&
+                ( !managedProducer.is_object() || managedProducer.value( "complete", false ) );
+            const auto base = [&]() {
+                json producers = json::array();
+                if( nativeProducer.is_object() ) producers.emplace_back( nativeProducer );
+                if( managedProducer.is_object() ) producers.emplace_back( managedProducer );
+                return json {
+                    { "present", present }, { "complete", aggregateComplete }, { "effective", effective },
+                    { "producer_state", producerState },
+                    { "reason", present ? ( aggregateComplete ? json( nullptr ) : json( "GPU pass evidence is incomplete" ) ) :
+                        json( "GPU pass producers and persisted explicit pass entities are absent" ) },
+                    { "source_mode", aggregateSourceMode },
+                    { "source_modes", {
+                        { "cpp-marker-command-list", { { "instance_count", Decimal( nativePassCount ) }, { "producer", nativeProducer } } },
+                        { "managed-command-buffer", { { "instance_count", Decimal( managedPassCount ) }, { "producer", managedProducer } } }
+                    } },
+                    { "producer", nativeProducer.is_object() ? nativeProducer : managedProducer },
+                    { "producers", std::move( producers ) }, { "scan_complete", !BudgetPartial() },
+                    { "instance_count", Decimal( passCount ) },
+                    { "missing_gpu_zone_count", Decimal( missingGpuZoneCount ) },
+                    { "unresolved_taxonomy_count", Decimal( unresolvedTaxonomyCount ) },
+                    { "taxonomy_catalog_complete", taxonomy.value( "complete", false ) },
+                    { "taxonomy_catalog_reason", taxonomy.value( "reason", json( nullptr ) ) },
+                    { "trust", { { "input", "untrusted_trace_data" },
+                        { "evidence", "persisted_gfx_entity_link_plus_gpu_timestamp_zone" } } }
+                };
+            };
+
+            if( method == "gpu.pass.get" )
+            {
+                if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "ref is required" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "gfx-entity" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a GPU Pass ref from this trace" );
+                const auto found = indexed->FindIndexedExplicitPass( *parsed, control );
+                if( !found ) throw QueryError( "ENTITY_NOT_FOUND", "explicit GPU pass ref was not found" );
+                auto result = base();
+                result["pass"] = ExplicitGpuPassJson( *source, toMatch( *found ), taxonomyDefinitions );
+                return Success( id, std::move( result ), trace );
+            }
+
+            const auto page = ParsePage( params, method, trace );
+            std::optional<bool> managedFilter;
+            if( params.contains( "source_mode" ) )
+            {
+                if( !params["source_mode"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "source_mode must be a string" );
+                const auto mode = params["source_mode"].get<std::string>();
+                if( mode == "managed-command-buffer" ) managedFilter = true;
+                else if( mode == "cpp-marker-command-list" ) managedFilter = false;
+                else throw QueryError( "INVALID_PARAMS",
+                    "source_mode must be cpp-marker-command-list or managed-command-buffer" );
+            }
+            const bool sourceFilterProvided = params.contains( "pass_source_id" );
+            const bool taxonomyFilterProvided = params.contains( "taxonomy_id" );
+            const auto sourceFilter = sourceFilterProvided ?
+                DecimalStringValue( params["pass_source_id"] ) : std::nullopt;
+            const auto taxonomyFilter = taxonomyFilterProvided ?
+                DecimalStringValue( params["taxonomy_id"] ) : std::nullopt;
+            std::optional<std::string> nameFilter;
+            if( params.contains( "name" ) )
+            {
+                if( !params["name"].is_string() ) throw QueryError( "INVALID_PARAMS", "name must be a string" );
+                nameFilter = Lower( params["name"].get<std::string>() );
+            }
+            const bool indexedTotal = !sourceFilterProvided && !taxonomyFilterProvided && !nameFilter;
+            uint64_t total = page.matchedTotal.value_or( indexedTotal ?
+                ( managedFilter ? ( *managedFilter ? managedPassCount : nativePassCount ) : passCount ) : 0 );
+            const bool mustCount = !page.matchedTotal && !indexedTotal;
+            uint64_t rawOffset = page.rawOffsetBound ? page.rawOffset : 0;
+            uint64_t matched = page.offset;
+            uint64_t nextRawOffset = rawOffset;
+            json values = json::array();
+            bool pageFilled = false;
+            std::optional<QueryIndexedExplicitPassFilterTag> indexedFilterTag;
+            uint64_t indexedFilterKey = 0;
+            if( sourceFilter && *sourceFilter <= UINT32_MAX )
+            { indexedFilterTag = QueryIndexedExplicitPassFilterTag::PassSource; indexedFilterKey = *sourceFilter; }
+            else if( taxonomyFilter && *taxonomyFilter <= UINT32_MAX )
+            { indexedFilterTag = QueryIndexedExplicitPassFilterTag::Taxonomy; indexedFilterKey = *taxonomyFilter; }
+            const bool impossibleFilter = ( sourceFilterProvided && ( !sourceFilter || *sourceFilter > UINT32_MAX ) ) ||
+                ( taxonomyFilterProvided && ( !taxonomyFilter || *taxonomyFilter > UINT32_MAX ) );
+            while( !impossibleFilter && ( mustCount || !pageFilled ) &&
+                ( indexedFilterTag || rawOffset < passCount ) )
+            {
+                checkCancelled();
+                std::vector<QueryIndexedExplicitPass> batch;
+                if( indexedFilterTag ) batch = indexed->ScanIndexedExplicitPassFilter(
+                    *indexedFilterTag, indexedFilterKey, rawOffset, 256, control );
+                else
+                {
+                    batch = indexed->ScanIndexedExplicitPasses( rawOffset,
+                        size_t( std::min<uint64_t>( 256, passCount - rawOffset ) ), control );
+                    if( batch.empty() ) throw QueryError( "INDEX_NOT_READY",
+                        "Explicit GPU Pass page is incomplete" );
+                    rawOffset += batch.size();
+                }
+                if( batch.empty() ) break;
+                for( const auto& item : batch )
+                {
+                    const auto match = toMatch( item );
+                    bool selected = true;
+                    if( managedFilter && item.managed != *managedFilter ) selected = false;
+                    if( sourceFilterProvided && ( !sourceFilter || *sourceFilter > UINT32_MAX ||
+                        match.pass.gpuQueryId != *sourceFilter ) ) selected = false;
+                    if( taxonomyFilterProvided && ( !taxonomyFilter || *taxonomyFilter > UINT32_MAX ||
+                        match.taxonomyId != *taxonomyFilter ) ) selected = false;
+                    json passJson;
+                    if( selected )
+                    {
+                        passJson = ExplicitGpuPassJson( *source, match, taxonomyDefinitions );
+                        if( nameFilter )
+                        {
+                            const auto name = passJson.contains( "name" ) && passJson["name"].is_string() ?
+                                Lower( passJson["name"].get<std::string>() ) : std::string();
+                            if( name.find( *nameFilter ) == std::string::npos ) selected = false;
+                        }
+                    }
+                    if( selected )
+                    {
+                        if( !pageFilled && matched >= page.offset )
+                        {
+                            values.emplace_back( std::move( passJson ) );
+                            nextRawOffset = item.rawCursorAfter;
+                            if( values.size() == page.limit ) pageFilled = true;
+                        }
+                        matched++;
+                    }
+                }
+            }
+            if( mustCount ) total = matched;
+            const auto returned = values.size();
+            const bool hasMore = page.offset + returned < total;
+            const auto cursor = NextResourceCursor( page, method, trace, returned,
+                size_t( nextRawOffset ), total );
+            auto result = base();
+            if( managedFilter && !sourceFilterProvided && !taxonomyFilterProvided && !nameFilter )
+            {
+                const bool managed = *managedFilter;
+                const json& selectedProducer = managed ? managedProducer : nativeProducer;
+                const auto selectedMissing = managed ? indexed->GetIndexedManagedExplicitPassMissingGpuZoneCount() :
+                    missingGpuZoneCount - indexed->GetIndexedManagedExplicitPassMissingGpuZoneCount();
+                const auto selectedUnresolved = managed ? indexed->GetIndexedManagedExplicitPassUnresolvedTaxonomyCount() :
+                    unresolvedTaxonomyCount - indexed->GetIndexedManagedExplicitPassUnresolvedTaxonomyCount();
+                const bool selectedPresent = selectedProducer.is_object() || total != 0;
+                const bool selectedComplete = selectedPresent && taxonomy.value( "present", false ) &&
+                    selectedMissing == 0 && selectedUnresolved == 0 &&
+                    ( !selectedProducer.is_object() || selectedProducer.value( "complete", false ) );
+                result["present"] = selectedPresent;
+                result["complete"] = selectedComplete;
+                result["effective"] = selectedProducer.is_object() ?
+                    selectedProducer.value( "effective", false ) : total != 0;
+                result["producer_state"] = selectedProducer.is_object() ?
+                    selectedProducer.value( "state", "unknown" ) :
+                    ( total == 0 ? "absent" : "persisted_entities_without_producer_record" );
+                result["reason"] = selectedPresent ?
+                    ( selectedComplete ? json( nullptr ) : json( "Selected GPU pass evidence is incomplete" ) ) :
+                    json( "Selected GPU pass producer and persisted entities are absent" );
+                result["source_mode"] = managed ? "managed-command-buffer" : "cpp-marker-command-list";
+                result["producer"] = selectedProducer;
+                result["producers"] = selectedProducer.is_object() ? json::array( { selectedProducer } ) : json::array();
+                result["instance_count"] = Decimal( total );
+                result["missing_gpu_zone_count"] = Decimal( selectedMissing );
+                result["unresolved_taxonomy_count"] = Decimal( selectedUnresolved );
+            }
+            result["passes"] = std::move( values );
+            result["page"] = { { "offset", page.offset }, { "limit", page.limit },
+                { "returned", returned }, { "total", total }, { "has_more", hasMore } };
+            return Success( id, std::move( result ), trace,
+                PageJson( page, returned, cursor ) );
+        }
+    }
+
+    if( method == "gpu.pass.search" || method == "gpu.pass.get" )
+    {
         auto taxonomy = GpuTaxonomyCatalogJson( info() );
         auto passes = BuildExplicitGpuPassSet( *source, taxonomy );
         size_t scanOffset = 0;
@@ -6949,7 +8312,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto taxonomyId = DecimalStringValue( definition["taxonomy_id"] );
             if( taxonomyId ) definitions.emplace( uint32_t( *taxonomyId ), definition );
         }
-        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
+        const auto* indexedPassSource = dynamic_cast<const QueryExplicitPassSource*>( source.get() );
+        auto explicitPasses = indexedPassSource ? ExplicitGpuPassSet{} :
+            BuildExplicitGpuPassSet( *source, taxonomy );
 
         using GpuInterval = std::pair<int64_t, int64_t>;
         struct CompleteGpuZoneInterval
@@ -6962,13 +8327,65 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             int64_t begin = 0;
             int64_t end = 0;
         };
+        struct IndexedCompleteGpuZoneInterval
+        {
+            uint64_t ordinal = 0;
+            uint64_t contextOrdinal = 0;
+            int64_t begin = 0;
+            int64_t end = 0;
+        };
         std::map<std::string, std::vector<GpuInterval>> allGpuIntervals;
+        std::map<std::string, std::vector<GpuInterval>> leafGpuIntervals;
         std::map<std::string, std::vector<GpuInterval>> explicitGpuIntervals;
         std::vector<CompleteGpuZoneInterval> completeGpuZones;
+        std::vector<IndexedCompleteGpuZoneInterval> indexedCompleteGpuZones;
         std::set<std::string> gpuParentZoneRefs;
         std::unordered_map<std::string, uint32_t> taxonomyByZoneRef;
         std::set<std::string> syntheticTaxonomyZoneRefs;
         std::vector<std::pair<uint32_t, std::string>> pendingParents;
+        std::shared_ptr<QueryResourceContext> taxonomyResources;
+        if( indexedPassSource )
+            if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                taxonomyResources = owner->GetQueryResourceContext();
+        analysis::AnalysisWorkspaceReservation taxonomyWorkspace(
+            taxonomyResources ? taxonomyResources->Workspace() : nullptr );
+        const uint64_t indexedZoneCount = indexedPassSource ? source->GetTraceInfoMetadata().counts.gpuZones : 0;
+        std::vector<uint32_t> indexedTaxonomyByZone;
+        std::vector<uint64_t> indexedParentByZone;
+        std::vector<uint8_t> indexedParentBits;
+        std::vector<uint8_t> indexedExplicitBits;
+        std::vector<uint8_t> indexedSyntheticBits;
+        std::vector<uint8_t> indexedExplicitAncestorBits;
+        std::map<uint64_t, std::string> indexedContextRefs;
+        if( indexedPassSource )
+        {
+            constexpr uint64_t perZoneBytes = sizeof( IndexedCompleteGpuZoneInterval ) +
+                sizeof( uint32_t ) + sizeof( uint64_t ) + 3 * sizeof( GpuInterval ) + 1;
+            if( indexedZoneCount > SIZE_MAX / perZoneBytes )
+                throw QueryError( "RESOURCE_LIMIT", "GPU taxonomy interval workspace is too large", true );
+            taxonomyWorkspace.Resize( size_t( indexedZoneCount * perZoneBytes ) );
+            indexedCompleteGpuZones.reserve( size_t( indexedZoneCount ) );
+            indexedTaxonomyByZone.assign( size_t( indexedZoneCount ), 0 );
+            indexedParentByZone.assign( size_t( indexedZoneCount ), UINT64_MAX );
+            const auto bitBytes = size_t( indexedZoneCount / 8 + ( indexedZoneCount % 8 != 0 ) );
+            indexedParentBits.assign( bitBytes, 0 );
+            indexedExplicitBits.assign( bitBytes, 0 );
+            indexedSyntheticBits.assign( bitBytes, 0 );
+            indexedExplicitAncestorBits.assign( bitBytes, 0 );
+            for( const auto& context : source->GetGpuContexts() )
+            {
+                indexedContextRefs.emplace( context.index, context.ref );
+                allGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+                leafGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+                explicitGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+            }
+        }
+        const auto setIndexedBit = []( std::vector<uint8_t>& bits, uint64_t ordinal ) {
+            bits[size_t( ordinal / 8 )] |= uint8_t( 1u << ( ordinal & 7 ) );
+        };
+        const auto indexedBit = []( const std::vector<uint8_t>& bits, uint64_t ordinal ) {
+            return ( bits[size_t( ordinal / 8 )] & uint8_t( 1u << ( ordinal & 7 ) ) ) != 0;
+        };
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> observedEdges;
         uint64_t taxonomyZoneCount = 0;
         uint64_t unknownTaxonomyZoneCount = 0;
@@ -6984,14 +8401,35 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             BudgetScanned( zones.size(), chunk, allowed );
             for( const auto& zone : zones )
             {
-                MatchExplicitGpuPassZone( *source, explicitPasses, zone );
+                if( !indexedPassSource ) MatchExplicitGpuPassZone( *source, explicitPasses, zone );
                 if( zone.gpuEndNs && *zone.gpuEndNs >= zone.gpuStartNs )
                 {
                     allGpuIntervals[zone.contextRef].emplace_back( zone.gpuStartNs, *zone.gpuEndNs );
-                    completeGpuZones.emplace_back( CompleteGpuZoneInterval {
-                        zone.ref, zone.contextRef, zone.name, zone.file, zone.line,
-                        zone.gpuStartNs, *zone.gpuEndNs } );
-                    if( zone.parentRef ) gpuParentZoneRefs.emplace( *zone.parentRef );
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = source->ParseEntityRef( zone.ref, "gpu-zone" );
+                        const auto contextOrdinal = source->ParseEntityRef( zone.contextRef, "gpu-context" );
+                        if( !ordinal || *ordinal >= indexedZoneCount || !contextOrdinal )
+                            throw QueryError( "INDEX_NOT_READY", "GPU taxonomy scanned an invalid GPU Zone identity" );
+                        indexedCompleteGpuZones.emplace_back( IndexedCompleteGpuZoneInterval {
+                            *ordinal, *contextOrdinal, zone.gpuStartNs, *zone.gpuEndNs } );
+                        indexedContextRefs.emplace( *contextOrdinal, zone.contextRef );
+                        if( zone.parentRef )
+                        {
+                            const auto parent = source->ParseEntityRef( *zone.parentRef, "gpu-zone" );
+                            if( !parent || *parent >= indexedZoneCount )
+                                throw QueryError( "INDEX_NOT_READY", "GPU taxonomy scanned an invalid parent GPU Zone" );
+                            indexedParentByZone[size_t( *ordinal )] = *parent;
+                            setIndexedBit( indexedParentBits, *parent );
+                        }
+                    }
+                    else
+                    {
+                        completeGpuZones.emplace_back( CompleteGpuZoneInterval {
+                            zone.ref, zone.contextRef, zone.name, zone.file, zone.line,
+                            zone.gpuStartNs, *zone.gpuEndNs } );
+                        if( zone.parentRef ) gpuParentZoneRefs.emplace( *zone.parentRef );
+                    }
                 }
                 const auto file = Lower( zone.file );
                 if( file.find( "jntracygputaxonomy.h" ) == std::string::npos ) continue;
@@ -7003,7 +8441,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     continue;
                 }
                 taxonomyZoneCount++;
-                syntheticTaxonomyZoneRefs.emplace( zone.ref );
+                if( indexedPassSource )
+                {
+                    const auto ordinal = source->ParseEntityRef( zone.ref, "gpu-zone" );
+                    if( !ordinal || *ordinal >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy marker has an invalid GPU Zone identity" );
+                    if( indexedTaxonomyByZone[size_t( *ordinal )] == 0 )
+                        indexedTaxonomyByZone[size_t( *ordinal )] = taxonomyId;
+                    setIndexedBit( indexedSyntheticBits, *ordinal );
+                    if( zone.parentRef && indexedParentByZone[size_t( *ordinal )] == UINT64_MAX )
+                    {
+                        const auto parent = source->ParseEntityRef( *zone.parentRef, "gpu-zone" );
+                        if( !parent || *parent >= indexedZoneCount )
+                            throw QueryError( "INDEX_NOT_READY", "GPU taxonomy marker has an invalid parent GPU Zone" );
+                        indexedParentByZone[size_t( *ordinal )] = *parent;
+                    }
+                }
+                else syntheticTaxonomyZoneRefs.emplace( zone.ref );
                 auto& stats = execution[taxonomyId];
                 stats.count++;
                 stats.contexts.emplace( zone.contextRef );
@@ -7014,8 +8468,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 }
                 else stats.incomplete++;
                 if( definition->second.value( "level", 0 ) > 0 ) fallbackZoneCount++;
-                taxonomyByZoneRef.emplace( zone.ref, taxonomyId );
-                if( zone.parentRef ) pendingParents.emplace_back( taxonomyId, *zone.parentRef );
+                if( !indexedPassSource )
+                {
+                    taxonomyByZoneRef.emplace( zone.ref, taxonomyId );
+                    if( zone.parentRef ) pendingParents.emplace_back( taxonomyId, *zone.parentRef );
+                }
             }
             offset += zones.size();
             if( zones.size() < allowed ) break;
@@ -7024,21 +8481,38 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         uint64_t explicitPassMissingZoneCount = 0;
         std::set<std::string> explicitPassZoneRefs;
         std::set<std::string> explicitAncestorZoneRefs;
-        for( const auto& pass : explicitPasses.matches )
+        const auto processExplicitPass = [&]( const ExplicitGpuPassMatch& pass )
         {
             if( !pass.zone )
             {
                 explicitPassMissingZoneCount++;
-                continue;
+                return;
             }
             const auto definition = definitions.find( pass.taxonomyId );
             if( definition == definitions.end() )
             {
                 unknownTaxonomyZoneCount++;
-                continue;
+                return;
             }
             explicitPassZoneCount++;
-            explicitPassZoneRefs.emplace( pass.zone->ref );
+            std::optional<uint64_t> indexedZoneOrdinal;
+            if( indexedPassSource )
+            {
+                indexedZoneOrdinal = source->ParseEntityRef( pass.zone->ref, "gpu-zone" );
+                if( !indexedZoneOrdinal || *indexedZoneOrdinal >= indexedZoneCount )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass references an invalid GPU Zone" );
+                setIndexedBit( indexedExplicitBits, *indexedZoneOrdinal );
+                if( indexedTaxonomyByZone[size_t( *indexedZoneOrdinal )] == 0 )
+                    indexedTaxonomyByZone[size_t( *indexedZoneOrdinal )] = pass.taxonomyId;
+                if( pass.zone->parentRef && indexedParentByZone[size_t( *indexedZoneOrdinal )] == UINT64_MAX )
+                {
+                    const auto parent = source->ParseEntityRef( *pass.zone->parentRef, "gpu-zone" );
+                    if( !parent || *parent >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass references an invalid parent GPU Zone" );
+                    indexedParentByZone[size_t( *indexedZoneOrdinal )] = *parent;
+                }
+            }
+            else explicitPassZoneRefs.emplace( pass.zone->ref );
             taxonomyZoneCount++;
             auto& stats = execution[pass.taxonomyId];
             stats.count++;
@@ -7047,25 +8521,111 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 stats.complete++;
                 stats.totalNs += uint64_t( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
-                explicitGpuIntervals[pass.zone->contextRef].emplace_back(
+                if( !indexedPassSource ) explicitGpuIntervals[pass.zone->contextRef].emplace_back(
                     pass.zone->gpuStartNs, *pass.zone->gpuEndNs );
             }
             else stats.incomplete++;
-            taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
-            if( pass.zone->parentRef )
+            if( !indexedPassSource ) taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
+            if( !indexedPassSource && pass.zone->parentRef )
             {
                 pendingParents.emplace_back( pass.taxonomyId, *pass.zone->parentRef );
                 if( syntheticTaxonomyZoneRefs.contains( *pass.zone->parentRef ) )
                     explicitAncestorZoneRefs.emplace( *pass.zone->parentRef );
             }
+        };
+        if( indexedPassSource )
+        {
+            QueryCorrelationReadControl passControl;
+            passControl.check = checkCancelled;
+            passControl.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "GPU taxonomy Explicit Pass scan budget exhausted", true );
+                return allowed;
+            };
+            passControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+            for( uint64_t passOffset = 0; passOffset < totalPasses; )
+            {
+                const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                    size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), passControl );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "GPU taxonomy Explicit Pass page is incomplete" );
+                for( const auto& value : page )
+                    processExplicitPass( IndexedExplicitGpuPassMatch( value ) );
+                passOffset += page.size();
+            }
         }
-        fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount, explicitAncestorZoneRefs.size() );
+        else for( const auto& pass : explicitPasses.matches ) processExplicitPass( pass );
+        uint64_t indexedExplicitAncestorCount = 0;
+        if( indexedPassSource )
+        {
+            for( const auto& zone : indexedCompleteGpuZones )
+            {
+                const auto context = indexedContextRefs.find( zone.contextOrdinal );
+                if( context == indexedContextRefs.end() )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy context identity is unresolved" );
+                if( indexedBit( indexedExplicitBits, zone.ordinal ) )
+                    explicitGpuIntervals[context->second].emplace_back( zone.begin, zone.end );
+                const auto parent = indexedParentByZone[size_t( zone.ordinal )];
+                if( indexedBit( indexedExplicitBits, zone.ordinal ) && parent != UINT64_MAX &&
+                    indexedBit( indexedSyntheticBits, parent ) && !indexedBit( indexedExplicitAncestorBits, parent ) )
+                {
+                    setIndexedBit( indexedExplicitAncestorBits, parent );
+                    indexedExplicitAncestorCount++;
+                }
+            }
+            for( uint64_t ordinal = 0; ordinal < indexedZoneCount; ordinal++ )
+            {
+                if( !indexedBit( indexedSyntheticBits, ordinal ) ) continue;
+                const auto child = indexedTaxonomyByZone[size_t( ordinal )];
+                const auto parentOrdinal = indexedParentByZone[size_t( ordinal )];
+                if( child == 0 || parentOrdinal == UINT64_MAX ) continue;
+                const auto parent = indexedTaxonomyByZone[size_t( parentOrdinal )];
+                if( parent != 0 ) observedEdges[{ parent, child }]++;
+            }
+
+            QueryCorrelationReadControl edgeControl;
+            edgeControl.check = checkCancelled;
+            edgeControl.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "GPU taxonomy Explicit Pass edge scan budget exhausted", true );
+                return allowed;
+            };
+            edgeControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+            for( uint64_t passOffset = 0; passOffset < totalPasses; )
+            {
+                const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                    size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), edgeControl );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "GPU taxonomy Explicit Pass edge page is incomplete" );
+                for( const auto& value : page )
+                {
+                    if( !value.zone || definitions.find( value.taxonomyId ) == definitions.end() ||
+                        !value.zone->parentRef ) continue;
+                    const auto parentOrdinal = source->ParseEntityRef( *value.zone->parentRef, "gpu-zone" );
+                    if( !parentOrdinal || *parentOrdinal >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass edge parent is invalid" );
+                    const auto parent = indexedTaxonomyByZone[size_t( *parentOrdinal )];
+                    if( parent != 0 ) observedEdges[{ parent, value.taxonomyId }]++;
+                }
+                passOffset += page.size();
+            }
+        }
+        fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount,
+            indexedPassSource ? indexedExplicitAncestorCount : uint64_t( explicitAncestorZoneRefs.size() ) );
         const auto mergeIntervals = []( std::vector<GpuInterval> intervals ) -> std::vector<GpuInterval> {
             if( intervals.empty() ) return {};
             std::sort( intervals.begin(), intervals.end() );
             int64_t begin = intervals.front().first;
             int64_t end = intervals.front().second;
-            std::vector<GpuInterval> merged;
+            size_t written = 0;
             for( size_t index = 1; index < intervals.size(); ++index )
             {
                 if( intervals[index].first <= end )
@@ -7073,21 +8633,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     end = std::max( end, intervals[index].second );
                     continue;
                 }
-                merged.emplace_back( begin, end );
+                intervals[written++] = { begin, end };
                 begin = intervals[index].first;
                 end = intervals[index].second;
             }
-            merged.emplace_back( begin, end );
-            return merged;
+            intervals[written++] = { begin, end };
+            intervals.resize( written );
+            return intervals;
         };
         const auto mergedDuration = []( const std::vector<GpuInterval>& intervals ) -> uint64_t {
             uint64_t duration = 0;
             for( const auto& interval : intervals ) duration += uint64_t( interval.second - interval.first );
             return duration;
         };
-        const auto subtractIntervals = []( const std::vector<GpuInterval>& envelope,
-                                           const std::vector<GpuInterval>& covered ) {
-            std::vector<GpuInterval> gaps;
+        const auto visitSubtractedIntervals = []( const std::vector<GpuInterval>& envelope,
+            const std::vector<GpuInterval>& covered, const auto& visit ) {
             size_t coveredIndex = 0;
             for( const auto& span : envelope )
             {
@@ -7097,14 +8657,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 while( index < covered.size() && covered[index].first < span.second )
                 {
                     if( covered[index].first > cursor )
-                        gaps.emplace_back( cursor, std::min( span.second, covered[index].first ) );
+                        visit( GpuInterval { cursor, std::min( span.second, covered[index].first ) } );
                     cursor = std::max( cursor, covered[index].second );
                     if( cursor >= span.second ) break;
                     index++;
                 }
-                if( cursor < span.second ) gaps.emplace_back( cursor, span.second );
+                if( cursor < span.second ) visit( GpuInterval { cursor, span.second } );
             }
-            return gaps;
         };
         const auto intersectionDuration = []( const std::vector<GpuInterval>& lhs,
                                               const std::vector<GpuInterval>& rhs ) -> uint64_t {
@@ -7121,8 +8680,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             return duration;
         };
-        std::map<std::string, std::vector<GpuInterval>> leafGpuIntervals;
-        for( const auto& zone : completeGpuZones )
+        if( indexedPassSource )
+        {
+            for( const auto& zone : indexedCompleteGpuZones )
+            {
+                if( zone.end <= zone.begin || indexedBit( indexedParentBits, zone.ordinal ) ) continue;
+                const auto context = indexedContextRefs.find( zone.contextOrdinal );
+                if( context == indexedContextRefs.end() )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy leaf context is unresolved" );
+                leafGpuIntervals[context->second].emplace_back( zone.begin, zone.end );
+            }
+        }
+        else for( const auto& zone : completeGpuZones )
             if( zone.end > zone.begin && !gpuParentZoneRefs.contains( zone.ref ) )
                 leafGpuIntervals[zone.contextRef].emplace_back( zone.begin, zone.end );
 
@@ -7134,6 +8703,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         struct UncoveredGpuInterval { std::string contextRef; int64_t begin = 0; int64_t end = 0; };
         std::vector<UncoveredGpuInterval> uncoveredGpuIntervals;
         std::vector<UncoveredGpuInterval> timelineUncoveredGpuIntervals;
+        uint64_t uncoveredGpuIntervalCount = 0;
+        uint64_t timelineUncoveredGpuIntervalCount = 0;
+        constexpr size_t maxUncoveredIntervals = 32;
+        const auto recordUncovered = [&]( std::vector<UncoveredGpuInterval>& top, uint64_t& count,
+            const std::string& context, const GpuInterval& gap ) {
+            if( gap.second <= gap.first ) return;
+            count++;
+            top.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            if( top.size() <= maxUncoveredIntervals ) return;
+            std::sort( top.begin(), top.end(), []( const auto& lhs, const auto& rhs ) {
+                const auto lhsDuration = lhs.end - lhs.begin;
+                const auto rhsDuration = rhs.end - rhs.begin;
+                if( lhsDuration != rhsDuration ) return lhsDuration > rhsDuration;
+                if( lhs.contextRef != rhs.contextRef ) return lhs.contextRef < rhs.contextRef;
+                return lhs.begin < rhs.begin;
+            } );
+            top.resize( maxUncoveredIntervals );
+        };
         std::set<std::string> gpuContexts;
         for( const auto& [context, unused] : allGpuIntervals ) gpuContexts.emplace( context );
         for( const auto& [context, unused] : leafGpuIntervals ) gpuContexts.emplace( context );
@@ -7143,19 +8730,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto leafFound = leafGpuIntervals.find( context );
             const auto explicitFound = explicitGpuIntervals.find( context );
             const auto mergedAll = allFound == allGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( allFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( allFound->second ) );
             const auto mergedLeaf = leafFound == leafGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( leafFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( leafFound->second ) );
             const auto mergedExplicit = explicitFound == explicitGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( explicitFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( explicitFound->second ) );
             const uint64_t totalNs = mergedDuration( mergedLeaf );
             const uint64_t explicitNs = intersectionDuration( mergedLeaf, mergedExplicit );
             const uint64_t envelopeNs = mergedDuration( mergedAll );
             const uint64_t explicitEnvelopeNs = intersectionDuration( mergedAll, mergedExplicit );
-            for( const auto& gap : subtractIntervals( mergedLeaf, mergedExplicit ) )
-                if( gap.second > gap.first ) uncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
-            for( const auto& gap : subtractIntervals( mergedAll, mergedExplicit ) )
-                if( gap.second > gap.first ) timelineUncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            visitSubtractedIntervals( mergedLeaf, mergedExplicit, [&]( const GpuInterval& gap ) {
+                recordUncovered( uncoveredGpuIntervals, uncoveredGpuIntervalCount, context, gap );
+            } );
+            visitSubtractedIntervals( mergedAll, mergedExplicit, [&]( const GpuInterval& gap ) {
+                recordUncovered( timelineUncoveredGpuIntervals, timelineUncoveredGpuIntervalCount, context, gap );
+            } );
             totalGpuBusyNs += totalNs;
             explicitGpuBusyNs += explicitNs;
             timelineEnvelopeNs += envelopeNs;
@@ -7180,10 +8769,48 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 return lhs.begin < rhs.begin;
             } );
             json values = json::array();
-            constexpr size_t maxUncoveredIntervals = 32;
             for( size_t gapIndex = 0; gapIndex < std::min( maxUncoveredIntervals, gaps.size() ); ++gapIndex )
             {
                 const auto& gap = gaps[gapIndex];
+                if( indexedPassSource )
+                {
+                    const auto contextOrdinal = source->ParseEntityRef( gap.contextRef, "gpu-context" );
+                    if( !contextOrdinal ) throw QueryError( "INDEX_NOT_READY",
+                        "GPU taxonomy uncovered interval has an invalid context" );
+                    const IndexedCompleteGpuZoneInterval* containing = nullptr;
+                    const IndexedCompleteGpuZoneInterval* previousExplicit = nullptr;
+                    const IndexedCompleteGpuZoneInterval* nextExplicit = nullptr;
+                    for( const auto& zone : indexedCompleteGpuZones )
+                    {
+                        if( zone.contextOrdinal != *contextOrdinal ) continue;
+                        const bool explicitZone = indexedBit( indexedExplicitBits, zone.ordinal );
+                        if( !explicitZone && zone.begin <= gap.begin && zone.end >= gap.end &&
+                            ( !containing || zone.end - zone.begin < containing->end - containing->begin ) )
+                            containing = &zone;
+                        if( !explicitZone ) continue;
+                        if( zone.end <= gap.begin && ( !previousExplicit || zone.end > previousExplicit->end ) )
+                            previousExplicit = &zone;
+                        if( zone.begin >= gap.end && ( !nextExplicit || zone.begin < nextExplicit->begin ) )
+                            nextExplicit = &zone;
+                    }
+                    const auto zoneJson = [&]( const IndexedCompleteGpuZoneInterval* zone ) -> json {
+                        if( !zone ) return nullptr;
+                        const auto value = source->GetGpuZone( source->MakeEntityRef( "gpu-zone", zone->ordinal ) );
+                        if( !value ) throw QueryError( "INDEX_NOT_READY",
+                            "GPU taxonomy uncovered interval evidence is missing" );
+                        return { { "ref", value->ref }, { "name", value->name }, { "file", value->file },
+                            { "line", value->line }, { "gpu_start_ns", Decimal( zone->begin ) },
+                            { "gpu_end_ns", Decimal( zone->end ) } };
+                    };
+                    values.push_back( {
+                        { "context_ref", gap.contextRef }, { "gpu_start_ns", Decimal( gap.begin ) },
+                        { "gpu_end_ns", Decimal( gap.end ) }, { "duration_ns", Decimal( gap.end - gap.begin ) },
+                        { "containing_non_explicit_zone", zoneJson( containing ) },
+                        { "previous_explicit_pass", zoneJson( previousExplicit ) },
+                        { "next_explicit_pass", zoneJson( nextExplicit ) }
+                    } );
+                    continue;
+                }
                 const CompleteGpuZoneInterval* containing = nullptr;
                 const CompleteGpuZoneInterval* previousExplicit = nullptr;
                 const CompleteGpuZoneInterval* nextExplicit = nullptr;
@@ -7224,7 +8851,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             std::min( timelineEnvelopeNs, explicitTimelineEnvelopeNs );
         const double explicitTimelineEnvelopeRatio = timelineEnvelopeNs == 0 ?
             0.0 : double( explicitTimelineEnvelopeNs ) / double( timelineEnvelopeNs );
-        for( const auto& [childId, parentRef] : pendingParents )
+        if( !indexedPassSource ) for( const auto& [childId, parentRef] : pendingParents )
         {
             const auto parent = taxonomyByZoneRef.find( parentRef );
             if( parent != taxonomyByZoneRef.end() ) observedEdges[{ parent->second, childId }]++;
@@ -7364,14 +8991,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "required_explicit_ratio", 0.95 }, { "maximum_fallback_or_unclassified_ratio", 0.05 },
                 { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) },
                 { "contexts", std::move( gpuBusyContexts ) },
-                { "uncovered_interval_count", Decimal( uncoveredGpuIntervals.size() ) },
+                { "uncovered_interval_count", Decimal( uncoveredGpuIntervalCount ) },
                 { "top_uncovered_intervals", std::move( topUncoveredGpuIntervals ) },
                 { "timeline_envelope", {
                     { "total_ns", Decimal( timelineEnvelopeNs ) },
                     { "explicit_ns", Decimal( explicitTimelineEnvelopeNs ) },
                     { "non_explicit_ns", Decimal( nonExplicitTimelineEnvelopeNs ) },
                     { "explicit_coverage_ratio", explicitTimelineEnvelopeRatio },
-                    { "uncovered_interval_count", Decimal( timelineUncoveredGpuIntervals.size() ) },
+                    { "uncovered_interval_count", Decimal( timelineUncoveredGpuIntervalCount ) },
                     { "top_uncovered_intervals", std::move( topTimelineUncoveredGpuIntervals ) },
                     { "evidence_kind", "parent_gpu_zone_timeline_envelope" },
                     { "used_for_gate", false }
@@ -8919,12 +10546,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
     {
-        const auto frameEvents = source->GetCorrelatedFrameEvents();
-        if( frameEvents.empty() )
+        if( !source->JobDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "bounded Job aggregation has not been built" );
+        const auto frameEventCount = source->GetCorrelatedFrameEventCount();
+        if( frameEventCount == 0 )
             return Success( id, { { "present", false }, { "complete", false },
                 { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
                 { "evidence_kind", "unavailable" } }, trace );
-
+        std::vector<analysis::CorrelatedFrameEventDto> frameEvents;
+        for( uint64_t offset = 0; offset < frameEventCount; )
+        {
+            checkDirectedJobRead();
+            const auto requested = size_t( std::min<uint64_t>( 256, frameEventCount - offset ) );
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                "Frame correlation scan budget exhausted", true );
+            auto page = source->ScanCorrelatedFrameEvents( size_t( offset ), allowed );
+            checkDirectedJobRead();
+            if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY",
+                "Frame correlation page is incomplete" );
+            BudgetScanned( page.size(), requested, allowed );
+            frameEvents.insert( frameEvents.end(), std::make_move_iterator( page.begin() ),
+                std::make_move_iterator( page.end() ) );
+            offset += page.size();
+        }
         uint64_t frameId = 0;
         if( params.contains( "ref" ) )
         {
@@ -9321,7 +10966,34 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::vector<uint64_t> gfxSeeds;
         gfxSeeds.reserve( selectedJobIds.size() );
         for( const auto jobId : selectedJobIds ) gfxSeeds.emplace_back( jobId );
-        const auto gfxEvidence = readGfx ? source->GetEvidenceGfx( frameId, gfxSeeds ) : analysis::GfxEvidenceSlice{};
+        analysis::GfxEvidenceSlice gfxEvidence;
+        if( readGfx )
+        {
+            if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+            {
+                QueryCorrelationReadControl control;
+                control.check = checkDirectedJobRead;
+                control.allowance = [&]( size_t requested ) {
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Gfx evidence index scan budget exhausted", true );
+                    return allowed;
+                };
+                control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                    BudgetScanned( actual, requested, allowed );
+                };
+                control.maximumEdges = size_t( UnsignedParameter(
+                    params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+                control.maximumNodes = size_t( UnsignedParameter(
+                    params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) );
+                auto bounded = indexed->GetIndexedGfxEvidence( frameId, gfxSeeds, control );
+                if( bounded.edgeLimitExceeded || bounded.nodeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", bounded.edgeLimitExceeded ?
+                        "Gfx evidence edge budget exhausted" : "Gfx evidence node budget exhausted", true );
+                gfxEvidence = std::move( bounded.value );
+            }
+            else gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds );
+        }
         const auto& dispatches = gfxEvidence.dispatches;
         const auto& entities = gfxEvidence.entities;
         const auto& gfxLinks = gfxEvidence.links;
@@ -9716,9 +11388,227 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["conclusion_contract"] = "all conclusions must cite returned node/edge refs; absent domains are not real zero";
         return Success( id, std::move( result ), trace );
     }
+    if( method == "frame.identity" )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+        {
+            QueryCorrelationReadControl control;
+            control.check = checkDirectedJobRead;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Frame correlation scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto identityJson = [&]( uint64_t frameId ) {
+                auto events = indexed->GetIndexedFrameEvents( frameId, control );
+                if( events.empty() )
+                    throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
+                std::sort( events.begin(), events.end(), []( const auto& lhs, const auto& rhs ) {
+                    return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
+                } );
+                int64_t begin = std::numeric_limits<int64_t>::max();
+                int64_t end = std::numeric_limits<int64_t>::min();
+                bool canonicalBegin = false;
+                bool canonicalEnd = false;
+                std::set<std::string> domains;
+                json eventValues = json::array();
+                for( const auto& event : events )
+                {
+                    begin = std::min( begin, event.timeNs );
+                    end = std::max( end, event.timeNs );
+                    domains.emplace( CorrelatedFrameDomainName( event.domain ) );
+                    canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
+                    canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
+                    eventValues.push_back( CorrelatedFrameEventJson( *source, event ) );
+                }
+                return json {
+                    { "ref", source->MakeEntityRef( "frame-identity", frameId ) },
+                    { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
+                    { "sequence", uint32_t( frameId ) }, { "begin_ns", Decimal( begin ) },
+                    { "end_ns", Decimal( end ) }, { "duration_ns", Decimal( std::max<int64_t>( 0, end - begin ) ) },
+                    { "complete", canonicalBegin && canonicalEnd }, { "domains", domains },
+                    { "events", std::move( eventValues ) }, { "evidence_kind", "exact" }
+                };
+            };
+            if( params.contains( "ref" ) || params.contains( "frame_id" ) )
+            {
+                uint64_t frameId = 0;
+                if( params.contains( "ref" ) )
+                {
+                    if( !params["ref"].is_string() )
+                        throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
+                    const auto parsed = source->ParseEntityRef(
+                        params["ref"].get<std::string>(), "frame-identity" );
+                    if( !parsed ) throw QueryError( "INVALID_PARAMS",
+                        "ref must be a FrameIdentity ref from this trace" );
+                    frameId = *parsed;
+                }
+                else frameId = UnsignedParameter( params, "frame_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                if( indexed->GetIndexedFrameIdentityCount() == 0 )
+                    return Success( id, { { "present", false },
+                        { "reason", "trace predates or does not contain JN frame correlation" },
+                        { "identities", json::array() } }, trace );
+                return Success( id, { { "present", true },
+                    { "identity", identityJson( frameId ) } }, trace );
+            }
+            const auto total = indexed->GetIndexedFrameIdentityCount();
+            if( total == 0 )
+                return Success( id, { { "present", false },
+                    { "reason", "trace predates or does not contain JN frame correlation" },
+                    { "identities", json::array() } }, trace );
+            const auto page = ParsePage( params, method, trace );
+            const auto frameIds = indexed->ScanIndexedFrameIdentityIds( page.offset, page.limit, control );
+            json identities = json::array();
+            for( const auto frameId : frameIds ) identities.push_back( identityJson( frameId ) );
+            const bool hasMore = page.offset + frameIds.size() < total;
+            const auto cursor = NextCursor( page, method, trace, frameIds.size(), hasMore );
+            return Success( id, { { "present", true }, { "identities", std::move( identities ) } },
+                trace, PageJson( page, frameIds.size(), cursor ) );
+        }
+    }
+    if( ( method == "entity.related" || method == "correlation.chain" ) )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+        {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto rootRef = params["ref"].get<std::string>();
+            QueryCorrelationReadControl control;
+            control.check = checkDirectedJobRead;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Correlation index scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            control.maximumEdges = size_t( UnsignedParameter(
+                params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+            const auto edgeJson = [&]( const QueryCorrelationEdge& edge, uint64_t ordinal ) {
+                return json {
+                    { "ref", source->MakeEntityRef( "correlation", ordinal + 1 ) },
+                    { "source_ref", edge.sourceRef }, { "target_ref", edge.targetRef },
+                    { "relation", edge.relation }, { "correlation_id", edge.targetRef },
+                    { "parent_span_id", edge.sourceRef },
+                    { "origin_frame_id", edge.originFrameId == 0 ? json( nullptr ) : json( Decimal( edge.originFrameId ) ) },
+                    { "origin_frame_ref", edge.originFrameId == 0 ? json( nullptr ) :
+                        json( source->MakeEntityRef( "frame-identity", edge.originFrameId ) ) },
+                    { "evidence_kind", "exact" }
+                };
+            };
+            const auto orderEdges = []( auto& edges ) {
+                std::stable_sort( edges.begin(), edges.end(), []( const auto& lhs, const auto& rhs ) {
+                    if( lhs.orderDomain != rhs.orderDomain ) return lhs.orderDomain < rhs.orderDomain;
+                    if( lhs.ordinal != rhs.ordinal ) return lhs.ordinal < rhs.ordinal;
+                    if( lhs.sourceRef != rhs.sourceRef ) return lhs.sourceRef < rhs.sourceRef;
+                    if( lhs.targetRef != rhs.targetRef ) return lhs.targetRef < rhs.targetRef;
+                    return lhs.relation < rhs.relation;
+                } );
+            };
+            if( method == "entity.related" )
+            {
+                auto neighborhood = indexed->GetIndexedCorrelationNeighbors( rootRef, control );
+                if( neighborhood.edgeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                if( !neighborhood.known ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
+                orderEdges( neighborhood.edges );
+                json relations = json::array();
+                std::set<std::tuple<std::string, std::string, std::string, uint64_t, uint8_t, uint64_t>> seen;
+                for( const auto& edge : neighborhood.edges )
+                {
+                    const auto key = std::make_tuple( edge.sourceRef, edge.targetRef, edge.relation,
+                        edge.originFrameId, edge.orderDomain, edge.ordinal );
+                    if( !seen.emplace( key ).second ) continue;
+                    if( !BudgetConsumeEdge() )
+                        throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                    relations.push_back( edgeJson( edge, relations.size() ) );
+                }
+                return Success( id, { { "present", true }, { "root_ref", rootRef },
+                    { "relations", std::move( relations ) }, { "evidence_kind", "exact" } }, trace );
+            }
+
+            const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+            std::set<std::string> visited { rootRef };
+            std::queue<std::string> frontier;
+            frontier.push( rootRef );
+            BudgetConsumeNode();
+            bool rootKnown = false;
+            bool truncated = false;
+            std::vector<QueryCorrelationEdge> edges;
+            std::set<std::tuple<std::string, std::string, std::string, uint64_t, uint8_t, uint64_t>> seen;
+            while( !frontier.empty() && !truncated )
+            {
+                checkDirectedJobRead();
+                const auto current = frontier.front();
+                frontier.pop();
+                const auto neighborhood = indexed->GetIndexedCorrelationNeighbors( current, control );
+                if( neighborhood.edgeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                if( current == rootRef ) rootKnown = neighborhood.known;
+                for( const auto& edge : neighborhood.edges )
+                {
+                    const auto key = std::make_tuple( edge.sourceRef, edge.targetRef, edge.relation,
+                        edge.originFrameId, edge.orderDomain, edge.ordinal );
+                    if( seen.emplace( key ).second )
+                    {
+                        if( !BudgetConsumeEdge() )
+                            throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                        edges.emplace_back( edge );
+                    }
+                    std::string next;
+                    if( edge.sourceRef == current ) next = edge.targetRef;
+                    else if( edge.targetRef == current ) next = edge.sourceRef;
+                    if( next.empty() || visited.contains( next ) ) continue;
+                    if( visited.size() >= maxNodes || !BudgetConsumeNode() )
+                    { truncated = true; break; }
+                    visited.emplace( next );
+                    frontier.push( next );
+                }
+            }
+            if( !rootKnown ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
+            orderEdges( edges );
+            json relations = json::array();
+            for( const auto& edge : edges )
+                if( visited.contains( edge.sourceRef ) && visited.contains( edge.targetRef ) )
+                    relations.push_back( edgeJson( edge, relations.size() ) );
+            return Success( id, { { "present", true }, { "root_ref", rootRef },
+                { "nodes", visited }, { "relations", std::move( relations ) },
+                { "truncated", truncated }, { "evidence_kind", "exact" } }, trace );
+        }
+    }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {
-        auto frameEvents = source->GetCorrelatedFrameEvents();
+        const auto readBoundedRows = [&]( uint64_t total, const auto& read, const char* label ) {
+            using Rows = decltype( read( size_t( 0 ), size_t( 0 ) ) );
+            Rows result;
+            for( uint64_t offset = 0; offset < total; )
+            {
+                checkDirectedJobRead();
+                const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    std::string( label ) + " scan budget exhausted", true );
+                auto page = read( size_t( offset ), allowed );
+                checkDirectedJobRead();
+                if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY",
+                    std::string( label ) + " page is incomplete" );
+                BudgetScanned( page.size(), requested, allowed );
+                result.insert( result.end(), std::make_move_iterator( page.begin() ),
+                    std::make_move_iterator( page.end() ) );
+                offset += page.size();
+            }
+            return result;
+        };
+        auto frameEvents = readBoundedRows( source->GetCorrelatedFrameEventCount(),
+            [&]( size_t offset, size_t limit ) { return source->ScanCorrelatedFrameEvents( offset, limit ); },
+            "Frame correlation" );
         if( frameEvents.empty() )
             return Success( id, { { "present", false }, { "reason", "trace predates or does not contain JN frame correlation" }, { "identities", json::array() } }, trace );
 
@@ -9783,13 +11673,52 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         const bool frameSlice = method == "timeline.correlated_slice";
-        const auto jobs = frameSlice ? source->GetEvidenceJobs( parseFrame(), checkDirectedJobRead ) : source->GetJobs();
+        const auto jobs = frameSlice ? source->GetEvidenceJobs( parseFrame(), checkDirectedJobRead ) :
+            readBoundedRows( source->GetJobCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanJobs( offset, limit ); }, "Job" );
         std::vector<uint64_t> sliceSeeds;
         if( frameSlice ) for( const auto& job : jobs ) sliceSeeds.emplace_back( job.jobId );
-        const auto gfxSlice = frameSlice ? source->GetEvidenceGfx( parseFrame(), sliceSeeds ) : analysis::GfxEvidenceSlice{};
-        const auto dispatches = frameSlice ? gfxSlice.dispatches : source->GetGfxDispatches();
-        const auto entities = frameSlice ? gfxSlice.entities : source->GetGfxEntities();
-        const auto gfxLinks = frameSlice ? gfxSlice.links : source->GetGfxLinks();
+        analysis::GfxEvidenceSlice gfxSlice;
+        if( frameSlice )
+        {
+            const auto frameId = parseFrame();
+            if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+            {
+                QueryCorrelationReadControl control;
+                control.check = checkDirectedJobRead;
+                control.allowance = [&]( size_t requested ) {
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Gfx evidence index scan budget exhausted", true );
+                    return allowed;
+                };
+                control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                    BudgetScanned( actual, requested, allowed );
+                };
+                control.maximumEdges = size_t( UnsignedParameter(
+                    params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+                control.maximumNodes = size_t( UnsignedParameter(
+                    params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) );
+                auto bounded = indexed->GetIndexedGfxEvidence( frameId, sliceSeeds, control );
+                if( bounded.edgeLimitExceeded || bounded.nodeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", bounded.edgeLimitExceeded ?
+                        "Gfx evidence edge budget exhausted" : "Gfx evidence node budget exhausted", true );
+                gfxSlice = std::move( bounded.value );
+            }
+            else gfxSlice = source->GetEvidenceGfx( frameId, sliceSeeds );
+        }
+        const auto dispatches = frameSlice ? gfxSlice.dispatches :
+            readBoundedRows( source->GetGfxDispatchCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxDispatches( offset, limit ); },
+                "Gfx dispatch" );
+        const auto entities = frameSlice ? gfxSlice.entities :
+            readBoundedRows( source->GetGfxEntityCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                "Gfx entity" );
+        const auto gfxLinks = frameSlice ? gfxSlice.links :
+            readBoundedRows( source->GetGfxLinkCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                "Gfx link" );
         std::unordered_map<uint64_t, std::string> jobRefs;
         std::unordered_map<uint64_t, std::string> dispatchRefs;
         std::unordered_map<uint64_t, std::string> entityRefs;
@@ -9805,6 +11734,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json relations = json::array();
         const auto addRelation = [&]( std::string sourceRef, std::string targetRef, const char* relation, uint64_t originFrameId ) {
             if( frameSlice ) checkDirectedJobRead();
+            if( !BudgetConsumeEdge() )
+                throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
             relations.push_back( {
                 { "ref", source->MakeEntityRef( "correlation", relations.size() + 1 ) },
                 { "source_ref", sourceRef }, { "target_ref", targetRef }, { "relation", relation },
@@ -9931,6 +11862,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.statistics" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {
+        if( !source->JobDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "bounded Job aggregation has not been built" );
         const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
             if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
             const auto value = params[parameter].get<std::string>();
@@ -9938,18 +11871,99 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
             return *parsed;
         };
+        if( method == "job.search" && source->HasJobScheduleIndex() )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string kind = params.value( "kind", "" );
+            const std::string state = params.value( "state", "" );
+            size_t rawOffset = page.rawOffsetBound ? page.rawOffset : 0;
+            size_t legacySkip = page.rawOffsetBound ? 0 : page.offset;
+            bool hasMore = false;
+            size_t responseBytes = 0;
+            json values = json::array();
+            while( true )
+            {
+                checkDirectedJobRead();
+                const auto allowed = BudgetScanAllowance( 1 );
+                if( allowed == 0 )
+                {
+                    if( legacySkip != 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Job search budget exhausted before locating the legacy cursor; increase max_scan_events", true );
+                    hasMore = true;
+                    break;
+                }
+                auto rows = source->ScanJobsBySchedule( rawOffset, 1, checkDirectedJobRead );
+                BudgetScanned( rows.size(), 1, allowed );
+                if( rows.empty() ) break;
+                const auto& job = rows.front();
+                const char* currentState = job.cancelled ? "cancelled" : job.incomplete ? "incomplete" : job.completedNs ? "completed" : job.truncated ? "truncated" : "scheduled";
+                const bool matches = TextMatches( job.name, params ) &&
+                    ( kind.empty() || kind == JobKindName( job.kind ) ) && ( state.empty() || state == currentState );
+                if( matches && legacySkip == 0 && values.size() == page.limit ) { hasMore = true; break; }
+                rawOffset++;
+                if( !matches ) continue;
+                if( legacySkip != 0 ) { legacySkip--; continue; }
+                auto value = ProjectFields( JobJson( *source, job, false ), params );
+                const auto valueBytes = DumpProtocolJson( value ).size() + 1;
+                if( valueBytes > MaximumResponseBytes - responseBytes )
+                    throw QueryError( "RESOURCE_LIMIT", "Job search response exceeds the 8 MiB budget; use pagination or field projection", true );
+                responseBytes += valueBytes;
+                values.push_back( std::move( value ) );
+            }
+            const auto returned = values.size();
+            values = ProjectFields( std::move( values ), params );
+            const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, rawOffset, hasMore );
+            return Success( id, { { "jobs", std::move( values ) } }, trace, PageJson( page, returned, cursor, BudgetPartial() ) );
+        }
         const bool directed = method == "job.get" || method == "job.dependencies";
-        auto jobs = directed ? source->GetDirectedJobs( parseJobRef(), method == "job.dependencies", checkDirectedJobRead ) : source->GetJobs();
+        const bool indexedGfxStatistics = method == "job.gfx.statistics" && source->HasJobIdentityIndex();
+        const bool indexedJobStatistics = ( method == "job.statistics" || method == "job.critical_path" || method == "job.gfx_chain" ) && source->HasJobIdentityIndex();
+        std::vector<analysis::JobDto> jobs;
+        if( !indexedGfxStatistics && !indexedJobStatistics )
+            jobs = directed ? source->GetDirectedJobs( parseJobRef(), method == "job.dependencies", checkDirectedJobRead ) : source->GetJobs();
         const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
 
         if( method == "job.statistics" )
         {
-            std::vector<int64_t> scheduleToReady;
-            std::vector<int64_t> readyToQueue;
-            std::vector<int64_t> queueToFirstRun;
-            std::vector<int64_t> dependencyReady;
-            std::vector<int64_t> execution;
-            std::vector<int64_t> wait;
+            const auto jobCount = indexedJobStatistics ? source->GetJobCount() : jobs.size();
+            const auto visitJobs = [&]( const auto& visitor ) {
+                for( size_t offset = 0; offset < jobCount; offset++ )
+                {
+                    checkDirectedJobRead();
+                    if( indexedJobStatistics )
+                    {
+                        const auto allowed = BudgetScanAllowance( 1 );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Job statistics scan budget exhausted", true );
+                        auto page = source->ScanJobs( offset, 1 );
+                        checkDirectedJobRead();
+                        if( page.size() != 1 ) throw QueryError( "INDEX_NOT_READY", "Job statistics row missing from index" );
+                        BudgetScanned( page.size(), 1, allowed );
+                        visitor( page.front() );
+                    }
+                    else visitor( jobs[offset] );
+                }
+            };
+            std::array<std::vector<int64_t>, 6> latencyValues;
+            std::array<std::unique_ptr<QuerySpillStatistics>, 6> latencySpills;
+            if( indexedJobStatistics )
+            {
+                std::shared_ptr<QueryResourceContext> resources;
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                    resources = owner->GetQueryResourceContext();
+                const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                    std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                for( auto& spill : latencySpills )
+                    spill = std::make_unique<QuerySpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkDirectedJobRead );
+            }
+            const auto appendLatency = [&]( size_t metric, int64_t value ) {
+                if( latencySpills[metric] ) latencySpills[metric]->Append( value );
+                else latencyValues[metric].push_back( value );
+            };
+            const auto latencyStatistics = [&]( size_t metric ) {
+                return latencySpills[metric] ? latencySpills[metric]->Finish() : analysis::ComputeStatistics( latencyValues[metric] );
+            };
             std::map<uint32_t, uint64_t> laneDispatches;
             std::map<uint32_t, uint64_t> laneStealsAsThief;
             std::map<uint32_t, uint64_t> laneStealsAsVictim;
@@ -9997,50 +12011,50 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 json sameSlotJobs = json::array();
                 if( job.packedHandle != 0 )
                 {
-                    for( const auto& candidate : jobs )
+                    struct SlotCandidate
                     {
-                        if( candidate.jobId == job.jobId || candidate.packedHandle != job.packedHandle ) continue;
-                        sameHandleJobs.push_back( {
-                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
-                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
-                            { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
-                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
-                        } );
-                        if( sameHandleJobs.size() >= 8 ) break;
-                    }
-
-                    std::vector<const analysis::JobDto*> slotCandidates;
+                        uint64_t distance;
+                        uint64_t jobId;
+                        json value;
+                    };
+                    std::vector<SlotCandidate> slotCandidates;
                     const auto slotIndex = uint32_t( job.packedHandle );
-                    for( const auto& candidate : jobs )
-                    {
-                        if( candidate.jobId == job.jobId || uint32_t( candidate.packedHandle ) != slotIndex ) continue;
-                        slotCandidates.push_back( &candidate );
-                    }
-                    std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto* lhs, const auto* rhs ) {
-                        const auto lhsDelta = lhs->jobId > job.jobId ? lhs->jobId - job.jobId : job.jobId - lhs->jobId;
-                        const auto rhsDelta = rhs->jobId > job.jobId ? rhs->jobId - job.jobId : job.jobId - rhs->jobId;
-                        return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs->jobId < rhs->jobId;
-                    } );
-                    for( const auto* candidate : slotCandidates )
-                    {
+                    visitJobs( [&]( const analysis::JobDto& candidate ) {
+                        if( candidate.jobId == job.jobId ) return;
+                        if( candidate.packedHandle == job.packedHandle && sameHandleJobs.size() < 8 )
+                            sameHandleJobs.push_back( {
+                                { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                                { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
+                                { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
+                                { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                            } );
+                        if( uint32_t( candidate.packedHandle ) != slotIndex ) return;
+                        const auto distance = candidate.jobId > job.jobId ? candidate.jobId - job.jobId : job.jobId - candidate.jobId;
+                        const auto position = std::lower_bound( slotCandidates.begin(), slotCandidates.end(),
+                            std::make_pair( distance, candidate.jobId ), []( const auto& entry, const auto& key ) {
+                                return std::make_pair( entry.distance, entry.jobId ) < key;
+                            } );
+                        if( position == slotCandidates.end() && slotCandidates.size() == 8 ) return;
                         uint32_t readyCount = 0;
                         uint32_t queueCount = 0;
-                        for( const auto& candidateStage : candidate->stages )
+                        for( const auto& candidateStage : candidate.stages )
                         {
                             readyCount += candidateStage.stage == uint8_t( JnJobStage::Ready );
                             queueCount += candidateStage.stage == uint8_t( JnJobStage::QueueEnter );
                         }
-                        sameSlotJobs.push_back( {
-                            { "job_ref", candidate->ref }, { "job_id", Decimal( candidate->jobId ) },
-                            { "packed_handle", Decimal( candidate->packedHandle ) },
-                            { "generation", uint32_t( candidate->packedHandle >> 32 ) },
-                            { "schedule_ns", Decimal( candidate->scheduleNs ) },
-                            { "capture_boundary", candidate->captureBoundary }, { "orphan", candidate->orphan },
+                        json value = {
+                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                            { "packed_handle", Decimal( candidate.packedHandle ) },
+                            { "generation", uint32_t( candidate.packedHandle >> 32 ) },
+                            { "schedule_ns", Decimal( candidate.scheduleNs ) },
+                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
                             { "ready_count", readyCount }, { "queue_enter_count", queueCount },
-                            { "dispatch_count", candidate->dispatchCount }, { "stage_count", candidate->stages.size() }
-                        } );
-                        if( sameSlotJobs.size() >= 8 ) break;
-                    }
+                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                        };
+                        slotCandidates.insert( position, { distance, candidate.jobId, std::move( value ) } );
+                        if( slotCandidates.size() > 8 ) slotCandidates.pop_back();
+                    } );
+                    for( auto& candidate : slotCandidates ) sameSlotJobs.push_back( std::move( candidate.value ) );
                 }
                 examples.push_back( {
                     { "job_ref", job.ref }, { "job_id", Decimal( job.jobId ) }, { "name", job.name },
@@ -10063,7 +12077,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "delta_ns", Decimal( end - begin ) }
                 } );
             };
-            for( const auto& job : jobs )
+            visitJobs( [&]( const analysis::JobDto& job )
             {
                 checkCancelled();
                 const bool captureBoundary = job.orphan || job.truncated;
@@ -10098,8 +12112,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 waitEnds += job.waitEndCount;
                 continuations += job.continuationCount;
                 jobsWithoutWaiter += job.waitEndCount == 0 && job.continuationCount == 0;
-                if( job.waitNs > 0 ) { waitJobs++; wait.push_back( job.waitNs ); }
-                if( job.executionNs > 0 ) execution.push_back( job.executionNs );
+                if( job.waitNs > 0 ) { waitJobs++; appendLatency( 5, job.waitNs ); }
+                if( job.executionNs > 0 ) appendLatency( 4, job.executionNs );
                 if( job.jobSchemaVersion >= 2 )
                 {
                     v2++;
@@ -10143,22 +12157,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !captureBoundary && job.readyNs )
                 {
                     const auto value = *job.readyNs - job.scheduleNs;
-                    if( value >= 0 ) scheduleToReady.push_back( value );
+                    if( value >= 0 ) appendLatency( 0, value );
                     else { invalidOrder++; invalidScheduleToReady++; recordInvalidOrder( job, "schedule_to_ready", job.scheduleNs, *job.readyNs ); }
                 }
                 if( !captureBoundary && job.readyNs && job.queueEnterNs )
                 {
                     const auto value = *job.queueEnterNs - *job.readyNs;
-                    if( value >= 0 ) readyToQueue.push_back( value );
+                    if( value >= 0 ) appendLatency( 1, value );
                     else { invalidOrder++; invalidReadyToQueue++; recordInvalidOrder( job, "ready_to_queue", *job.readyNs, *job.queueEnterNs ); }
                 }
                 if( !captureBoundary && job.queueEnterNs && job.firstRunNs )
                 {
                     const auto value = *job.firstRunNs - *job.queueEnterNs;
-                    if( value >= 0 ) queueToFirstRun.push_back( value );
+                    if( value >= 0 ) appendLatency( 2, value );
                     else { invalidOrder++; invalidQueueToFirstRun++; recordInvalidOrder( job, "queue_to_first_run", *job.queueEnterNs, *job.firstRunNs ); }
                 }
-                if( !captureBoundary && job.dependencyReadyLatencyNs ) dependencyReady.push_back( *job.dependencyReadyLatencyNs );
+                if( !captureBoundary && job.dependencyReadyLatencyNs ) appendLatency( 3, *job.dependencyReadyLatencyNs );
                 for( const auto& stage : job.stages )
                 {
                     if( stage.stage == uint8_t( JnJobStage::Dispatch ) ) laneDispatches[stage.arg0]++;
@@ -10168,7 +12182,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         laneStealsAsVictim[stage.arg1]++;
                     }
                 }
-            }
+            } );
             json lanes = json::array();
             std::set<uint32_t> laneIds;
             for( const auto& [lane, count] : laneDispatches ) laneIds.insert( lane );
@@ -10180,10 +12194,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "steals_as_victim", Decimal( laneStealsAsVictim[lane] ) }
             } );
             return Success( id, {
-                { "present", !jobs.empty() }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
+                { "present", jobCount != 0 }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
                 { "source_mode", v3 != 0 ? "native-hooks-job-v3" : v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
                 { "counts", {
-                    { "jobs", Decimal( jobs.size() ) }, { "completed", Decimal( completed ) },
+                    { "jobs", Decimal( jobCount ) }, { "completed", Decimal( completed ) },
                     { "managed", Decimal( managed ) }, { "burst", Decimal( burst ) },
                     { "v2", Decimal( v2 ) }, { "v2_or_newer", Decimal( v2 ) }, { "v3", Decimal( v3 ) },
                     { "scheduler_steals", Decimal( schedulerSteals ) },
@@ -10193,12 +12207,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "jobs_without_waiter", Decimal( jobsWithoutWaiter ) }
                 } },
                 { "latency", {
-                    { "schedule_to_ready", StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
-                    { "ready_to_queue", StatisticsJson( analysis::ComputeStatistics( readyToQueue ) ) },
-                    { "queue_to_first_run", StatisticsJson( analysis::ComputeStatistics( queueToFirstRun ) ) },
-                    { "dependency_complete_to_ready", StatisticsJson( analysis::ComputeStatistics( dependencyReady ) ) },
-                    { "execution", StatisticsJson( analysis::ComputeStatistics( execution ) ) },
-                    { "wait", StatisticsJson( analysis::ComputeStatistics( wait ) ) }
+                    { "schedule_to_ready", StatisticsJson( latencyStatistics( 0 ) ) },
+                    { "ready_to_queue", StatisticsJson( latencyStatistics( 1 ) ) },
+                    { "queue_to_first_run", StatisticsJson( latencyStatistics( 2 ) ) },
+                    { "dependency_complete_to_ready", StatisticsJson( latencyStatistics( 3 ) ) },
+                    { "execution", StatisticsJson( latencyStatistics( 4 ) ) },
+                    { "wait", StatisticsJson( latencyStatistics( 5 ) ) }
                 } },
                 { "lanes", std::move( lanes ) },
                 { "quality", {
@@ -10276,41 +12290,78 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "job.critical_path" )
         {
-            if( jobs.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
-            std::unordered_map<uint64_t, size_t> indexById;
-            indexById.reserve( jobs.size() );
-            for( size_t index = 0; index < jobs.size(); index++ ) indexById.emplace( jobs[index].jobId, index );
-            std::vector<std::vector<size_t>> outgoing( jobs.size() );
-            std::vector<size_t> indegree( jobs.size(), 0 );
-            for( size_t index = 0; index < jobs.size(); index++ )
+            struct CriticalJob
             {
-                for( const auto& dependency : jobs[index].dependencies )
+                uint64_t id = 0;
+                int64_t executionNs = 0;
+                std::vector<uint64_t> prerequisites;
+            };
+            std::vector<CriticalJob> graph;
+            std::unordered_map<uint64_t, size_t> indexById;
+            const auto jobCount = indexedJobStatistics ? source->GetJobCount() : jobs.size();
+            constexpr size_t maximumCriticalNodes = 1000000;
+            constexpr size_t maximumCriticalEdges = 4000000;
+            const auto visitCriticalJobs = [&]( const auto& visitor ) {
+                for( size_t offset = 0; offset < jobCount; offset++ )
                 {
-                    const auto prerequisite = indexById.find( dependency.prerequisiteJobId );
+                    checkDirectedJobRead();
+                    analysis::JobDto value;
+                    if( indexedJobStatistics )
+                    {
+                        const auto allowed = BudgetScanAllowance( 1 );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "critical path scan budget exhausted", true );
+                        auto page = source->ScanJobs( offset, 1 );
+                        if( page.size() != 1 ) throw QueryError( "INDEX_NOT_READY", "critical path row missing from index" );
+                        BudgetScanned( page.size(), 1, allowed );
+                        value = std::move( page.front() );
+                    }
+                    else value = jobs[offset];
+                    visitor( std::move( value ) );
+                }
+            };
+            visitCriticalJobs( [&]( analysis::JobDto job ) {
+                checkDirectedJobRead();
+                if( graph.size() >= maximumCriticalNodes ) throw QueryError( "RESOURCE_LIMIT", "critical path node budget exhausted", true );
+                if( job.dependencies.size() > maximumCriticalEdges - std::min( maximumCriticalEdges, size_t( std::accumulate( graph.begin(), graph.end(), size_t( 0 ),
+                    []( size_t total, const CriticalJob& current ) { return total + current.prerequisites.size(); } ) ) ) )
+                    throw QueryError( "RESOURCE_LIMIT", "critical path edge budget exhausted", true );
+                CriticalJob compact;
+                compact.id = job.jobId;
+                compact.executionNs = job.executionNs;
+                compact.prerequisites.reserve( job.dependencies.size() );
+                for( const auto& dependency : job.dependencies ) compact.prerequisites.push_back( dependency.prerequisiteJobId );
+                indexById.emplace( compact.id, graph.size() );
+                graph.push_back( std::move( compact ) );
+            } );
+            if( graph.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
+            std::vector<std::vector<size_t>> outgoing( graph.size() );
+            std::vector<size_t> indegree( graph.size(), 0 );
+            size_t edgeCount = 0;
+            for( size_t index = 0; index < graph.size(); index++ )
+            {
+                for( const auto prerequisiteId : graph[index].prerequisites )
+                {
+                    checkDirectedJobRead();
+                    const auto prerequisite = indexById.find( prerequisiteId );
                     if( prerequisite == indexById.end() ) continue;
+                    if( ++edgeCount > maximumCriticalEdges ) throw QueryError( "RESOURCE_LIMIT", "critical path edge budget exhausted", true );
                     outgoing[prerequisite->second].push_back( index );
                     indegree[index]++;
                 }
             }
             std::queue<size_t> ready;
             for( size_t index = 0; index < indegree.size(); index++ ) if( indegree[index] == 0 ) ready.push( index );
-            std::vector<int64_t> cost( jobs.size(), 0 );
-            std::vector<std::optional<size_t>> parent( jobs.size() );
+            std::vector<int64_t> cost( graph.size(), 0 );
+            std::vector<std::optional<size_t>> parent( graph.size() );
             size_t processed = 0;
             while( !ready.empty() )
             {
                 checkCancelled();
-                const auto current = ready.front();
-                ready.pop();
-                processed++;
-                cost[current] += std::max<int64_t>( jobs[current].executionNs, 0 );
+                const auto current = ready.front(); ready.pop(); processed++;
+                cost[current] += std::max<int64_t>( graph[current].executionNs, 0 );
                 for( const auto next : outgoing[current] )
                 {
-                    if( cost[next] < cost[current] )
-                    {
-                        cost[next] = cost[current];
-                        parent[next] = current;
-                    }
+                    if( cost[next] < cost[current] ) { cost[next] = cost[current]; parent[next] = current; }
                     if( --indegree[next] == 0 ) ready.push( next );
                 }
             }
@@ -10322,84 +12373,152 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( found == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
                 endIndex = found->second;
             }
-            else
-            {
-                endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
-            }
+            else endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
             std::vector<size_t> path;
             for( std::optional<size_t> current = endIndex; current; current = parent[*current] ) path.push_back( *current );
             std::reverse( path.begin(), path.end() );
             json values = json::array();
-            for( const auto index : path ) values.push_back( JobJson( *source, jobs[index], false ) );
-            return Success( id, {
-                { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
-                { "has_cycle", processed != jobs.size() }, { "processed_jobs", processed }, { "total_jobs", jobs.size() }
-            }, trace );
+            for( const auto index : path )
+            {
+                const auto find = indexById.find( graph[index].id );
+                if( find == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "critical path Job disappeared" );
+                const auto detail = indexedJobStatistics ? source->ScanJobs( find->second, 1 ) : std::vector<analysis::JobDto>{ jobs[find->second] };
+                if( detail.size() != 1 ) throw QueryError( "ENTITY_NOT_FOUND", "critical path Job detail missing" );
+                values.push_back( JobJson( *source, detail.front(), false ) );
+            }
+            return Success( id, { { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
+                { "has_cycle", processed != graph.size() }, { "processed_jobs", processed }, { "total_jobs", graph.size() } }, trace );
         }
+
 
         if( method == "job.gfx.statistics" )
         {
-            const auto dispatches = source->GetGfxDispatches();
-            const auto entities = source->GetGfxEntities();
-            const auto links = source->GetGfxLinks();
-            std::set<uint64_t> dispatchIds;
-            std::set<uint64_t> entityIds;
+            const auto dispatches = indexedGfxStatistics ? std::vector<analysis::GfxDispatchDto>{} : source->GetGfxDispatches();
+            const auto entities = indexedGfxStatistics ? std::vector<analysis::GfxEntityDto>{} : source->GetGfxEntities();
+            const auto links = indexedGfxStatistics ? std::vector<analysis::GfxLinkDto>{} : source->GetGfxLinks();
+            const auto dispatchCount = indexedGfxStatistics ? source->GetGfxDispatchCount() : dispatches.size();
+            const auto entityCount = indexedGfxStatistics ? source->GetGfxEntityCount() : entities.size();
+            const auto linkCount = indexedGfxStatistics ? source->GetGfxLinkCount() : links.size();
+            const auto visitRows = [&]( uint64_t count, const auto& values, const auto& read, const auto& visitor ) {
+                if( !indexedGfxStatistics )
+                {
+                    for( const auto& value : values ) { checkDirectedJobRead(); visitor( value ); }
+                    return;
+                }
+                for( uint64_t offset = 0; offset < count; )
+                {
+                    checkDirectedJobRead();
+                    const auto requested = size_t( std::min<uint64_t>( 256, count - offset ) );
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Gfx statistics scan budget exhausted; no complete result was published", true );
+                    const auto page = read( size_t( offset ), allowed );
+                    checkDirectedJobRead();
+                    if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY", "Gfx statistics page does not match its index count" );
+                    BudgetScanned( page.size(), requested, allowed );
+                    for( const auto& value : page ) { checkDirectedJobRead(); visitor( value ); }
+                    offset += page.size();
+                }
+            };
+            const auto visitDispatches = [&]( const auto& visitor ) {
+                visitRows( dispatchCount, dispatches, [&]( size_t offset, size_t count ) { return source->ScanGfxDispatches( offset, count ); }, visitor );
+            };
+            const auto visitEntities = [&]( const auto& visitor ) {
+                visitRows( entityCount, entities, [&]( size_t offset, size_t count ) { return source->ScanGfxEntities( offset, count ); }, visitor );
+            };
+            const auto visitLinks = [&]( const auto& visitor ) {
+                visitRows( linkCount, links, [&]( size_t offset, size_t count ) { return source->ScanGfxLinks( offset, count ); }, visitor );
+            };
+            std::set<uint64_t> workerDispatchIds;
+            std::set<uint64_t> workerEntityIds;
+            std::unique_ptr<QuerySpillUInt64Set> indexedDispatchIds;
+            std::unique_ptr<QuerySpillUInt64Set> indexedEntityIds;
+            if( indexedGfxStatistics )
+            {
+                std::shared_ptr<QueryResourceContext> resources;
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                    resources = owner->GetQueryResourceContext();
+                const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                    std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                indexedDispatchIds = std::make_unique<QuerySpillUInt64Set>( temporaryRoot,
+                    resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                    checkDirectedJobRead );
+                indexedEntityIds = std::make_unique<QuerySpillUInt64Set>( temporaryRoot,
+                    resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                    checkDirectedJobRead );
+            }
             std::map<uint64_t, std::string> jobRefs;
             json entitiesByKind = json::object();
             json linksByRelation = json::object();
             json sampleDispatchRef = nullptr;
             json sampleEntityRef = nullptr;
             json sampleLinkedJobRef = nullptr;
-            for( const auto& dispatch : dispatches )
+            visitDispatches( [&]( const analysis::GfxDispatchDto& dispatch )
             {
-                dispatchIds.emplace( dispatch.dispatchId );
+                if( indexedDispatchIds ) indexedDispatchIds->Append( dispatch.dispatchId );
+                else workerDispatchIds.emplace( dispatch.dispatchId );
                 if( sampleDispatchRef.is_null() ) sampleDispatchRef = dispatch.ref;
-            }
-            for( const auto& entity : entities )
+            } );
+            visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
-                entityIds.emplace( entity.entityId );
+                if( indexedEntityIds ) indexedEntityIds->Append( entity.entityId );
+                else workerEntityIds.emplace( entity.entityId );
                 const auto name = GfxEntityKindName( entity.kind );
                 entitiesByKind[name] = Decimal( entitiesByKind.contains( name ) ? std::stoull( entitiesByKind[name].get<std::string>() ) + 1 : 1 );
                 if( sampleEntityRef.is_null() ) sampleEntityRef = entity.ref;
-            }
+            } );
+            if( indexedDispatchIds ) indexedDispatchIds->Finish();
+            if( indexedEntityIds ) indexedEntityIds->Finish();
+            const auto hasDispatch = [&]( uint64_t value ) {
+                return indexedDispatchIds ? indexedDispatchIds->Contains( value ) : workerDispatchIds.contains( value );
+            };
+            const auto hasEntity = [&]( uint64_t value ) {
+                return indexedEntityIds ? indexedEntityIds->Contains( value ) : workerEntityIds.contains( value );
+            };
             for( const auto& job : jobs ) jobRefs.emplace( job.jobId, job.ref );
+            const auto jobCount = indexedGfxStatistics ? source->GetJobCount() : jobs.size();
+            const auto findJobRef = [&]( uint64_t jobId ) -> std::optional<std::string> {
+                if( indexedGfxStatistics ) return source->FindJobRef( jobId, checkDirectedJobRead );
+                const auto found = jobRefs.find( jobId );
+                return found == jobRefs.end() ? std::nullopt : std::optional<std::string>( found->second );
+            };
 
             uint64_t danglingParents = 0;
-            for( const auto& entity : entities )
+            visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
-                if( entity.parentId != 0 && !dispatchIds.contains( entity.parentId ) && !entityIds.contains( entity.parentId ) ) danglingParents++;
-            }
+                if( entity.parentId != 0 && !hasDispatch( entity.parentId ) && !hasEntity( entity.parentId ) ) danglingParents++;
+            } );
             uint64_t danglingSources = 0;
             uint64_t danglingTargets = 0;
             uint64_t capturedExecuteLinks = 0;
             uint64_t uncapturedExecuteLinks = 0;
-            for( const auto& link : links )
+            visitLinks( [&]( const analysis::GfxLinkDto& link )
             {
                 const auto relationName = GfxRelationName( link.relation );
                 linksByRelation[relationName] = Decimal( linksByRelation.contains( relationName ) ? std::stoull( linksByRelation[relationName].get<std::string>() ) + 1 : 1 );
-                const bool sourceKnown = dispatchIds.contains( link.sourceId ) || entityIds.contains( link.sourceId ) || jobRefs.contains( link.sourceId );
-                const bool targetKnown = dispatchIds.contains( link.targetId ) || entityIds.contains( link.targetId ) || jobRefs.contains( link.targetId );
+                checkDirectedJobRead();
+                const auto sourceJob = findJobRef( link.sourceId );
+                const auto targetJob = findJobRef( link.targetId );
+                const bool sourceKnown = hasDispatch( link.sourceId ) || hasEntity( link.sourceId ) || sourceJob.has_value();
+                const bool targetKnown = hasDispatch( link.targetId ) || hasEntity( link.targetId ) || targetJob.has_value();
                 if( !sourceKnown ) danglingSources++;
                 if( !targetKnown && link.relation != 5 ) danglingTargets++;
                 if( link.relation == 2 )
                 {
-                    const auto sourceJob = jobRefs.find( link.sourceId );
-                    const auto targetJob = jobRefs.find( link.targetId );
-                    if( sourceJob != jobRefs.end() || targetJob != jobRefs.end() )
+                    if( sourceJob || targetJob )
                     {
                         capturedExecuteLinks++;
-                        if( sampleLinkedJobRef.is_null() ) sampleLinkedJobRef = sourceJob != jobRefs.end() ? sourceJob->second : targetJob->second;
+                        if( sampleLinkedJobRef.is_null() ) sampleLinkedJobRef = sourceJob ? *sourceJob : *targetJob;
                     }
                     else
                     {
                         uncapturedExecuteLinks++;
                     }
                 }
-            }
+            } );
             return Success( id, {
                 { "counts", {
-                    { "dispatches", Decimal( dispatches.size() ) }, { "entities", Decimal( entities.size() ) },
-                    { "links", Decimal( links.size() ) }, { "jobs", Decimal( jobs.size() ) }
+                    { "dispatches", Decimal( dispatchCount ) }, { "entities", Decimal( entityCount ) },
+                    { "links", Decimal( linkCount ) }, { "jobs", Decimal( jobCount ) }
                 } },
                 { "entities_by_kind", std::move( entitiesByKind ) },
                 { "links_by_relation", std::move( linksByRelation ) },
@@ -10427,6 +12546,71 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( parsed ) { rootId = *parsed; break; }
         }
         if( rootId == 0 ) throw QueryError( "INVALID_PARAMS", "ref must identify a Job, GfxDispatch, or GfxEntity in this trace" );
+        if( source->HasJobIdentityIndex() )
+        {
+            const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+            std::shared_ptr<QueryResourceContext> resources;
+            if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                resources = owner->GetQueryResourceContext();
+            const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                std::filesystem::temp_directory_path() / "tracy-query-statistics";
+            QuerySpillUInt64Graph adjacency( temporaryRoot,
+                resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                checkDirectedJobRead );
+            size_t edgeCount = 0;
+            const auto addEdge = [&]( uint64_t lhs, uint64_t rhs ) {
+                if( ++edgeCount > 4000000 ) throw QueryError( "RESOURCE_LIMIT", "Gfx chain edge budget exhausted", true );
+                adjacency.AppendUndirected( lhs, rhs );
+            };
+            const auto visitRows = [&]( uint64_t total, const auto& read, const auto& visitor ) {
+                for( uint64_t offset = 0; offset < total; )
+                {
+                    checkDirectedJobRead();
+                    const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Gfx chain scan budget exhausted", true );
+                    const auto page = read( size_t( offset ), allowed );
+                    if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY", "Gfx chain page is incomplete" );
+                    BudgetScanned( page.size(), requested, allowed );
+                    for( const auto& row : page ) { checkDirectedJobRead(); visitor( row ); }
+                    offset += page.size();
+                }
+            };
+            visitRows( source->GetGfxLinkCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                [&]( const auto& link ) { addEdge( link.sourceId, link.targetId ); } );
+            visitRows( source->GetGfxEntityCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                [&]( const auto& entity ) { if( entity.parentId != 0 ) addEdge( entity.entityId, entity.parentId ); } );
+            adjacency.Finish();
+            std::set<uint64_t> visited;
+            std::queue<uint64_t> frontier;
+            visited.emplace( rootId ); frontier.push( rootId ); BudgetConsumeNode();
+            bool truncated = false;
+            while( !frontier.empty() )
+            {
+                checkDirectedJobRead();
+                const auto current = frontier.front(); frontier.pop();
+                adjacency.VisitNeighbors( current, [&]( uint64_t next ) {
+                    if( visited.contains( next ) ) return true;
+                    if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; return false; }
+                    visited.emplace( next ); frontier.push( next );
+                    return true;
+                } );
+                if( truncated ) break;
+            }
+            json dispatchJson = json::array(), entityJson = json::array(), linkJson = json::array(), jobJson = json::array();
+            visitRows( source->GetGfxDispatchCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxDispatches( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.dispatchId ) ) dispatchJson.push_back( GfxDispatchJson( row ) ); } );
+            visitRows( source->GetGfxEntityCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.entityId ) ) entityJson.push_back( GfxEntityJson( row ) ); } );
+            visitRows( source->GetGfxLinkCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.sourceId ) && visited.contains( row.targetId ) ) linkJson.push_back( GfxLinkJson( row ) ); } );
+            const auto jobCount = source->GetJobCount();
+            visitRows( jobCount, [&]( size_t offset, size_t limit ) { return source->ScanJobs( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.jobId ) ) jobJson.push_back( JobJson( *source, row, false ) ); } );
+            return Success( id, { { "root_ref", rootRef }, { "jobs", std::move( jobJson ) },
+                { "dispatches", std::move( dispatchJson ) }, { "entities", std::move( entityJson ) },
+                { "links", std::move( linkJson ) }, { "visited_nodes", visited.size() }, { "truncated", truncated } }, trace );
+        }
         const auto dispatches = source->GetGfxDispatches();
         const auto entities = source->GetGfxEntities();
         const auto links = source->GetGfxLinks();
@@ -10509,10 +12693,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const std::string kind = params.value( "kind", "" );
         std::optional<uint32_t> callstack;
         if( params.contains( "callstack" ) ) callstack = parseCallstack( params["callstack"] );
+        const auto time = ScanRangeFrom( params, 0, 1 );
         auto scanPage = ScanFiltered<analysis::SampleDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanSampleEvents( range ); },
+            []( const auto& item, const auto& range ) { return item.ScanSampleEventsRaw( range ); },
             [&]( const auto& sample ) {
-                return ( threadRef.empty() || sample.threadRef == threadRef ) &&
+                return sample.timeNs >= time.startNs && sample.timeNs < time.endNs &&
+                    ( threadRef.empty() || sample.threadRef == threadRef ) &&
                     ( kind.empty() || sample.kind == kind ) && ( !callstack || sample.callstack == *callstack );
             }, SampleJson );
         const auto returned = scanPage.values.size();
@@ -10521,11 +12707,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "sample.ghost_zones" )
     {
+        if( !source->SampleDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "sample ghost-zone index has not been built" );
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
+        const auto time = ScanRangeFrom( params, 0, 1 );
         auto scanPage = ScanFiltered<analysis::GhostZoneDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanGhostZones( range ); },
-            [&]( const auto& zone ) { return ( threadRef.empty() || zone.threadRef == threadRef ) && TextMatches( zone.name + " " + zone.file, params ); }, GhostZoneJson );
+            []( const auto& item, const auto& range ) { return item.ScanGhostZonesRaw( range ); },
+            [&]( const auto& zone ) { return zone.startNs < time.endNs && zone.endNs > time.startNs &&
+                ( threadRef.empty() || zone.threadRef == threadRef ) &&
+                TextMatches( zone.name + " " + zone.file, params ); }, GhostZoneJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "ready", true }, { "ghost_zones", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
@@ -10547,9 +12738,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             checkCancelled();
             const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
             auto range = ScanRangeFrom( params, offset, allowed );
-            const auto samples = source->ScanSampleEvents( range );
+            const auto samples = source->ScanSampleEventsRaw( range );
             BudgetScanned( samples.size(), chunk, allowed );
-            for( const auto& sample : samples ) if( sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
+            for( const auto& sample : samples ) if( sample.timeNs >= range.startNs && sample.timeNs < range.endNs &&
+                sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
             {
                 if( !counts.contains( sample.callstack ) && !BudgetConsumeGroup() ) continue;
                 counts[sample.callstack]++;
@@ -10575,6 +12767,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "sample.symbol_statistics" || method == "symbol.search" || method == "symbol.get" || method == "symbol.address" || method == "symbol.address_map" )
     {
+        if( method == "sample.symbol_statistics" && !source->SampleDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "sample symbol-statistics index has not been built" );
         if( method == "symbol.address_map" )
         {
             const auto page = ParsePage( params, method, trace );
@@ -11130,6 +13324,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
             struct MetricGroup
             {
+                uint64_t ordinal = 0;
                 std::string key;
                 std::string name;
                 std::string matchKind;
@@ -11138,6 +13333,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 std::vector<int64_t> running;
                 std::vector<int64_t> latency;
                 std::vector<int64_t> wait;
+                std::array<analysis::Statistics, 5> spilled;
+                uint8_t spilledMask = 0;
             };
             using MetricMap = std::map<std::string, MetricGroup>;
             const auto buildCatalogMaps = []( const json& catalog ) {
@@ -11169,6 +13366,39 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto collectCpu = [&]( const analysis::TraceSource& item, analysis::ScanRange selectedRange,
                 const std::map<std::string, std::string>& sourceKeys ) {
                 MetricMap groups;
+                const bool indexed = dynamic_cast<const QueryExplicitPassSource*>( &item ) != nullptr;
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                if( indexed )
+                {
+                    std::shared_ptr<QueryResourceContext> resources;
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
+                }
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "CPU compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key; group.name = name; group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
                 size_t offset = 0;
                 constexpr size_t chunk = 4096;
                 while( true )
@@ -11188,17 +13418,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         const auto stable = sourceKeys.find( sourceMatch );
                         const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName + '|' + zone.function;
                         const auto key = stable == sourceKeys.end() ? "fallback:cpu:" + fallback : "stable:" + stable->second;
-                        auto& group = groups[key];
-                        group.key = key;
-                        group.name = displayName;
-                        group.matchKind = stable == sourceKeys.end() ? "legacy_source_fallback" : "catalog_definition_key";
-                        group.inclusive.emplace_back( *zone.endNs - zone.startNs );
-                        if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
-                        if( zone.runningTimeNs ) group.running.emplace_back( *zone.runningTimeNs );
+                        auto& group = metricGroup( key, displayName,
+                            stable == sourceKeys.end() ? "legacy_source_fallback" : "catalog_definition_key" );
+                        appendMetric( group, 0, *zone.endNs - zone.startNs, group.inclusive );
+                        if( zone.selfTimeNs ) appendMetric( group, 1, *zone.selfTimeNs, group.self );
+                        if( zone.runningTimeNs ) appendMetric( group, 2, *zone.runningTimeNs, group.running );
                     }
                     offset += values.size();
                     if( values.size() < allowed ) break;
                 }
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "CPU compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
@@ -11213,8 +13449,126 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         const auto id = DecimalStringValue( definition["taxonomy_id"] );
                         if( id && *id <= std::numeric_limits<uint32_t>::max() ) definitions.emplace( uint32_t( *id ), definition );
                     }
-                auto explicitPasses = BuildExplicitGpuPassSet( item, taxonomy );
-                std::vector<analysis::GpuZoneDto> zones;
+                const auto* indexedPassSource = dynamic_cast<const QueryExplicitPassSource*>( &item );
+                auto explicitPasses = indexedPassSource ? ExplicitGpuPassSet{} :
+                    BuildExplicitGpuPassSet( item, taxonomy );
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                std::shared_ptr<QueryResourceContext> resources;
+                if( indexedPassSource )
+                {
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
+                }
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "GPU compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key;
+                        group.name = name;
+                        group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
+                analysis::AnalysisWorkspaceReservation matchedZoneWorkspace(
+                    resources ? resources->Workspace() : nullptr );
+                std::vector<uint8_t> explicitlyMatchedZoneBits;
+                if( indexedPassSource )
+                {
+                    const auto zoneCount = itemInfo.counts.gpuZones;
+                    const auto bytes64 = zoneCount / 8 + ( zoneCount % 8 != 0 );
+                    if( bytes64 > SIZE_MAX )
+                        throw QueryError( "RESOURCE_LIMIT", "GPU compare matched-Zone bitset is too large", true );
+                    const auto bytes = size_t( bytes64 );
+                    matchedZoneWorkspace.Resize( bytes );
+                    explicitlyMatchedZoneBits.assign( bytes, 0 );
+                }
+                std::set<std::string> workerMatchedZoneRefs;
+                const auto collectPass = [&]( const ExplicitGpuPassMatch& pass )
+                {
+                    if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) return;
+                    if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) return;
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = item.ParseEntityRef( pass.zone->ref, "gpu-zone" );
+                        if( !ordinal || *ordinal >= itemInfo.counts.gpuZones )
+                            throw QueryError( "INDEX_NOT_READY", "GPU compare Explicit Pass references an invalid GPU Zone" );
+                        explicitlyMatchedZoneBits[size_t( *ordinal / 8 )] |= uint8_t( 1u << ( *ordinal & 7 ) );
+                    }
+                    else workerMatchedZoneRefs.emplace( pass.zone->ref );
+                    const auto definition = definitions.find( pass.taxonomyId );
+                    const bool stable = pass.taxonomyStableId && definition != definitions.end();
+                    const auto displayName = stable ? definition->second.value( "canonical_name", pass.zone->name ) :
+                        ( pass.zone->name.empty() ? pass.zone->function : pass.zone->name );
+                    const auto fallback = NormalizeSourceKey( pass.zone->file ) + ':' + std::to_string( pass.zone->line ) + '|' + displayName;
+                    const auto key = stable ? "stable:gpu-taxonomy:" + std::to_string( pass.taxonomyId ) : "fallback:gpu:" + fallback;
+                    auto& group = metricGroup( key, displayName,
+                        stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback" );
+                    appendMetric( group, 0, *pass.zone->gpuEndNs - pass.zone->gpuStartNs, group.inclusive );
+                    if( pass.zone->selfTimeNs ) appendMetric( group, 1, *pass.zone->selfTimeNs, group.self );
+                };
+                if( indexedPassSource )
+                {
+                    QueryCorrelationReadControl passControl;
+                    passControl.check = checkCancelled;
+                    passControl.allowance = [&]( size_t requested ) {
+                        const auto allowed = BudgetScanAllowance( requested );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                            "GPU compare Explicit Pass scan budget exhausted", true );
+                        return allowed;
+                    };
+                    passControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                        BudgetScanned( actual, requested, allowed );
+                    };
+                    const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+                    for( uint64_t passOffset = 0; passOffset < totalPasses; )
+                    {
+                        const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                            size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), passControl );
+                        if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                            "GPU compare Explicit Pass page is incomplete" );
+                        for( const auto& value : page )
+                            collectPass( IndexedExplicitGpuPassMatch( value ) );
+                        passOffset += page.size();
+                    }
+                }
+
+                const auto collectZone = [&]( const analysis::GpuZoneDto& zone )
+                {
+                    bool matched = false;
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = item.ParseEntityRef( zone.ref, "gpu-zone" );
+                        if( !ordinal || *ordinal >= itemInfo.counts.gpuZones )
+                            throw QueryError( "INDEX_NOT_READY", "GPU compare scanned an invalid GPU Zone identity" );
+                        matched = ( explicitlyMatchedZoneBits[size_t( *ordinal / 8 )] & uint8_t( 1u << ( *ordinal & 7 ) ) ) != 0;
+                    }
+                    else matched = workerMatchedZoneRefs.contains( zone.ref );
+                    if( matched || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) return;
+                    const auto displayName = zone.name.empty() ? zone.function : zone.name;
+                    const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName;
+                    const auto key = "fallback:gpu:" + fallback;
+                    auto& group = metricGroup( key, displayName, "legacy_source_fallback" );
+                    appendMetric( group, 0, *zone.gpuEndNs - zone.gpuStartNs, group.inclusive );
+                    if( zone.selfTimeNs ) appendMetric( group, 1, *zone.selfTimeNs, group.self );
+                };
+                std::vector<analysis::GpuZoneDto> workerZones;
                 size_t offset = 0;
                 constexpr size_t chunk = 4096;
                 while( true )
@@ -11228,67 +13582,114 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     BudgetScanned( values.size(), chunk, allowed );
                     for( const auto& value : values )
                     {
-                        MatchExplicitGpuPassZone( item, explicitPasses, value );
-                        zones.emplace_back( value );
+                        if( indexedPassSource ) collectZone( value );
+                        else
+                        {
+                            MatchExplicitGpuPassZone( item, explicitPasses, value );
+                            workerZones.emplace_back( value );
+                        }
                     }
                     offset += values.size();
                     if( values.size() < allowed ) break;
                 }
-                std::set<std::string> explicitlyMatchedZones;
-                for( const auto& pass : explicitPasses.matches )
+                if( !indexedPassSource )
                 {
-                    if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) continue;
-                    if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) continue;
-                    explicitlyMatchedZones.emplace( pass.zone->ref );
-                    const auto definition = definitions.find( pass.taxonomyId );
-                    const bool stable = pass.taxonomyStableId && definition != definitions.end();
-                    const auto displayName = stable ? definition->second.value( "canonical_name", pass.zone->name ) :
-                        ( pass.zone->name.empty() ? pass.zone->function : pass.zone->name );
-                    const auto fallback = NormalizeSourceKey( pass.zone->file ) + ':' + std::to_string( pass.zone->line ) + '|' + displayName;
-                    const auto key = stable ? "stable:gpu-taxonomy:" + std::to_string( pass.taxonomyId ) : "fallback:gpu:" + fallback;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = displayName;
-                    group.matchKind = stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback";
-                    group.inclusive.emplace_back( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
-                    if( pass.zone->selfTimeNs ) group.self.emplace_back( *pass.zone->selfTimeNs );
+                    for( const auto& pass : explicitPasses.matches ) collectPass( pass );
+                    for( const auto& zone : workerZones ) collectZone( zone );
                 }
-                for( const auto& zone : zones )
-                {
-                    if( explicitlyMatchedZones.contains( zone.ref ) || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) continue;
-                    const auto displayName = zone.name.empty() ? zone.function : zone.name;
-                    const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName;
-                    const auto key = "fallback:gpu:" + fallback;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = displayName;
-                    group.matchKind = "legacy_source_fallback";
-                    group.inclusive.emplace_back( *zone.gpuEndNs - zone.gpuStartNs );
-                    if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
-                }
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "GPU compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
-            const auto collectJobs = []( const analysis::TraceSource& item, const analysis::ScanRange& range,
+            const auto collectJobs = [&]( const analysis::TraceSource& item, const analysis::ScanRange& range,
                 const std::map<std::string, std::string>& jobKeys ) {
                 MetricMap groups;
-                for( const auto& job : item.GetJobs() )
+                const bool indexed = item.HasJobIdentityIndex();
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                if( indexed )
                 {
-                    if( job.scheduleNs < range.startNs || job.scheduleNs >= range.endNs ) continue;
+                    std::shared_ptr<QueryResourceContext> resources;
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
+                }
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "Job compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key; group.name = name; group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
+                const auto collectJob = [&]( const analysis::JobDto& job ) {
+                    if( job.scheduleNs < range.startNs || job.scheduleNs >= range.endNs ) return;
                     const auto stable = jobKeys.find( job.name );
                     const auto key = stable == jobKeys.end() ? "fallback:job:" + job.name : "stable:" + stable->second;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = job.name;
-                    group.matchKind = stable == jobKeys.end() ? "job_name_fallback" : "catalog_definition_key";
-                    group.inclusive.emplace_back( job.executionNs );
-                    group.wait.emplace_back( job.waitNs );
-                    if( job.firstRunNs ) group.latency.emplace_back( *job.firstRunNs - job.scheduleNs );
+                    auto& group = metricGroup( key, job.name,
+                        stable == jobKeys.end() ? "job_name_fallback" : "catalog_definition_key" );
+                    appendMetric( group, 0, job.executionNs, group.inclusive );
+                    appendMetric( group, 4, job.waitNs, group.wait );
+                    if( job.firstRunNs ) appendMetric( group, 3, *job.firstRunNs - job.scheduleNs, group.latency );
+                };
+                if( indexed )
+                {
+                    const auto total = item.GetJobCount();
+                    for( size_t offset = 0; offset < total; )
+                    {
+                        checkCancelled();
+                        const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                        const auto allowed = BudgetScanAllowance( requested );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                            "Job compare scan budget exhausted", true );
+                        const auto values = item.ScanJobs( offset, allowed );
+                        BudgetScanned( values.size(), requested, allowed );
+                        if( values.empty() ) throw QueryError( "INDEX_NOT_READY",
+                            "Job compare page is incomplete" );
+                        for( const auto& job : values ) collectJob( job );
+                        offset += values.size();
+                    }
                 }
+                else for( const auto& job : item.GetJobs() ) collectJob( job );
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "Job compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
             const auto compareMetricMaps = [&]( const MetricMap& left, const MetricMap& right, size_t frameCount ) {
+                const auto metricStatistics = []( const MetricGroup& group, size_t metric,
+                    const std::vector<int64_t>& values ) {
+                    return ( group.spilledMask & uint8_t( 1u << metric ) ) != 0 ?
+                        group.spilled[metric] : analysis::ComputeStatistics( values );
+                };
                 std::set<std::string> keys;
                 for( const auto& [key, value] : left ) keys.emplace( key );
                 for( const auto& [key, value] : right ) keys.emplace( key );
@@ -11305,16 +13706,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     else if( key.rfind( "stable:", 0 ) == 0 ) stableMatches++;
                     else fallbackMatches++;
                     const analysis::Statistics empty;
-                    const auto beforeInclusive = before == left.end() ? empty : analysis::ComputeStatistics( before->second.inclusive );
-                    const auto afterInclusive = after == right.end() ? empty : analysis::ComputeStatistics( after->second.inclusive );
-                    const auto beforeSelf = before == left.end() ? empty : analysis::ComputeStatistics( before->second.self );
-                    const auto afterSelf = after == right.end() ? empty : analysis::ComputeStatistics( after->second.self );
-                    const auto beforeRunning = before == left.end() ? empty : analysis::ComputeStatistics( before->second.running );
-                    const auto afterRunning = after == right.end() ? empty : analysis::ComputeStatistics( after->second.running );
-                    const auto beforeLatency = before == left.end() ? empty : analysis::ComputeStatistics( before->second.latency );
-                    const auto afterLatency = after == right.end() ? empty : analysis::ComputeStatistics( after->second.latency );
-                    const auto beforeWait = before == left.end() ? empty : analysis::ComputeStatistics( before->second.wait );
-                    const auto afterWait = after == right.end() ? empty : analysis::ComputeStatistics( after->second.wait );
+                    const auto beforeInclusive = before == left.end() ? empty : metricStatistics( before->second, 0, before->second.inclusive );
+                    const auto afterInclusive = after == right.end() ? empty : metricStatistics( after->second, 0, after->second.inclusive );
+                    const auto beforeSelf = before == left.end() ? empty : metricStatistics( before->second, 1, before->second.self );
+                    const auto afterSelf = after == right.end() ? empty : metricStatistics( after->second, 1, after->second.self );
+                    const auto beforeRunning = before == left.end() ? empty : metricStatistics( before->second, 2, before->second.running );
+                    const auto afterRunning = after == right.end() ? empty : metricStatistics( after->second, 2, after->second.running );
+                    const auto beforeLatency = before == left.end() ? empty : metricStatistics( before->second, 3, before->second.latency );
+                    const auto afterLatency = after == right.end() ? empty : metricStatistics( after->second, 3, after->second.latency );
+                    const auto beforeWait = before == left.end() ? empty : metricStatistics( before->second, 4, before->second.wait );
+                    const auto afterWait = after == right.end() ? empty : metricStatistics( after->second, 4, after->second.wait );
                     const double deltaPerFrame = frameCount == 0 ? 0 : double( afterInclusive.total - beforeInclusive.total ) / double( frameCount );
                     const double deltaP95 = afterInclusive.p95 - beforeInclusive.p95;
                     ranked.push_back( { std::max( std::abs( deltaPerFrame ), std::abs( deltaP95 ) ), key, {
@@ -11602,7 +14003,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             addFinding( "warning", "TRUNCATED_STREAM_TAIL", "the selected committed stream revision has an incomplete or truncated tail; results are bounded to the last readable records", 1 );
         }
-        if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
+        if( const auto* indexedCatalog = dynamic_cast<const QueryCatalogStatusSource*>( source.get() ) )
+        {
+            const auto& validation = indexedCatalog->GetQueryCatalogValidation();
+            if( !validation.complete )
+                throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            if( validation.present )
+            {
+                const auto status = indexedCatalog->GetQueryCatalogStatus( 0, 0 );
+                if( !validation.originalValid || ( !validation.healthy && validation.findings.empty() ) )
+                    addFinding( "error", "GPU_CATALOG_INVALID_CORE",
+                        "N27 GPU Catalog Core is invalid or disk semantic validation failed", 1 );
+                if( status.unresolvedCount )
+                    addFinding( "error", "GPU_CATALOG_UNRESOLVED_RESOURCE",
+                        "completed GPU Catalog lifetimes contain unresolved pointer-token evidence",
+                        status.unresolvedCount );
+                for( const auto& finding : validation.findings )
+                {
+                    const auto code = finding.code == "CATALOG_TRANSPORT_CHECKSUM_MISSING" ||
+                        finding.code == "CATALOG_STORED_CHECKSUM" ? "GPU_CATALOG_CHECKSUM_FAILURE" :
+                        finding.code == "CATALOG_SEQUENCE" ? "GPU_CATALOG_SEQUENCE_GAP" :
+                        finding.code == "CATALOG_BATCH_RANGE" ? "GPU_CATALOG_INVALID_BATCH" :
+                        finding.code.c_str();
+                    addFinding( "error", code, "GPU Catalog disk validation: " + finding.code, finding.count );
+                }
+            }
+        }
+        else if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
         {
             uint64_t invalidBatches = 0, checksumFailures = 0, sequenceGaps = 0, unresolved = 0;
             std::map<uint64_t, std::vector<uint32_t>> sequences;
@@ -11880,7 +14307,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 checkCancelled();
                 const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
                 analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-                const auto values = source->ScanSampleEvents( range );
+                const auto values = source->ScanSampleEventsRaw( range );
                 BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& value : values )
                 {
@@ -12008,6 +14435,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     throw QueryError( "METHOD_NOT_FOUND", "unknown method: " + method );
+}
+
+std::vector<uint32_t> QueryGpuTaxonomyIds( const analysis::TraceInfoDto& info )
+{
+    std::vector<uint32_t> result;
+    const auto taxonomy = GpuTaxonomyCatalogJson( info );
+    if( !taxonomy.contains( "definitions" ) || !taxonomy["definitions"].is_array() ) return result;
+    for( const auto& definition : taxonomy["definitions"] )
+    {
+        if( !definition.contains( "taxonomy_id" ) ) continue;
+        const auto value = DecimalStringValue( definition["taxonomy_id"] );
+        if( value && *value != 0 && *value <= UINT32_MAX ) result.emplace_back( uint32_t( *value ) );
+    }
+    std::sort( result.begin(), result.end() );
+    result.erase( std::unique( result.begin(), result.end() ), result.end() );
+    return result;
 }
 
 std::string DumpProtocolJson( const json& value )

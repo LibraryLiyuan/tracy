@@ -241,7 +241,19 @@ public:
     using CompleteFrameFilter = std::function<bool(std::string_view domain,
         std::string_view frameScope, uint64_t frameIndex)>;
     void SetCompleteFrameFilter( CompleteFrameFilter filter );
+    void SetProgress( std::function<void( std::string_view, uint64_t, uint64_t )> progress );
     void AddDomainAudit( const NeutralDomainAuditInput& value );
+    // Internal phase snapshot. The owner must hold the generation writer lease.
+    // checkpoint is a fresh direct child of temporaryRoot. Referenced runs are
+    // retained until the generation owner retires them after final publication.
+    // Save before installing a process-local CompleteFrameFilter; reinstall the
+    // same filter from the validated stage metadata before Finish after restore.
+    void SaveCheckpoint(const std::filesystem::path& checkpoint, const std::string& identity,
+        const std::function<bool()>& cancelled = {});
+    void RestoreCheckpoint(const std::filesystem::path& checkpoint, const std::string& identity,
+        const std::function<bool()>& cancelled = {});
+    // Only after successful Restore, while still holding the generation lease.
+    uint64_t CleanupUnreferencedRuns(const std::function<bool()>& cancelled = {});
     bool Finish( NeutralStatisticsResult& result, std::string& error,
         const NeutralSignatureFramesSink& signatureSink = {},
         const std::function<bool()>& cancelled = {} );
@@ -266,7 +278,8 @@ ExactDistribution ComputeExactDistributionExternal(
     const std::filesystem::path& temporaryRoot,
     const std::string& prefix,
     uint64_t maximumBufferedValues,
-    const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
+    const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::function<bool()>& cancelled = {} );
 
 NeutralStatisticsResult BuildNeutralStatistics( const NeutralStatisticsInput& input );
 

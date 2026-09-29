@@ -32,6 +32,9 @@ class GpuCatalogBoundedScanSource
 {
 public:
     virtual ~GpuCatalogBoundedScanSource() = default;
+    // True only when allocation summary pages form one strictly increasing,
+    // unique allocationId stream. Callers still verify the order while reading.
+    virtual bool GpuAllocationSummariesUniqueById() const { return false; }
     virtual uint64_t GetGpuCatalogResourceCountBounded() const = 0;
     virtual uint64_t GetGpuCatalogAllocationCountBounded() const = 0;
     virtual uint64_t GetGpuCatalogPassCountBounded() const = 0;
@@ -83,6 +86,7 @@ using BoundedScanRecords = std::variant<
     std::vector<RelationDto>,
     std::vector<MemoryEventDto>,
     std::vector<SampleDto>,
+    std::vector<SampleSummaryDto>,
     std::vector<ContextSwitchDto>,
     std::vector<RuntimeDomainStateDto>,
     std::vector<ScriptFrameDto>,
@@ -141,13 +145,19 @@ public:
 class BoundedTraceScanner
 {
 public:
-    explicit BoundedTraceScanner( const TraceSource& source );
+    explicit BoundedTraceScanner( const TraceSource& source, bool cpuPolicyProjection = false,
+        bool jobPolicyProjection = false, bool systemSummaryProjection = false,
+        std::function<void()> check = {} );
     BoundedScanBatch Read( const BoundedScanRequest& request ) const;
 
 private:
     const TraceSource& m_source;
     const NativeBoundedTraceSource& m_bounded;
     const GpuCatalogBoundedScanSource* m_gpu = nullptr;
+    bool m_cpuPolicyProjection = false;
+    bool m_jobPolicyProjection = false;
+    bool m_systemSummaryProjection = false;
+    std::function<void()> m_check;
 };
 
 const char* BoundedScanDomainName( BoundedScanDomain domain );

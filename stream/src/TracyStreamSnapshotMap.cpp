@@ -68,7 +68,8 @@ bool WriteConvertedSnapshotMap(
     const std::filesystem::path& streamPath,
     const ScanResult& scan,
     const std::filesystem::path& snapshotPath,
-    std::string& error )
+    std::string& error,
+    std::function<void(const std::filesystem::path&,const std::string&)> publish )
 {
     error.clear();
     try
@@ -92,7 +93,7 @@ bool WriteConvertedSnapshotMap(
         const auto mapPath = ConvertedSnapshotMapPath( streamPath );
         auto temporary = mapPath;
         temporary += ".tmp";
-        std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+        std::ostringstream output;
         if( !output )
         {
             error = "cannot create temporary snapshot map";
@@ -111,8 +112,10 @@ bool WriteConvertedSnapshotMap(
             << "snapshot=" << std::quoted( snapshotPath.filename().string() ) << '\n'
             << "snapshot_bytes=" << std::filesystem::file_size( snapshotPath ) << '\n'
             << "snapshot_write_time=" << FileWriteTime( snapshotPath ) << '\n';
-        output.close();
-        if( !output )
+        if(publish){publish(mapPath,output.str());return true;}
+        std::ofstream file(temporary,std::ios::binary|std::ios::trunc);
+        file<<output.str();file.close();
+        if( !file )
         {
             error = "cannot flush temporary snapshot map";
             std::error_code ignored;

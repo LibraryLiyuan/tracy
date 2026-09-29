@@ -20,12 +20,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
+option(TRACY_QUERY_DEV_NO_LTO "Disable Query link-time optimization for iterative local tests" OFF)
+if(TRACY_QUERY_DEV_NO_LTO)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "Build zstd programs" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "Build zstd tests" FORCE)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
+
+# Internal acceptance builds only; production binaries ignore experiment env.
+option(TRACY_CACHE_STORAGE_EXPERIMENTS "Enable internal cache storage comparisons" OFF)
+mark_as_advanced(TRACY_CACHE_STORAGE_EXPERIMENTS)
+if(TRACY_CACHE_STORAGE_EXPERIMENTS)
+    set_property(SOURCE ${TRACY_ANALYSIS_DIR}/TracyAnalysisCacheTable.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS TRACY_CACHE_STORAGE_EXPERIMENTS)
+endif()
+
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json
@@ -58,7 +71,39 @@ add_library(TracyQueryProtocol STATIC
     src/TracyPng.hpp
     src/TracyQueryIndex.cpp
     src/TracyQueryIndex.hpp
+    src/TracyQueryCatalogStore.cpp
+    src/TracyQueryCatalogStore.hpp
+    src/TracyQueryGpuReferenceStore.cpp
+    src/TracyQueryGpuReferenceStore.hpp
+    src/TracyQueryGpuPassResourceStore.cpp
+    src/TracyQueryGpuPassResourceStore.hpp
+    src/TracyQueryCallstackStore.cpp
+    src/TracyQueryCallstackStore.hpp
+    src/TracyQuerySampleStore.cpp
+    src/TracyQuerySampleStore.hpp
+    src/TracyQueryGhostZoneStore.cpp
+    src/TracyQueryGhostZoneStore.hpp
+    src/TracyQuerySampleDerivedStore.cpp
+    src/TracyQuerySampleDerivedStore.hpp
+    src/TracyQueryJobStore.cpp
+    src/TracyQueryJobStore.hpp
+    src/TracyQueryCorrelationStore.cpp
+    src/TracyQueryCorrelationStore.hpp
+    src/TracyQueryExplicitPassStore.cpp
+    src/TracyQueryExplicitPassStore.hpp
+    src/TracyQueryExplicitPassBuilder.cpp
+    src/TracyQueryExplicitPassBuilder.hpp
+    src/TracyQuerySampleView.cpp
+    src/TracyQuerySampleView.hpp
+    src/TracyQueryStringStore.cpp
+    src/TracyQueryStringStore.hpp
+    src/TracyQueryResourceContext.cpp
+    src/TracyQueryResourceContext.hpp
+    src/TracyQueryValidationStore.cpp
+    src/TracyQueryValidationStore.hpp
     src/TracyQueryService.cpp
+    src/TracyQuerySpillStatistics.cpp
+    src/TracyQuerySpillStatistics.hpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
     src/TracySegmentTraceSource.hpp
@@ -71,6 +116,9 @@ target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_
 target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
 target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore nlohmann_json::nlohmann_json)
 target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_options(TracyQueryProtocol PRIVATE /bigobj)
+endif()
 
 add_executable(tracy-query src/main.cpp)
 target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
@@ -98,9 +146,146 @@ if(BUILD_TESTING)
         endif()
     endfunction()
 
+    add_executable(tracy-paged-record-store-tests tests/PagedRecordStoreTests.cpp)
+    add_executable(tracy-memory-attribution-tests tests/MemoryAttributionTests.cpp)
+    tracy_query_enable_assertions(tracy-memory-attribution-tests)
+    add_test(NAME tracy-memory-attribution COMMAND tracy-memory-attribution-tests)
+    target_link_libraries(tracy-paged-record-store-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-paged-record-store-tests)
+    add_test(NAME tracy-paged-record-store COMMAND tracy-paged-record-store-tests)
+
+    add_executable(tracy-process-commit-limit-tests tests/ProcessCommitLimitTests.cpp)
+    target_include_directories(tracy-process-commit-limit-tests PRIVATE ${TRACY_ANALYSIS_DIR})
+    tracy_query_enable_assertions(tracy-process-commit-limit-tests)
+    add_test(NAME tracy-process-commit-limit COMMAND tracy-process-commit-limit-tests)
+
+    add_executable(tracy-gpu-memory-request-scope-tests tests/GpuMemoryRequestScopeTests.cpp)
+    target_link_libraries(tracy-gpu-memory-request-scope-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-gpu-memory-request-scope-tests)
+    add_test(NAME tracy-gpu-memory-request-scope COMMAND tracy-gpu-memory-request-scope-tests)
+
+    add_executable(tracy-compressed-query-index-tests tests/CompressedQueryIndexTests.cpp)
+    target_link_libraries(tracy-compressed-query-index-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-compressed-query-index-tests)
+
+    add_executable(tracy-cpu-policy-projection-probe tests/CpuPolicyProjectionProbe.cpp)
+    target_link_libraries(tracy-cpu-policy-projection-probe PRIVATE TracyQueryProtocol nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-cpu-policy-projection-probe)
+
+    add_executable(tracy-query-sample-store-tests tests/QuerySampleStoreTests.cpp)
+    target_link_libraries(tracy-query-sample-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-store-tests)
+    add_test(NAME tracy-query-sample-store COMMAND tracy-query-sample-store-tests)
+
+    add_executable(tracy-query-sample-index-integration-tests tests/QuerySampleIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-sample-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-index-integration-tests)
+
+    add_executable(tracy-query-ghost-zone-store-tests tests/QueryGhostZoneStoreTests.cpp)
+    target_link_libraries(tracy-query-ghost-zone-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-ghost-zone-store-tests)
+    add_test(NAME tracy-query-ghost-zone-store COMMAND tracy-query-ghost-zone-store-tests)
+
+    add_executable(tracy-query-sample-derived-store-tests tests/QuerySampleDerivedStoreTests.cpp)
+    target_link_libraries(tracy-query-sample-derived-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-derived-store-tests)
+    add_test(NAME tracy-query-sample-derived-store COMMAND tracy-query-sample-derived-store-tests)
+
+    add_executable(tracy-query-job-store-tests tests/QueryJobStoreTests.cpp)
+    target_link_libraries(tracy-query-job-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-job-store-tests)
+    add_test(NAME tracy-query-job-store COMMAND tracy-query-job-store-tests)
+
+    add_executable(tracy-query-correlation-store-tests tests/QueryCorrelationStoreTests.cpp)
+    target_link_libraries(tracy-query-correlation-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-correlation-store-tests)
+    add_test(NAME tracy-query-correlation-store COMMAND tracy-query-correlation-store-tests)
+
+    add_executable(tracy-query-explicit-pass-store-tests tests/QueryExplicitPassStoreTests.cpp)
+    target_link_libraries(tracy-query-explicit-pass-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-store-tests)
+    add_test(NAME tracy-query-explicit-pass-store COMMAND tracy-query-explicit-pass-store-tests)
+
+    add_executable(tracy-query-explicit-pass-builder-tests tests/QueryExplicitPassBuilderTests.cpp)
+    target_link_libraries(tracy-query-explicit-pass-builder-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-builder-tests)
+    add_test(NAME tracy-query-explicit-pass-builder COMMAND tracy-query-explicit-pass-builder-tests)
+
+    add_executable(tracy-query-correlation-capacity tests/QueryCorrelationCapacity.cpp)
+    target_link_libraries(tracy-query-correlation-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-correlation-capacity)
+
+    add_executable(tracy-query-explicit-pass-capacity tests/QueryExplicitPassCapacity.cpp)
+    target_link_libraries(tracy-query-explicit-pass-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-capacity)
+
+    add_executable(tracy-query-explicit-pass-join-capacity tests/QueryExplicitPassJoinCapacity.cpp)
+    target_link_libraries(tracy-query-explicit-pass-join-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-join-capacity)
+
+    add_executable(tracy-query-gpu-aggregation-capacity tests/QueryGpuAggregationCapacity.cpp)
+    target_link_libraries(tracy-query-gpu-aggregation-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-aggregation-capacity)
+
+    add_executable(tracy-query-gpu-pass-fused-capacity tests/QueryGpuPassFusedCapacity.cpp)
+    target_link_libraries(tracy-query-gpu-pass-fused-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-pass-fused-capacity)
+
+    add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
+    target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-view-tests)
+    add_test(NAME tracy-query-sample-view COMMAND tracy-query-sample-view-tests)
+
+    add_executable(tracy-query-job-stage-index-integration-tests tests/QueryJobStageIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-job-stage-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-job-stage-index-integration-tests)
+
+    add_executable(tracy-query-catalog-store-tests tests/QueryCatalogStoreTests.cpp)
+    target_link_libraries(tracy-query-catalog-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-store-tests)
+    add_test(NAME tracy-query-catalog-store COMMAND tracy-query-catalog-store-tests)
+
+    add_executable(tracy-query-gpu-reference-store-tests tests/QueryGpuReferenceStoreTests.cpp)
+    target_link_libraries(tracy-query-gpu-reference-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-reference-store-tests)
+    add_test(NAME tracy-query-gpu-reference-store COMMAND tracy-query-gpu-reference-store-tests)
+
+    add_executable(tracy-query-gpu-pass-resource-store-tests tests/QueryGpuPassResourceStoreTests.cpp)
+    target_link_libraries(tracy-query-gpu-pass-resource-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-pass-resource-store-tests)
+    add_test(NAME tracy-query-gpu-pass-resource-store COMMAND tracy-query-gpu-pass-resource-store-tests)
+
+    add_executable(tracy-query-gpu-association-audit tests/QueryGpuAssociationAudit.cpp)
+    target_link_libraries(tracy-query-gpu-association-audit PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-association-audit)
+
+    add_executable(tracy-query-catalog-association-search-tests tests/QueryCatalogAssociationSearchTests.cpp)
+    target_link_libraries(tracy-query-catalog-association-search-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-association-search-tests)
+    add_test(NAME tracy-query-catalog-association-search COMMAND tracy-query-catalog-association-search-tests)
+
+    add_executable(tracy-query-callstack-store-tests tests/QueryCallstackStoreTests.cpp)
+    target_link_libraries(tracy-query-callstack-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-callstack-store-tests)
+    add_test(NAME tracy-query-callstack-store COMMAND tracy-query-callstack-store-tests)
+
+    add_executable(tracy-query-string-store-tests tests/QueryStringStoreTests.cpp)
+    target_link_libraries(tracy-query-string-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-string-store-tests)
+    add_test(NAME tracy-query-string-store COMMAND tracy-query-string-store-tests)
+
+    add_executable(tracy-query-catalog-index-integration-tests tests/QueryCatalogIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-catalog-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-index-integration-tests)
+
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-job-evidence-read-tests)
     add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)
+
+    add_executable(tracy-query-spill-statistics-tests tests/QuerySpillStatisticsTests.cpp)
+    target_link_libraries(tracy-query-spill-statistics-tests PRIVATE TracyQueryProtocol)
+    add_test(NAME tracy-query-spill-statistics COMMAND tracy-query-spill-statistics-tests)
 
     add_executable(tracy-query-contract-tests tests/ProtocolTests.cpp)
     target_link_libraries(tracy-query-contract-tests PRIVATE TracyQueryProtocol)
@@ -135,7 +320,7 @@ if(BUILD_TESTING)
     add_test(NAME tracy-neutral-aggregate-store COMMAND tracy-neutral-aggregate-store-tests)
 
     add_executable(tracy-analysis-cache-table-tests tests/AnalysisCacheTableTests.cpp)
-    target_link_libraries(tracy-analysis-cache-table-tests PRIVATE TracyAnalysis)
+    target_link_libraries(tracy-analysis-cache-table-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-analysis-cache-table-tests)
     add_test(NAME tracy-analysis-cache-table COMMAND tracy-analysis-cache-table-tests)
     add_executable(tracy-analysis-cache-query-tests tests/AnalysisCacheQueryTests.cpp)
@@ -146,6 +331,16 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-analysis-workspace-budget-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-analysis-workspace-budget-tests)
     add_test(NAME tracy-analysis-workspace-budget COMMAND tracy-analysis-workspace-budget-tests)
+
+    add_executable(tracy-query-resource-context-tests tests/QueryResourceContextTests.cpp)
+    target_link_libraries(tracy-query-resource-context-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-resource-context-tests)
+    add_test(NAME tracy-query-resource-context COMMAND tracy-query-resource-context-tests)
+
+    add_executable(tracy-query-validation-store-tests tests/QueryValidationStoreTests.cpp)
+    target_link_libraries(tracy-query-validation-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-validation-store-tests)
+    add_test(NAME tracy-query-validation-store COMMAND tracy-query-validation-store-tests)
     add_executable(tracy-analysis-dictionary-tests tests/AnalysisDictionaryTests.cpp)
     target_include_directories(tracy-analysis-dictionary-tests PRIVATE ../analysis)
     tracy_query_enable_assertions(tracy-analysis-dictionary-tests)
@@ -191,11 +386,22 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-exact-statistics-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-exact-statistics-tests)
     add_test(NAME tracy-exact-statistics COMMAND tracy-exact-statistics-tests)
+    add_test(NAME tracy-exact-distribution-disk COMMAND tracy-exact-statistics-tests --distribution-disk-only)
+    add_test(NAME tracy-exact-distribution-cancel COMMAND tracy-exact-statistics-tests --distribution-cancel-only)
+    add_test(NAME tracy-exact-reduce-cancel COMMAND tracy-exact-statistics-tests --reduce-cancel-only)
+    add_test(NAME tracy-exact-equal-distribution COMMAND tracy-exact-statistics-tests --equal-distribution-only)
+    add_test(NAME tracy-exact-constant-distribution COMMAND tracy-exact-statistics-tests --constant-distribution-only)
+    add_test(NAME tracy-exact-statistics-checkpoint COMMAND tracy-exact-statistics-tests --checkpoint-only)
 
     add_executable(tracy-cache-publish-retry-tests tests/CachePublishRetryTests.cpp)
     target_link_libraries(tracy-cache-publish-retry-tests PRIVATE TracyAnalysis)
     tracy_query_enable_assertions(tracy-cache-publish-retry-tests)
     add_test(NAME tracy-cache-publish-retry COMMAND tracy-cache-publish-retry-tests)
+
+    add_executable(tracy-query-index-publish-tests tests/QueryIndexPublishTests.cpp)
+    target_link_libraries(tracy-query-index-publish-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-index-publish-tests)
+    add_test(NAME tracy-query-index-publish COMMAND tracy-query-index-publish-tests)
 
     add_executable(tracy-frame-window-review-tests tests/FrameWindowReviewTests.cpp)
     target_link_libraries(tracy-frame-window-review-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
@@ -215,18 +421,24 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     add_test(NAME tracy-analysis-scan-manager COMMAND tracy-analysis-scan-manager-tests)
     # Same native-source assertions without linking the full QueryService
     # dispatcher; keeps default-producer red/green cycles independent of MCP.
-    add_executable(tracy-default-analysis-cache-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp)
+    add_executable(tracy-default-analysis-cache-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp src/TracyQueryResourceContext.cpp)
     target_link_libraries(tracy-default-analysis-cache-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
-    target_include_directories(tracy-default-analysis-cache-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+    target_include_directories(tracy-default-analysis-cache-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${TRACY_SERVER_DIR})
     target_compile_definitions(tracy-default-analysis-cache-tests PRIVATE TRACY_DEFAULT_SCAN_TEST_ONLY)
     tracy_query_enable_assertions(tracy-default-analysis-cache-tests)
     add_test(NAME tracy-default-analysis-cache COMMAND tracy-default-analysis-cache-tests)
-    add_executable(tracy-analysis-cache-manager-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp)
+    add_test(NAME tracy-analysis-phase-recovery COMMAND tracy-default-analysis-cache-tests --phase-recovery)
+    add_test(NAME tracy-analysis-phase-storage-identity COMMAND tracy-default-analysis-cache-tests --phase-storage-identity)
+    add_test(NAME tracy-analysis-phase-metadata-budget COMMAND tracy-default-analysis-cache-tests --phase-metadata-budget)
+    add_test(NAME tracy-analysis-manager-phase-recovery COMMAND tracy-default-analysis-cache-tests --manager-phase-recovery)
+    add_test(NAME tracy-analysis-publication-phase-recovery COMMAND tracy-default-analysis-cache-tests --publication-phase-recovery)
+    add_executable(tracy-analysis-cache-manager-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp src/TracyQueryResourceContext.cpp)
     target_link_libraries(tracy-analysis-cache-manager-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
-    target_include_directories(tracy-analysis-cache-manager-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+    target_include_directories(tracy-analysis-cache-manager-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${TRACY_SERVER_DIR})
     target_compile_definitions(tracy-analysis-cache-manager-tests PRIVATE TRACY_SCAN_MANAGER_TEST_ONLY)
     tracy_query_enable_assertions(tracy-analysis-cache-manager-tests)
     add_test(NAME tracy-analysis-cache-manager COMMAND tracy-analysis-cache-manager-tests)
+    add_test(NAME tracy-analysis-state-publication-lock COMMAND tracy-analysis-cache-manager-tests --publication-lock-only)
 
     add_executable(tracy-gpu-analysis-tests tests/GpuAnalysisTests.cpp)
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)

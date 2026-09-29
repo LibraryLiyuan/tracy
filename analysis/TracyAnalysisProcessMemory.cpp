@@ -25,7 +25,20 @@ AnalysisProcessMemorySample ReadAnalysisProcessMemory()
     PROCESS_MEMORY_COUNTERS_EX counters{};
     counters.cb=sizeof(counters);
     if(!GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),sizeof(counters))) return {};
-    return {true,uint64_t(counters.WorkingSetSize),uint64_t(counters.PrivateUsage)};
+    AnalysisProcessMemorySample result;
+    result.available=true;
+    result.residentBytes=uint64_t(counters.WorkingSetSize);
+    result.privateBytes=uint64_t(counters.PrivateUsage);
+    MEMORYSTATUSEX memory{}; memory.dwLength=sizeof(memory);
+    if(GlobalMemoryStatusEx(&memory))
+    {
+        result.systemCommitAvailable=true;
+        result.systemCommitLimitBytes=uint64_t(memory.ullTotalPageFile);
+        result.systemCommitHeadroomBytes=uint64_t(memory.ullAvailPageFile);
+        result.systemCommitBytes=result.systemCommitLimitBytes>=result.systemCommitHeadroomBytes ?
+            result.systemCommitLimitBytes-result.systemCommitHeadroomBytes : 0;
+    }
+    return result;
 #elif defined(__linux__)
     std::ifstream input("/proc/self/smaps_rollup");
     AnalysisProcessMemorySample result;
@@ -40,7 +53,24 @@ AnalysisProcessMemorySample ReadAnalysisProcessMemory()
             result.privateBytes+=kib*1024;
         if(key=="Private_Dirty:") privateDirty=true;
     }
-    result.available=rss && privateDirty; return result;
+    result.available=rss && privateDirty;
+    std::ifstream memory("/proc/meminfo");
+    uint64_t commitLimit=0,committed=0;
+    while(std::getline(memory,line))
+    {
+        std::istringstream fields(line); std::string key,unit; uint64_t kib=0;
+        if(!(fields>>key>>kib>>unit) || unit!="kB") continue;
+        if(key=="CommitLimit:") commitLimit=kib*1024;
+        else if(key=="Committed_AS:") committed=kib*1024;
+    }
+    if(commitLimit)
+    {
+        result.systemCommitAvailable=true;
+        result.systemCommitLimitBytes=commitLimit;
+        result.systemCommitBytes=committed;
+        result.systemCommitHeadroomBytes=committed<commitLimit ? commitLimit-committed : 0;
+    }
+    return result;
 #elif defined(__APPLE__)
     task_vm_info_data_t info{}; mach_msg_type_number_t count=TASK_VM_INFO_COUNT;
     if(task_info(mach_task_self(),TASK_VM_INFO,reinterpret_cast<task_info_t>(&info),&count)!=KERN_SUCCESS) return {};
@@ -74,7 +104,18 @@ void AnalysisProcessMemoryGuard::Check(bool forceSample)
         m_snapshot.residentBytes=sample.residentBytes; m_snapshot.privateBytes=sample.privateBytes;
         m_snapshot.peakResidentBytes=std::max(m_snapshot.peakResidentBytes,sample.residentBytes);
         m_snapshot.peakPrivateBytes=std::max(m_snapshot.peakPrivateBytes,sample.privateBytes);
-        if(sample.residentBytes>m_options.maximumBytes || sample.privateBytes>m_options.maximumBytes)
+        if(sample.systemCommitAvailable)
+        {
+            const bool first=!m_snapshot.systemCommitAvailable;
+            m_snapshot.systemCommitAvailable=true;
+            m_snapshot.systemCommitLimitBytes=sample.systemCommitLimitBytes;
+            m_snapshot.systemCommitBytes=sample.systemCommitBytes;
+            m_snapshot.systemCommitHeadroomBytes=sample.systemCommitHeadroomBytes;
+            m_snapshot.peakSystemCommitBytes=std::max(m_snapshot.peakSystemCommitBytes,sample.systemCommitBytes);
+            if(first || sample.systemCommitHeadroomBytes<m_snapshot.minimumSystemCommitHeadroomBytes)
+                m_snapshot.minimumSystemCommitHeadroomBytes=sample.systemCommitHeadroomBytes;
+        }
+        if(sample.privateBytes>m_options.maximumBytes)
             m_snapshot.error="analysis_process_memory_budget";
     }
     if(!m_snapshot.error.empty()) throw std::runtime_error(m_snapshot.error);

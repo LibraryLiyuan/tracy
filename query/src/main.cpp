@@ -5,6 +5,7 @@
 #include "TracySessionManager.hpp"
 #include "TracySegmentTraceSource.hpp"
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyProcessCommitLimit.hpp"
 
 #include "../../public/common/TracyVersion.hpp"
 
@@ -30,25 +31,6 @@ namespace
 using nlohmann::json;
 using namespace tracy::query;
 
-void ApplyIndexedMemoryBudget()
-{
-#ifdef _WIN32
-    constexpr SIZE_T MinimumWorkingSet = SIZE_T( 64 ) * 1024 * 1024;
-    constexpr SIZE_T MaximumWorkingSet = SIZE_T( 1900 ) * 1024 * 1024;
-    if( !SetProcessWorkingSetSizeEx( GetCurrentProcess(), MinimumWorkingSet, MaximumWorkingSet, QUOTA_LIMITS_HARDWS_MAX_ENABLE ) )
-    {
-        // PROCESS_SET_QUOTA is not available to a normal desktop token on all
-        // Windows installations.  Indexed Query must remain usable without an
-        // administrator prompt; its internal cache, page and response budgets
-        // continue to provide the portable memory bound.  The OS hard working
-        // set is therefore an additional best-effort guard, not a start-up
-        // requirement.
-        std::cerr << "warning: could not apply the optional 1.9 GiB indexed working-set guard (Windows error "
-            << GetLastError() << "); continuing with internal query budgets\n";
-    }
-#endif
-}
-
 struct Arguments
 {
     bool version = false;
@@ -67,8 +49,45 @@ struct Arguments
     std::vector<std::filesystem::path> allowSourceRoots;
     std::optional<std::filesystem::path> analysisRoot;
     std::optional<std::filesystem::path> analysisCacheRoot;
+    std::optional<std::filesystem::path> resourceProfile;
+    QueryResourceContextOptions resourceOptions;
     size_t analysisCacheMiB = 512;
 };
+
+QueryResourceContextOptions LoadResourceProfile(const std::filesystem::path& path)
+{
+    if(!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path)>64*1024)
+        throw std::runtime_error("--resource-profile must name a JSON file no larger than 64 KiB");
+    std::ifstream input(path,std::ios::binary);
+    const auto profile=json::parse(input);
+    if(profile.at("schema")!=1 || !profile.value("working_set_is_observation_only",false) ||
+        profile.value("heavy_build_concurrency",0u)!=1)
+        throw std::runtime_error("unsupported Query resource profile");
+    QueryResourceContextOptions options;
+    options.expectedTraceBytes=profile.at("trace_bytes").get<uint64_t>();
+    options.expectedTraceSha256=profile.at("trace_sha256").get<std::string>();
+    std::transform(options.expectedTraceSha256.begin(),options.expectedTraceSha256.end(),
+        options.expectedTraceSha256.begin(),[](unsigned char value){return char(std::tolower(value));});
+    options.expectedFinalDiskLimit=profile.at("final_disk_limit").get<uint64_t>();
+    options.expectedPeakDiskLimit=profile.at("peak_live_disk_limit").get<uint64_t>();
+    options.privateBytesSoftTarget=profile.at("private_bytes_soft_target").get<uint64_t>();
+    options.processCommitHardLimit=profile.at("process_commit_hard_limit").get<uint64_t>();
+    options.sampleInterval=std::chrono::milliseconds(profile.at("sample_period_ms").get<uint64_t>());
+    if(profile.contains("workspace_maximum_bytes")) options.workspaceMaximumBytes=profile.at("workspace_maximum_bytes").get<uint64_t>();
+    if(profile.contains("workspace_target_bytes")) options.workspaceTargetBytes=profile.at("workspace_target_bytes").get<uint64_t>();
+    if(profile.contains("diagnostic_memory_reserve_bytes")) options.diagnosticMemoryReserveBytes=profile.at("diagnostic_memory_reserve_bytes").get<uint64_t>();
+    if(profile.contains("diagnostic_disk_reserve_bytes")) options.diagnosticDiskReserveBytes=profile.at("diagnostic_disk_reserve_bytes").get<uint64_t>();
+    if(profile.contains("additional_disk_roots")) {
+        const auto& roots=profile.at("additional_disk_roots");
+        if(!roots.is_array() || roots.size()>16) throw std::runtime_error("query_resource_profile_accounting_root");
+        for(const auto& root:roots) {
+            if(!root.is_string() || root.get<std::string>().empty())
+                throw std::runtime_error("query_resource_profile_accounting_root");
+            options.accountingRoots.emplace_back(root.get<std::string>());
+        }
+    }
+    return options;
+}
 
 void Usage()
 {
@@ -78,10 +97,10 @@ void Usage()
         << "  tracy-query --version\n"
         << "  tracy-query --schema\n"
         << "  tracy-query --doctor [--trace file.tracy] [--compact-index] [--allow-root path]\n"
-        << "  tracy-query --build-index --trace file.tracy [--allow-root path] [--output file.json]\n"
+        << "  tracy-query --build-index --trace file.tracy [--resource-profile file.json] [--allow-root path] [--output file.json]\n"
         << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path] [--output file.json]\n"
         << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path] [--output file.ndjson]\n"
-        << "  tracy-query --mcp [--indexed|--no-indexed] [--allow-root path] [--allow-source-root path] [--analysis-root path --analysis-cache-root path] [--analysis-cache-mib 512]\n";
+        << "  tracy-query --mcp [--indexed|--no-indexed] [--resource-profile file.json] [--allow-root path] [--allow-source-root path] [--analysis-root path --analysis-cache-root path] [--analysis-cache-mib 512]\n";
 }
 
 Arguments ParseArguments( int argc, char** argv )
@@ -110,6 +129,7 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--allow-source-root" ) result.allowSourceRoots.emplace_back( value( "--allow-source-root" ) );
         else if( option == "--analysis-root" ) result.analysisRoot = value( "--analysis-root" );
         else if( option == "--analysis-cache-root" ) result.analysisCacheRoot = value( "--analysis-cache-root" );
+        else if( option == "--resource-profile" ) result.resourceProfile = value( "--resource-profile" );
         else if( option == "--analysis-cache-mib" )
         {
             const auto parsed = std::stoull( value( "--analysis-cache-mib" ) );
@@ -139,6 +159,11 @@ Arguments ParseArguments( int argc, char** argv )
         }
         *result.analysisRoot = result.analysisRoot->lexically_normal();
         *result.analysisCacheRoot = result.analysisCacheRoot->lexically_normal();
+    }
+    if(result.resourceProfile)
+    {
+        *result.resourceProfile=std::filesystem::absolute(*result.resourceProfile).lexically_normal();
+        result.resourceOptions=LoadResourceProfile(*result.resourceProfile);
     }
     return result;
 }
@@ -197,7 +222,7 @@ std::optional<std::string> OpenDefaultTrace( SessionManager& sessions, const std
 
 int RunSingle( const Arguments& args )
 {
-    SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
+    SessionManager sessions( args.allowRoots, 2, {}, args.indexed, args.resourceOptions );
     QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
         args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
     json failure;
@@ -216,7 +241,7 @@ int RunSingle( const Arguments& args )
 
 int RunBatch( const Arguments& args )
 {
-    SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
+    SessionManager sessions( args.allowRoots, 2, {}, args.indexed, args.resourceOptions );
     QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
         args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
     json failure;
@@ -274,7 +299,7 @@ int RunDoctor( const Arguments& args )
     };
     try
     {
-        SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
+        SessionManager sessions( args.allowRoots, 2, {}, args.indexed, args.resourceOptions );
         json roots = json::array();
         for( const auto& root : sessions.AllowRoots() ) roots.emplace_back( root.string() );
         result["allow_roots"] = std::move( roots );
@@ -283,8 +308,12 @@ int RunDoctor( const Arguments& args )
             if( args.compactIndex )
             {
                 const auto path = sessions.ResolveTracePath( *args.trace );
-                const auto source = tracy::analysis::WorkerTraceSource::Open( path, {}, {}, tracy::analysis::WorkerTraceLoadMode::CompactIndex );
-                const auto info = source->GetTraceInfo();
+                auto resources=QueryIndex::CreateResourceContext(path,args.resourceOptions);
+                resources->SetPhase("doctor:compact-load"); resources->SetLiveWorkers(1);
+                const auto source = tracy::analysis::WorkerTraceSource::Open( path, {}, {},
+                    tracy::analysis::WorkerTraceLoadMode::CompactIndex,nullptr,resources->CreateFileReadHooks() );
+                const auto info = source->GetTraceInfoMetadata();
+                resources->ValidateTraceIdentity(std::filesystem::file_size(path),info.fingerprint);
                 result["checks"]["trace_loader"] = "ok";
                 result["checks"]["load_mode"] = "compact_index";
                 result["trace"] = {
@@ -335,26 +364,78 @@ int RunBuildIndex( const Arguments& args )
     std::unique_ptr<SegmentTraceSource> streamSource;
     QueryIndexManifest index;
     QueryIndexValidation validation;
+    std::shared_ptr<QueryResourceContext> resources;
+    bool builtIndex = false;
     if( streamInput )
     {
         streamSource = SegmentTraceSource::Open( path, {}, true );
         indexedPath = streamSource->SnapshotPath();
         const auto view = streamSource->RefreshView();
         if( view ) streamRevision = view->revision;
-        validation = QueryIndex::Validate( indexedPath, true );
+        resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
+        resources->RunResourceBoundary( [&] {
+            validation = QueryIndex::Validate( indexedPath, true, resources );
+        } );
         if( !validation.manifest ) throw std::runtime_error( "stream query index validation failed: " + validation.reason );
         index = *validation.manifest;
     }
     else
     {
-        index = QueryIndex::Build( indexedPath );
-        validation = QueryIndex::Validate( indexedPath, true );
+        resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
+        resources->RunResourceBoundary( [&] {
+            const auto checkpoint = QueryIndex::CheckpointPath( indexedPath );
+            if( std::filesystem::is_regular_file( checkpoint ) )
+            {
+                index = QueryIndex::Build( indexedPath, {}, resources );
+                builtIndex = true;
+            }
+            else
+            {
+                const auto published = QueryIndex::Validate( indexedPath, false, resources );
+                if( published.manifest ) index = *published.manifest;
+                else
+                {
+                    index = QueryIndex::Build( indexedPath, {}, resources );
+                    builtIndex = true;
+                }
+            }
+            validation = QueryIndex::Validate( indexedPath, true, resources,
+                builtIndex ? &index : nullptr );
+        } );
     }
+    resources->SetPhase("complete");
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
+    const auto resourceSnapshot = resources->Snapshot();
+    json phaseHistory=json::array();
+    for(const auto& phase:resourceSnapshot.phaseHistory)
+    {
+        if(!phase.complete) continue;
+        phaseHistory.push_back({
+            {"phase",phase.phase},{"start_ms",phase.startMs},{"end_ms",phase.endMs},
+            {"duration_ms",phase.durationMs},
+            {"progress_current",std::to_string(phase.progressCurrent)},
+            {"progress_total",std::to_string(phase.progressTotal)},
+            {"disk_current_bytes",std::to_string(phase.diskCurrentBytes)},
+            {"disk_peak_bytes",std::to_string(phase.diskPeakBytes)},
+            {"workspace_current_bytes",std::to_string(phase.workspaceCurrentBytes)},
+            {"workspace_peak_bytes",std::to_string(phase.workspacePeakBytes)},
+            {"private_bytes",std::to_string(phase.privateBytes)},
+            {"peak_private_bytes",std::to_string(phase.peakPrivateBytes)}
+        });
+    }
     const json result = {
         { "program", "tracy-query" }, { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
         { "operation", "build-index" }, { "ok", validation.manifest.has_value() },
         { "elapsed_ms", std::to_string( elapsed ) },
+        { "phase_history", std::move(phaseHistory) },
+        { "phase_history_truncated", resourceSnapshot.phaseHistoryTruncated },
+        { "resources", {
+            { "disk_current_bytes", std::to_string( resourceSnapshot.disk.currentBytes ) },
+            { "disk_peak_bytes", std::to_string( resourceSnapshot.disk.peakBytes ) },
+            { "disk_final_limit_bytes", std::to_string( resourceSnapshot.disk.finalLimitBytes ) },
+            { "disk_peak_limit_bytes", std::to_string( resourceSnapshot.disk.peakLimitBytes ) },
+            { "workspace_peak_bytes", std::to_string( resourceSnapshot.workspace.peakBytes ) }
+        } },
         { "input", {
             { "kind", streamInput ? "stream" : "snapshot" }, { "path", path.string() },
             { "indexed_snapshot", indexedPath.string() }, { "stream_revision", std::to_string( streamRevision ) }
@@ -394,7 +475,6 @@ int main( int argc, char** argv )
             if( !output ) throw std::runtime_error( "unable to open --output file" );
             std::cout.rdbuf( output.rdbuf() );
         }
-        if( args.indexed || args.buildIndex ) ApplyIndexedMemoryBudget();
         if( args.compactIndex && ( !args.doctor || !args.trace ) ) throw std::runtime_error( "--compact-index requires --doctor and --trace" );
         if( args.buildIndex && !args.trace ) throw std::runtime_error( "--build-index requires --trace" );
         const int modes = int( args.version ) + int( args.schema ) + int( args.doctor ) + int( args.buildIndex ) + int( args.mcp ) + int( args.request.has_value() ) + int( args.batch.has_value() );
@@ -405,7 +485,7 @@ int main( int argc, char** argv )
         }
         if( args.version )
         {
-            std::cout << "tracy-query " << tracy::Version::Major << '.' << tracy::Version::Minor << '.' << tracy::Version::Patch << " protocol " << QueryProtocol << " schema " << QuerySchemaVersion << '\n';
+            std::cout << "tracy-query " << tracy::Version::Major << '.' << tracy::Version::Minor << '.' << tracy::Version::Patch << " protocol " << QueryProtocol << " schema " << QuerySchemaVersion << " trace-format JNTRACYX/1 string-index 32\n";
             return 0;
         }
         if( args.schema )
@@ -413,19 +493,29 @@ int main( int argc, char** argv )
             std::cout << QuerySchemaJson << '\n';
             return 0;
         }
+#ifdef _WIN32
+        // Installed before any input is opened, covering Worker, indexing,
+        // scans, caches and direct/MCP query allocations in this process.
+        tracy::analysis::ProcessCommitLimit commitLimit(32ull*1024*1024*1024);
+#endif
         if( args.doctor ) return RunDoctor( args );
         if( args.buildIndex ) return RunBuildIndex( args );
         if( args.request ) return RunSingle( args );
         if( args.batch ) return RunBatch( args );
         if( args.mcp )
         {
-            SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
+            SessionManager sessions( args.allowRoots, 2, {}, args.indexed, args.resourceOptions );
             QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
                 args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
             McpServer server( sessions, service, args.allowSourceRoots );
             return server.Run( std::cin, std::cout );
         }
         return 1;
+    }
+    catch( const QueryResourceError& error )
+    {
+        std::cerr << error.Code() << ": " << error.what() << '\n';
+        return 2;
     }
     catch( const QueryError& error )
     {

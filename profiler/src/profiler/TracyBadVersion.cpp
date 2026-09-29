@@ -107,7 +107,7 @@ void BadVersionImpl( BadVersionState& badVer )
         ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_BOMB );
         ImGui::PopFont();
-        ImGui::TextUnformatted( "The file you are trying to open is corrupted." );
+        ImGui::TextUnformatted( "Unable to load this trace." );
         ImGui::Spacing();
         ImGui::TextUnformatted( badVer.msg.c_str() );
         ImGui::Separator();

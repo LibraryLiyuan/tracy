@@ -429,6 +429,21 @@ public:
     std::vector<analysis::CpuContextSwitchDto> ScanCpuContextSwitchEvents( const analysis::ScanRange& range ) const override { analysis::CpuContextSwitchDto value; value.ref = MakeEntityRef( "cpu-context-switch", 0 ); value.cpu = 0; value.startNs = 5; value.endNs = 45; value.rawThreadIndex = 1; value.threadRef = MakeEntityRef( "thread", 1 ); return Page( { value }, range ); }
     std::vector<analysis::SampleDto> ScanSampleEvents( const analysis::ScanRange& range ) const override { analysis::SampleDto value; value.ref = MakeEntityRef( "sample", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 30; value.callstack = 1; value.callstackRef = MakeEntityRef( "callstack", 1 ); return Page( { value }, range ); }
     std::vector<analysis::GhostZoneDto> ScanGhostZones( const analysis::ScanRange& range ) const override { analysis::GhostZoneDto value; value.ref = MakeEntityRef( "ghost-zone", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.startNs = 20; value.endNs = 30; value.name = "ghost"; return Page( { value }, range ); }
+    std::vector<analysis::GhostZoneDto> ScanGhostZonesRaw( const analysis::ScanRange& range ) const override
+    {
+        std::vector<analysis::GhostZoneDto> rows;
+        for( size_t ordinal = range.offset; ordinal < 7 && rows.size() < range.limit; ++ordinal )
+        {
+            analysis::GhostZoneDto value;
+            value.ref = MakeEntityRef( "ghost-zone", ordinal );
+            value.threadRef = MakeEntityRef( "thread", 1 );
+            value.startNs = int64_t( ordinal * 10 );
+            value.endNs = value.startNs + 8;
+            value.name = "ghost";
+            rows.emplace_back( std::move( value ) );
+        }
+        return rows;
+    }
     std::vector<analysis::HardwareSampleDto> GetHardwareSamples() const override { return { { MakeEntityRef( "hardware-sample", 1 ), "0x1", 1, 1, 1, 1, 1, 1 } }; }
     std::vector<analysis::HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const override
     {

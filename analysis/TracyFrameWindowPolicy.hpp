@@ -2,6 +2,7 @@
 #define __TRACYFRAMEWINDOWPOLICY_HPP__
 
 #include "TracyCandidatePolicy.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyWindowStatistics.hpp"
 #include <algorithm>
 #include <cmath>
@@ -46,8 +47,11 @@ struct Window
 
 inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
     const nlohmann::json& config, double budgetNs,
-    const std::function<bool()>& cancelled = {}, WindowWork* work = nullptr )
+    const std::function<bool()>& cancelled = {}, WindowWork* work = nullptr,
+    AnalysisWorkspaceReservation* retainedWorkspace = nullptr,
+    std::shared_ptr<AnalysisWorkspaceBudget> budget = {} )
 {
+    AnalysisWorkspaceReservation temporaryWorkspace(budget);
     std::vector<Window> result;
     const auto& frames = timeline.frames;
     if( frames.empty() || timeline.observationUnit != "frame" ) return result;
@@ -57,6 +61,10 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
     const auto scales = config.value( "window_sizes", std::vector<uint64_t> { 30, 60, 120 } );
     const auto check = [&] { if(cancelled && cancelled()) throw std::runtime_error("cancelled"); };
     check();
+    if(budget) {
+        if(frames.size()>(UINT64_MAX-4096)/32) throw std::runtime_error("analysis_workspace_budget");
+        temporaryWorkspace.Add(4096+32ull*frames.size()); // order-statistics arrays and growth
+    }
     WindowStatistics statistics(frames,budgetNs,cancelled,work);
     const auto frameOffset = [&](uint64_t index) { return size_t(std::lower_bound(frames.begin(),frames.end(),index,
         [](const auto& f,uint64_t i){return f.frameIndex<i;})-frames.begin()); };
@@ -73,6 +81,9 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
             double(statistics.Over()) / statistics.Count() < overRatio ) continue;
         const auto median = statistics.Median();
         if( median <= budgetNs ) continue;
+        // Four slots cover vector growth with old/new buffers alive together;
+        // the extra space covers the temporary and its one scale-set node.
+        if(budget) temporaryWorkspace.Add(4*sizeof(Window)+128);
         result.push_back( { begin, end, statistics.Mad(median) / median <= stableRatio, { length } } );
     }
     std::sort( result.begin(), result.end(), [&]( const auto& a, const auto& b ) {
@@ -101,7 +112,12 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
             merged.back().end = std::max( merged.back().end, window.end );
             merged.back().scales.insert( window.scales.begin(), window.scales.end() );
         }
-        else merged.push_back( window );
+        else {
+            // Reserve the destination vector growth and every possible scale
+            // node before copying; merged windows remain live after return.
+            if(retainedWorkspace) retainedWorkspace->Add(4*sizeof(Window)+128+64ull*scales.size());
+            merged.push_back( window );
+        }
     }
     return merged;
 }
@@ -127,9 +143,14 @@ struct TimelineState
 {
     std::map<std::string,PolicyFrameTimeline> timelines;
     std::map<std::string,std::vector<Window>> windows;
+    // Computed once per FrameSet; missing signature rows remain known zero.
+    std::map<std::string,std::vector<uint64_t>> validFrameIndices;
+    std::map<std::string,std::vector<uint64_t>> normalFrameIndices;
 };
 template<class Visit>
-TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
+TimelineState Prepare(const CandidatePolicyInput& input,Visit visit,
+    AnalysisWorkspaceReservation* retainedWorkspace = nullptr,
+    std::shared_ptr<AnalysisWorkspaceBudget> budget = {})
 {
     const auto& config=input.normalizedProfile.at("candidate_policy");
     const auto budgetNs=input.normalizedProfile.at("frame_budget").at("frame_ms").get<double>()*1e6;
@@ -149,7 +170,22 @@ TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
             if((++comparisons & 255)==0)check(); return a.frameIndex < b.frameIndex; } );
         for( size_t i = 1; i < t.frames.size(); ++i )
             if( t.frames[i].frameIndex == t.frames[i-1].frameIndex ) throw std::runtime_error( "duplicate_frame_timeline" );
-        windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled ) );
+        windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled, nullptr,
+            retainedWorkspace, budget ) );
+        if(t.observationUnit=="frame") {
+            auto& valid=state.validFrameIndices[scope];
+            auto& normal=state.normalFrameIndices[scope];
+            if(retainedWorkspace) {
+                if(t.frames.size()>(UINT64_MAX-2048)/16) throw std::runtime_error("analysis_workspace_budget");
+                retainedWorkspace->Add(2048+16ull*t.frames.size());
+            }
+            valid.reserve(t.frames.size());normal.reserve(t.frames.size());
+            for(const auto& frame:t.frames)
+                if(frame.exact) {
+                    valid.push_back(frame.frameIndex);
+                    if(frame.valueNs<=budgetNs)normal.push_back(frame.frameIndex);
+                }
+        }
     }
     return state;
 }
@@ -210,10 +246,23 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
     };
     if( input.cancelled && input.cancelled() ) throw std::runtime_error( "cancelled" );
     if( !c.frameSeriesComplete ) return {};
-    auto series = input.readFrameSeries ? input.readFrameSeries( c ) : c.frames;
+    const auto t = timelines.find( c.frameScope );
+    std::vector<PolicyFrameEvidence> loadedSeries;
+    const std::vector<PolicyFrameEvidence>* seriesView = nullptr;
+    // Frame roots describe the same complete sequence as the supplied
+    // Timeline. Borrow its already sorted copy instead of loading another
+    // whole-capture vector from the per-signature series store.
+    if( c.frameRoot && t != timelines.end() ) seriesView = &t->second.frames;
+    else
+    {
+        loadedSeries = input.readFrameSeries ? input.readFrameSeries( c ) : c.frames;
+        std::sort( loadedSeries.begin(), loadedSeries.end(), []( const auto& a, const auto& b ) {
+            return a.frameIndex < b.frameIndex; } );
+        seriesView = &loadedSeries;
+    }
+    const auto& series = *seriesView;
     if(checkSeries) checkSeries(series);
     if( series.empty() ) return {};
-    std::sort( series.begin(), series.end(), []( const auto& a, const auto& b ) { return a.frameIndex < b.frameIndex; } );
     for( size_t i = 1; i < series.size(); ++i )
         if( series[i].frameIndex == series[i-1].frameIndex ) throw std::runtime_error( "duplicate_signature_frame" );
     const auto at = [&]( uint64_t frame ) {
@@ -221,7 +270,6 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
             []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
         return it != series.end() && it->frameIndex == frame ? *it : PolicyFrameEvidence { frame, 0, {}, {}, true };
     };
-    const auto t = timelines.find( c.frameScope );
     if( c.frameRoot )
     {
         std::vector<PolicyFrameEvidence> bad;
@@ -254,40 +302,50 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
         acceptTop(TopKey{c.frameScope, c.threadOrQueue, c.metricPreference, target},
             TopItem{frame.valueNs, ci, frame.frameIndex, manifestation, evidence, c.signatureId});
     };
-    // Compute eligible reference points once per signature. lower_bound keeps
-    // nearest-distance selection (and the earlier-frame tie break) deterministic.
-    std::vector<PolicyFrameEvidence> normalFrames;
-    if(t != timelines.end() && c.observationUnit == "frame") for(const auto& frame:t->second.frames)
-    {
-        if(input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
-        if(!frame.exact || frame.valueNs>budgetNs)continue;
-        const auto value=at(frame.frameIndex); if(value.exact)normalFrames.push_back(value);
-    }
+    // The FrameSet's eligible indices are shared by all signatures. Resolve
+    // only the two nearest points for this series, skipping explicit unknowns;
+    // an absent series row is still an exact known zero via at().
+    const auto normal=state.normalFrameIndices.find(c.frameScope);
     const auto reference = [&](uint64_t begin,uint64_t end)->std::optional<PolicyFrameEvidence> {
-        auto after=std::upper_bound(normalFrames.begin(),normalFrames.end(),end,
-            [](uint64_t index,const auto& frame){return index<frame.frameIndex;});
-        auto before=std::lower_bound(normalFrames.begin(),normalFrames.end(),begin,
-            [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
-        if(before!=normalFrames.begin())
-        {
-            --before;
-            if(after==normalFrames.end() || begin-before->frameIndex<=after->frameIndex-end)return *before;
+        if(normal==state.normalFrameIndices.end() || c.observationUnit!="frame")return {};
+        const auto& indices=normal->second;
+        auto after=std::upper_bound(indices.begin(),indices.end(),end);
+        auto before=std::lower_bound(indices.begin(),indices.end(),begin);
+        std::optional<PolicyFrameEvidence> earlier,later;
+        size_t checked=0;
+        while(before!=indices.begin()) {
+            if((checked++&4095)==0 && input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
+            const auto value=at(*--before);
+            if(value.exact) {earlier=value;break;}
         }
-        if(after!=normalFrames.end())return *after;
-        return {};
+        while(after!=indices.end()) {
+            if((checked++&4095)==0 && input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
+            const auto value=at(*after++);
+            if(value.exact) {later=value;break;}
+        }
+        if(earlier && (!later || begin-earlier->frameIndex<=later->frameIndex-end))return earlier;
+        return later;
     };
     std::vector<PolicyFrameEvidence> qualified;
     std::set<std::string> reasons;
+    const auto* timelineFrames=t==timelines.end()?nullptr:&t->second.frames;
+    size_t timelinePosition=0;
     for( const auto& frame : series )
     {
         if(input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
         if( !frame.exact ) continue;
         bool problem = c.observationUnit == "l0_segment";
-        if( t != timelines.end() )
+        if(timelineFrames)
         {
-            const auto it = std::lower_bound( t->second.frames.begin(), t->second.frames.end(), frame.frameIndex,
-                []( const auto& f, uint64_t index ) { return f.frameIndex < index; } );
-            problem = problem || ( it != t->second.frames.end() && it->frameIndex == frame.frameIndex && it->exact && it->valueNs > budgetNs );
+            while(timelinePosition<timelineFrames->size() &&
+                (*timelineFrames)[timelinePosition].frameIndex<frame.frameIndex) {
+                if((timelinePosition&4095)==0 && input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
+                ++timelinePosition;
+            }
+            problem = problem || (timelinePosition<timelineFrames->size() &&
+                (*timelineFrames)[timelinePosition].frameIndex==frame.frameIndex &&
+                (*timelineFrames)[timelinePosition].exact &&
+                (*timelineFrames)[timelinePosition].valueNs>budgetNs);
         }
         if( problem ) top( "frame:" + std::to_string( frame.frameIndex ), "frame_cost", frame, {} );
         if( double( frame.valueNs ) >= absoluteNs ) { qualified.push_back( frame ); reasons.emplace( "absolute_frame_cost" ); }
@@ -322,10 +380,44 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
     if( t == timelines.end() ) return Collect(std::move(signals));
     for( const auto& window : windows.at( c.frameScope ) )
     {
+        // A missing series row is a known zero. If fewer than half of the
+        // valid FrameSet positions can be positive, the exact median cannot
+        // exceed zero; positive policy thresholds cannot emit this window.
+        // Inspect only explicit series rows rather than materializing every
+        // zero and sorting a large temporary vector.
+        const auto valid=state.validFrameIndices.find(c.frameScope);
+        if(valid!=state.validFrameIndices.end() && series.size()*2<t->second.frames.size() &&
+            minimumNs>0 && absoluteNs>0 && growthNs>=0 && growthRatio>=0) {
+            const auto begin=std::lower_bound(valid->second.begin(),valid->second.end(),window.begin);
+            const auto end=std::upper_bound(begin,valid->second.end(),window.end);
+            uint64_t count=uint64_t(end-begin),positive=0;
+            auto explicitRow=std::lower_bound(series.begin(),series.end(),window.begin,
+                [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
+            uint64_t checked=0;
+            for(;explicitRow!=series.end() && explicitRow->frameIndex<=window.end;++explicitRow) {
+                if((checked++&4095)==0 && input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
+                if(!std::binary_search(begin,end,explicitRow->frameIndex))continue;
+                if(!explicitRow->exact)--count;
+                else positive+=explicitRow->valueNs>0;
+            }
+            if(!count || double(count)/double(window.end-window.begin+1)<config.value("window_valid_ratio",0.8) ||
+                positive<count/2+count%2)continue;
+        }
         std::vector<PolicyFrameEvidence> values;
         std::vector<int64_t> costs;
-        for( const auto& frame : t->second.frames ) if( frame.frameIndex >= window.begin && frame.frameIndex <= window.end && frame.exact )
-        { auto v = at( frame.frameIndex ); if( v.exact ) { values.push_back( v ); costs.push_back( v.valueNs ); } }
+        const auto first=std::lower_bound(t->second.frames.begin(),t->second.frames.end(),window.begin,
+            [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
+        const auto last=std::upper_bound(first,t->second.frames.end(),window.end,
+            [](uint64_t index,const auto& frame){return index<frame.frameIndex;});
+        auto seriesIt=std::lower_bound(series.begin(),series.end(),window.begin,
+            [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
+        for(auto it=first;it!=last;++it) if(it->exact)
+        {
+            while(seriesIt!=series.end() && seriesIt->frameIndex<it->frameIndex)++seriesIt;
+            const auto v=seriesIt!=series.end() && seriesIt->frameIndex==it->frameIndex ?
+                *seriesIt : PolicyFrameEvidence{it->frameIndex,0,{},{},true};
+            if(v.exact) {values.push_back(v);costs.push_back(v.valueNs);}
+        }
         if( values.empty() || double( values.size() ) / double( window.end-window.begin+1 ) < config.value( "window_valid_ratio", 0.8 ) ) continue;
         const auto median = Median( costs );
         const auto peak = *std::max_element( values.begin(), values.end(), []( const auto& a, const auto& b ) { return a.valueNs < b.valueNs; } );

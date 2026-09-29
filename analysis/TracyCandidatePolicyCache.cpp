@@ -1,9 +1,12 @@
 #include "TracyCandidatePolicyCache.hpp"
 #include "TracyCandidatePolicyInternal.hpp"
+#include "TracyCandidatePolicyTopRecord.hpp"
 #include "TracyFrameWindowPolicy.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include "TracyAnalysisCacheKey.hpp"
 #include <algorithm>
+#include <chrono>
+#include <iostream>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -155,6 +158,24 @@ NeutralRankingEntry Entry(const json& j)
     e.cumulativeContribution=std::stod(j.at("cumulative_contribution").get<std::string>());
     return e;
 }
+uint64_t FrameStorageBytes(const std::vector<PolicyFrameEvidence>& frames)
+{
+    const auto add=[&](uint64_t& bytes,uint64_t count,uint64_t width) {
+        if(width && count>(UINT64_MAX-bytes)/width) Fail("frame_workspace_budget");
+        bytes+=count*width;
+    };
+    uint64_t bytes=0;
+    add(bytes,frames.capacity(),sizeof(PolicyFrameEvidence));
+    for(const auto& f:frames) {
+        // The PolicyFrameEvidence object already contains the vector/string
+        // control blocks. Capacities cover only their separately allocated
+        // storage; counting SSO capacity as well is deliberately conservative.
+        add(bytes,f.structureKey.capacity(),1);
+        add(bytes,f.eventRefs.capacity(),sizeof(std::string));
+        for(const auto& ref:f.eventRefs) add(bytes,ref.capacity(),1);
+    }
+    return bytes;
+}
 uint64_t FrameBytes(const std::vector<PolicyFrameEvidence>& frames)
 {
     uint64_t bytes=frames.size()*256;
@@ -212,7 +233,15 @@ struct Builder
         Check(options);
         if(!input.signatures.empty() || !input.aggregate.signatures.empty() || !input.aggregate.rankings.empty()) Fail("materialized_input");
         if(options.familyBytes<1024 || options.familyBytes>64*1024*1024) Fail("family_budget");
-        if(options.frameWorkspaceBytes<4096 || options.frameWorkspaceBytes>512*1024*1024) Fail("frame_workspace_budget");
+        // The shared workspace limits actual retained copies. Without a
+        // workspace owner, keep the conservative stand-alone ceiling.
+        // Small injected workspaces must reach their actual allocation gate;
+        // the frame admission ceiling cannot preempt those fault tests.
+        const auto sharedFrameLimit=options.table.workspace ?
+            std::max<uint64_t>(512ull*1024*1024,options.table.workspace->Snapshot().maximumBytes) :
+            512ull*1024*1024;
+        if(options.frameWorkspaceBytes<4096 || options.frameWorkspaceBytes>sharedFrameLimit)
+            Fail("frame_workspace_budget");
         if(input.normalizedProfile.dump().size()>options.table.manifestBytes/4) Fail("profile_budget");
         std::string error; if(!candidate_policy::ValidateInput(input,error)) throw std::runtime_error(error);
         if(input.aggregateIdentity!=neutral.Identity()) Fail("neutral_identity_mismatch");
@@ -259,14 +288,21 @@ struct Builder
     }
     void PrepareLocals()
     {
+        auto subphaseStarted=std::chrono::steady_clock::now();
+        const auto reportSubphase=[&](const char* stage) {
+            const auto now=std::chrono::steady_clock::now();
+            std::cerr<<"Query policy-local stage="<<stage<<" duration_ms="<<
+                std::chrono::duration_cast<std::chrono::milliseconds>(now-subphaseStarted).count()<<'\n';
+            subphaseStarted=now;
+        };
         AnalysisWorkspaceReservation timelineWorkspace(options.table.workspace),rootsWorkspace(options.table.workspace);
         uint64_t timelineBytes=0;
         std::set<std::string> supplied;
         for(const auto& t:input.frameTimelines) {
             timelineWorkspace.Add(2048+8ull*(t.frameScope.size()+t.name.size()+t.observationUnit.size()));
-            supplied.insert(t.frameScope); timelineBytes+=FrameBytes(t.frames);
+            supplied.insert(t.frameScope); timelineBytes+=FrameStorageBytes(t.frames);
         }
-        if(timelineBytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
+        if(timelineBytes>options.frameWorkspaceBytes/2) Fail("frame_workspace_budget");
         std::map<std::string,PolicySignatureContext> roots;
         const auto count=VisitContexts([&](const PolicySignatureContext& c) {
             contextOrder->Append(Unsigned(*c.sourceOrdinal),SignatureKey(c));
@@ -275,7 +311,7 @@ struct Builder
             if(it!=roots.end() && *it->second.sourceOrdinal<*c.sourceOrdinal) return;
             const auto bytes=FrameBytes(c.frames);
             if(it!=roots.end()) timelineBytes-=FrameBytes(it->second.frames);
-            if(bytes>options.frameWorkspaceBytes/4-timelineBytes) Fail("frame_workspace_budget");
+            if(bytes>options.frameWorkspaceBytes/2-timelineBytes) Fail("frame_workspace_budget");
             const auto previous=it==roots.end()?0:ContextBytes(it->second);
             const auto next=ContextBytes(c);
             rootsWorkspace.Add(next); // Old and replacement coexist during the copy.
@@ -287,24 +323,33 @@ struct Builder
         { auto order=Reader("context-order");
           if(order.RecordCount()!=count) Fail("context_order_count");
           for(uint64_t i=0;i<count;++i) if(order.GetAt(i).key!=Unsigned(i)) Fail("context_order_gap"); }
+        reportSubphase("context-order");
         const auto& config=input.normalizedProfile.at("candidate_policy");
         const auto topN=config.value("local_top_n",uint64_t(5));
         if(topN>1000) Fail("local_top_budget");
         const auto scales=config.value("window_sizes",std::vector<uint64_t>{30,60,120});
-        if(scales.size()>64 || timelineBytes>options.frameWorkspaceBytes/(4+scales.size())) Fail("frame_workspace_budget");
-        // Covers the copied timelines, window vectors/set nodes, their growth
-        // peaks, and median/MAD arrays. Charge before Prepare creates them.
+        if(scales.size()>64 || timelineBytes>options.frameWorkspaceBytes/2) Fail("frame_workspace_budget");
+        // Charge copied timelines before Prepare. Window statistics, actual
+        // window growth and retained index vectors reserve separately there.
         for(const auto& [_,c]:roots)
+        {
             timelineWorkspace.Add(2048+8ull*(c.frameScope.size()+c.name.size()+c.observationUnit.size()));
-        timelineWorkspace.Add(2*timelineBytes*(4+scales.size()));
-        const auto state=frame_window::Prepare(input,[&](const auto& visit){for(const auto& [_,c]:roots) visit(c);});
+        }
+        if(timelineBytes>UINT64_MAX/2) Fail("frame_workspace_budget");
+        timelineWorkspace.Add(2*timelineBytes);
+        const auto state=frame_window::Prepare(input,
+            [&](const auto& visit){for(const auto& [_,c]:roots) visit(c);},
+            &timelineWorkspace,options.table.workspace);
         roots.clear(); rootsWorkspace.Resize(0);
+        reportSubphase("frame-prepare");
         auto topInput=Sorter("local-top-input"),observations=Sorter("local-observations");
         VisitContexts([&](const PolicySignatureContext& c) {
             if(FrameBytes(c.frames)>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
             const auto key=SignatureKey(c);
             AnalysisWorkspaceReservation seriesWorkspace(options.table.workspace);
-            if(c.frameSeriesComplete) {
+            const auto timeline=state.timelines.find(c.frameScope);
+            const bool borrowedRoot=c.frameRoot && timeline!=state.timelines.end();
+            if(c.frameSeriesComplete && !borrowedRoot) {
                 // The native extent has a known row count, so reject before
                 // ReadPolicyFrameSeries allocates. Opaque callbacks are checked
                 // immediately on return, before the policy makes any copies.
@@ -317,10 +362,9 @@ struct Builder
                 [&](const frame_window::TopKey& group,frame_window::TopItem item) {
                     Check(options); item.sourceKey=key;
                     const auto groupKey=Field(std::get<0>(group))+Field(std::get<1>(group))+Field(std::get<2>(group))+Field(std::get<3>(group));
-                    auto payload=TopJson(item); payload["group"]=Hex(groupKey);
-                    topInput->Append(groupKey+Unsigned(item.context),payload.dump());
+                    topInput->Append(groupKey+Unsigned(item.context),candidate_policy::top_record::Encode(item));
                 },[&](const std::vector<PolicyFrameEvidence>& series) {
-                    const auto bytes=FrameBytes(series);
+                    const auto bytes=borrowedRoot?FrameStorageBytes(series):FrameBytes(series);
                     if(bytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
                     uint64_t largest=256;
                     for(const auto& frame:series) {
@@ -328,12 +372,16 @@ struct Builder
                         for(const auto& ref:frame.eventRefs) current+=64+2ull*ref.size();
                         largest=std::max(largest,current);
                     }
-                    // Qualified/typical/window copies, ranges/quantile arrays,
-                    // and returned Signal JSON stay covered through spooling.
-                    seriesWorkspace.Resize(8192+32*bytes+16ull*key.size());
-                    const auto timeline=state.timelines.find(c.frameScope);
-                    if(timeline!=state.timelines.end()) {
-                        seriesWorkspace.Add(4*FrameBytes(timeline->second.frames));
+                    // FrameBytes conservatively prices each series row at
+                    // 256 B plus owned strings. The loaded series, qualified
+                    // and typical copies, sparse references, range JSON and
+                    // emitted signals fit in eight such row sets. Window
+                    // vectors are charged separately against the Timeline.
+                    const auto copies=c.frameRoot?4ull:8ull;
+                    if(bytes>(UINT64_MAX-8192-16ull*key.size())/copies) Fail("frame_workspace_budget");
+                    seriesWorkspace.Resize(8192+copies*bytes+16ull*key.size());
+                    if(timeline!=state.timelines.end() && !borrowedRoot) {
+                        seriesWorkspace.Add(4*FrameStorageBytes(timeline->second.frames));
                         const auto windows=state.windows.at(c.frameScope).size();
                         const auto perWindow=8192+64*largest;
                         if(windows>UINT64_MAX/perWindow) Fail("frame_workspace_budget");
@@ -347,6 +395,7 @@ struct Builder
             }
         });
         topInput->Commit(); topInput.reset();
+        reportSubphase("context-scan");
         {
             auto inputTop=Reader("local-top-input"); std::string group;
             const auto slotBytes=2ull*sizeof(frame_window::TopItem)*(topN+1);
@@ -368,12 +417,14 @@ struct Builder
             {
                 Check(options); const auto record=inputTop.GetAt(i);
                 AnalysisWorkspaceReservation decodingWorkspace(options.table.workspace,65536+32ull*record.payload.size());
-                const auto row=json::parse(record.payload);
-                const auto nextGroup=Unhex(row.at("group").get<std::string>());
+                if(record.key.size()<8) Fail("top_input_key");
+                const auto nextGroup=record.key.substr(0,record.key.size()-8);
                 if(nextGroup!=group) { flush(); group=nextGroup; }
                 // Replay original context order through the very same bounded
                 // reservoir, including equivalent-comparator insertion behavior.
-                auto item=ParseTop(row);
+                auto item=candidate_policy::top_record::Decode(record.payload);
+                if(record.key.compare(record.key.size()-8,8,Unsigned(item.context))!=0)
+                    Fail("top_input_context");
                 item.workspaceBytes=4096+4ull*(item.manifestation.size()+item.signature.size()+item.sourceKey.size())+
                     32ull*item.evidence.dump().size();
                 entriesWorkspace.Add(item.workspaceBytes);
@@ -385,6 +436,7 @@ struct Builder
             flush();
         }
         observations->Commit(); observations.reset();
+        reportSubphase("local-top");
         {
             auto observationsReader=Reader("local-observations"); auto output=Sorter("local-signals");
             AnalysisWorkspaceReservation keysWorkspace(options.table.workspace),signalWorkspace(options.table.workspace);
@@ -434,6 +486,7 @@ struct Builder
             }
             flush(); output->Commit();
         }
+        reportSubphase("signals");
     }
     void PrepareRankings()
     {
@@ -640,7 +693,19 @@ std::string BuildCandidatePolicyCache(const std::filesystem::path& root,NeutralS
     const CandidatePolicyInput& metadata,CandidatePolicyCacheOptions options)
 {
     Builder builder(root,neutral,metadata,std::move(options));
-    builder.PrepareLocals(); builder.PrepareRankings(); builder.Join(); builder.Reduce(); builder.Publish(); return builder.identity;
+    const auto phase=[&](const char* name,auto&& action)
+    {
+        const auto start=std::chrono::steady_clock::now();
+        action();
+        const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+        std::cerr<<"Query policy-phase stage="<<name<<" duration_ms="<<elapsed<<'\n';
+    };
+    phase("prepare-locals",[&]{builder.PrepareLocals();});
+    phase("prepare-rankings",[&]{builder.PrepareRankings();});
+    phase("join",[&]{builder.Join();});
+    phase("reduce",[&]{builder.Reduce();});
+    phase("publish",[&]{builder.Publish();});
+    return builder.identity;
 }
 struct CandidatePolicyCacheReader::Impl
 {

@@ -1,8 +1,13 @@
 #include "TracyCandidatePolicyCache.hpp"
 #include "TracyHash.hpp"
+#include "TracyPolicyFrameSeries.hpp"
+#include "TracyFrameWindowPolicy.hpp"
+#include "TracyCandidatePolicyTopRecord.hpp"
 #include <chrono>
+#include <cctype>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 using namespace tracy::analysis;
 using nlohmann::json;
@@ -17,6 +22,27 @@ template<class Action> void Reject(Action action,const char* expected)
     throw std::runtime_error(std::string("expected rejection: ")+expected);
 }
 std::string Sha(const json& j) { const auto s=j.dump(); Sha256Builder h; h.Update(s.data(),s.size()); return h.FinalHex(); }
+void TopInputBinaryRoundTrip()
+{
+    frame_window::TopItem original{123456,17,42,std::string("frame\0cost",10),
+        json{{"nested",json::array({1,"two"})}},std::string("sig\xff",4)};
+    original.sourceKey=std::string("scope\0\xff",7);
+    const auto bytes=candidate_policy::top_record::Encode(original);
+    const auto restored=candidate_policy::top_record::Decode(bytes);
+    Require(restored.cost==original.cost && restored.context==original.context &&
+        restored.frame==original.frame && restored.manifestation==original.manifestation &&
+        restored.evidence==original.evidence && restored.signature==original.signature &&
+        restored.sourceKey==original.sourceKey,"binary Top input changed identity or evidence");
+    auto truncated=bytes;truncated.pop_back();
+    Reject([&]{(void)candidate_policy::top_record::Decode(truncated);},"candidate_policy_top_input_format");
+    frame_window::TopItem empty{-7,0,UINT64_MAX,"",json::object(),""};
+    empty.sourceKey=std::string("\0",1);
+    const auto emptyRestored=candidate_policy::top_record::Decode(candidate_policy::top_record::Encode(empty));
+    Require(emptyRestored.cost==empty.cost && emptyRestored.context==0 &&
+        emptyRestored.frame==empty.frame && emptyRestored.evidence==json::object() &&
+        emptyRestored.sourceKey==empty.sourceKey,"empty or signed Top input changed");
+    Reject([&]{(void)candidate_policy::top_record::Decode(bytes+"extra");},"candidate_policy_top_input_format");
+}
 CandidatePolicyInput Fixture(const std::filesystem::path& root, bool local=false)
 {
     CandidatePolicyInput input; input.aggregateIdentity=Identity;
@@ -139,7 +165,33 @@ void CachedParity(const std::filesystem::path& root, bool local=false, bool fall
     auto metadata=input; metadata.aggregate.signatures.clear(); metadata.aggregate.rankings.clear(); metadata.signatures.clear();
     NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
     CandidatePolicyCacheOptions options; options.table.blockBytes=16384; options.sortBufferBytes=32768;
-    const auto policyId=BuildCandidatePolicyCache(root/"policy",neutral,metadata,options);
+    std::ostringstream phaseLog;
+    const auto oldError=std::cerr.rdbuf(phaseLog.rdbuf());
+    std::string policyId;
+    try { policyId=BuildCandidatePolicyCache(root/"policy",neutral,metadata,options); }
+    catch(...) { std::cerr.rdbuf(oldError); throw; }
+    std::cerr.rdbuf(oldError);
+    const auto log=phaseLog.str();
+    size_t previous=0;
+    for(const auto* stage:{"context-order","frame-prepare","context-scan","local-top","signals"})
+    {
+        const auto marker=std::string("Query policy-local stage=")+stage+" duration_ms=";
+        const auto found=log.find(marker,previous);
+        Require(found!=std::string::npos,"policy local timing missing or out of order");
+        previous=found+marker.size();
+        Require(previous<log.size() && std::isdigit(static_cast<unsigned char>(log[previous])),
+            "policy local duration is not numeric");
+    }
+    previous=0;
+    for(const auto* stage:{"prepare-locals","prepare-rankings","join","reduce","publish"})
+    {
+        const auto marker=std::string("Query policy-phase stage=")+stage+" duration_ms=";
+        const auto found=log.find(marker,previous);
+        Require(found!=std::string::npos,"policy phase timing missing or out of order");
+        const auto start=found+marker.size();
+        Require(start<log.size() && std::isdigit(static_cast<unsigned char>(log[start])),"policy phase duration is not numeric");
+        previous=start+1;
+    }
     Require(policyId==oracle.policyIdentity,"policy identity unchanged");
     CandidatePolicyCacheReader cache(root/"policy",policyId,options);
     json candidates=json::array(),rankings=json::array();
@@ -240,6 +292,104 @@ void SharedTimelineWorkspace(const std::filesystem::path& root)
     Require(options.table.workspace->Snapshot().currentBytes==0,"finished Timeline state returns its workspace");
     CandidatePolicyCacheReader result(root/"small",id,options);
     Require(!result.Candidates(0,1,65536).records.empty(),"bounded Timeline preserves candidate availability");
+}
+
+void LargeFrameTimeline(const std::filesystem::path& root)
+{
+    constexpr uint64_t FrameCount=300'000;
+    CandidatePolicyInput input; input.aggregateIdentity=Identity;
+    input.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},{"module_budgets",json::array()},
+        {"resource_budgets",json::object()},{"user_focus",json::array()},
+        {"candidate_policy",{{"top_n",1},{"local_top_n",1},{"cumulative_contribution",0.8},
+            {"per_domain_limit",10},{"absolute_frame_cost_ms",10.0},{"priorities",{"P0","P1","P2","P3","P4"}}}}};
+    input.profileIdentity=Sha(input.normalizedProfile);
+    PolicySignatureContext rootContext; rootContext.domain="cpu"; rootContext.signatureId="frame-root";
+    rootContext.frameScope="Player"; rootContext.name="Player"; rootContext.frameRoot=true;
+    rootContext.frameSeriesComplete=true; rootContext.seriesCount=FrameCount; rootContext.sourceOrdinal=0;
+    input.signatures.push_back(rootContext);
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    timeline.frames.reserve(FrameCount);
+    const std::string frameReference(128,'r');
+    for(uint64_t frame=0;frame<FrameCount;++frame)
+        timeline.frames.push_back({frame,frame==FrameCount/2?20'000'000:12'000'000,{frameReference},"",true});
+    input.frameTimelines.push_back(std::move(timeline));
+    NeutralStatisticsStreamSummary summary; summary.qualityComplete=true;
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.blockBytes=65536;
+    { NeutralStatisticsCacheWriter writer(root/"neutral",Identity,neutralOptions);
+      writer.AppendContext(SerializePolicySignatureContextRecord(rootContext)); writer.Commit(summary); }
+    NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
+    input.signatures.clear(); input.aggregate.qualityComplete=true;
+    input.aggregate.contentSha256=neutral.ContentSha256(); uint64_t seriesReads=0;
+    input.readFrameSeries=[&](const auto&){++seriesReads; throw std::runtime_error("duplicate_root_series_read");
+        return std::vector<PolicyFrameEvidence>{};};
+    CandidatePolicyCacheOptions options; options.table.blockBytes=65536; options.sortBufferBytes=262144;
+    options.frameWorkspaceBytes=1024ull*1024*1024;
+    options.table.workspace=std::make_shared<AnalysisWorkspaceBudget>();
+    const auto identity=BuildCandidatePolicyCache(root/"policy",neutral,input,options);
+    Require(seriesReads==0,"a supplied Frame Root Timeline must not load a duplicate full series");
+    CandidatePolicyCacheReader result(root/"policy",identity,options);
+    Require(!result.Candidates(0,10,1024*1024).records.empty(),"large Frame Timeline preserves root policy findings");
+    Require(options.table.workspace->Snapshot().peakBytes<=4ull*1024*1024*1024,
+        "large Frame Timeline exceeded the shared workspace contract");
+}
+void SparseTimelineWithConcurrentWorkspace(const std::filesystem::path& root)
+{
+    auto input=Fixture(root);
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.blockBytes=16384;
+    WriteNeutral(root/"neutral",input,neutralOptions);
+    NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
+    input.signatures.clear(); input.aggregate.signatures.clear(); input.aggregate.rankings.clear();
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    timeline.frames.reserve(512);
+    for(uint64_t i=0;i<512;++i)
+        timeline.frames.push_back({i,1,{},std::string(8192,'x'),true});
+    input.frameTimelines.push_back(std::move(timeline));
+    CandidatePolicyCacheOptions options;
+    options.table.blockBytes=16384; options.table.manifestBytes=65536;
+    // The Frame data fits two copies in 16 MiB, even though seven speculative
+    // copies (the old scale-based gate) would reject it.
+    options.sortBufferBytes=32768; options.frameWorkspaceBytes=16*1024*1024;
+    options.table.workspace=std::make_shared<AnalysisWorkspaceBudget>(96*1024*1024,48*1024*1024);
+    AnalysisWorkspaceReservation concurrent(options.table.workspace,50*1024*1024);
+    const auto policyId=BuildCandidatePolicyCache(root/"policy",neutral,input,options);
+    Require(options.table.workspace->Snapshot().peakBytes<=96*1024*1024,
+        "sparse Timeline policy exceeded the shared workspace cap");
+    {
+        CandidatePolicyCacheReader result(root/"policy",policyId,options);
+        Require(!result.Candidates(0,1,65536).records.empty(),
+            "sparse Timeline with concurrent workspace retains policy output");
+    }
+    concurrent.Resize(0);
+    Require(options.table.workspace->Snapshot().currentBytes==0,
+        "sparse Timeline releases its shared workspace reservations");
+}
+void WindowGrowthChargesSharedBudget()
+{
+    PolicyFrameTimeline timeline; timeline.frameScope="dense"; timeline.name="dense";
+    for(uint64_t i=0;i<256;++i) timeline.frames.push_back({i,20'000'000,{},"",true});
+    const json config={{"window_sizes",{1}}, {"window_valid_ratio",0.8},
+        {"window_over_budget_ratio",0.8}, {"window_stable_mad_ratio",0.1}};
+    const auto expected=frame_window::Windows(timeline,config,16'666'667);
+    Require(expected.size()==256,"dense single-frame windows remain distinct");
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(64*1024,32*1024);
+    {
+        AnalysisWorkspaceReservation retained(workspace);
+        Reject([&]{frame_window::Windows(timeline,config,16'666'667,{},nullptr,&retained,workspace);},
+            "workspace_budget");
+    }
+    Require(workspace->Snapshot().rejectedReservations>0 && workspace->Snapshot().currentBytes==0,
+        "dense window growth rejects before unaccounted allocation and releases reservations");
+    workspace=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+    {
+        AnalysisWorkspaceReservation retained(workspace);
+        const auto actual=frame_window::Windows(timeline,config,16'666'667,{},nullptr,&retained,workspace);
+        Require(actual.size()==expected.size(),"window accounting preserves results");
+        for(size_t i=0;i<actual.size();++i)
+            Require(actual[i].begin==expected[i].begin && actual[i].end==expected[i].end &&
+                actual[i].stable==expected[i].stable && actual[i].scales==expected[i].scales,
+                "window accounting preserves every interval and scale");
+    }
+    Require(workspace->Snapshot().currentBytes==0,"dense window accounting releases all reservations");
 }
 void SharedContextDecodeWorkspace(const std::filesystem::path& root)
 {
@@ -635,8 +785,17 @@ void Scale(const std::filesystem::path& root,uint64_t count)
 {
     Require(count>0 && count<=2000000,"scale count range");
     const auto start=std::chrono::steady_clock::now(); NeutralStatisticsStreamSummary summary;
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(256ull<<20,128ull<<20);
+    auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+    AnalysisDiskActivity activity(usage);
+    auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage; disk->maximumBytes=512ull<<20;
+    const auto cancelled=[&]{return std::chrono::steady_clock::now()-start>std::chrono::seconds(120);};
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.workspace=workspace;
+    neutralOptions.table.disk=disk; neutralOptions.table.cancelled=cancelled;
+    CandidatePolicyCacheOptions policyOptions; policyOptions.table=neutralOptions.table;
     {
-        NeutralStatisticsStreamBuilder source(root/"runs"); NeutralStatisticsCacheWriter cache(root/"neutral",Identity);
+        NeutralStatisticsStreamBuilder source(root/"runs",65536,65536,workspace,disk);
+        NeutralStatisticsCacheWriter cache(root/"neutral",Identity,neutralOptions);
         for(uint64_t i=0;i<count;++i)
         {
             const auto id=ScaleId(i); const int64_t value=1'000'000+(i%97)*10000;
@@ -652,7 +811,7 @@ void Scale(const std::filesystem::path& root,uint64_t count)
             c.metricPreference="inclusive"; c.sourceOrdinal=ScaleIndex(c.signatureId,count); c.frameSeriesComplete=true;
             c.frames={{0,frames[0].inclusiveNs,{"event:"+c.signatureId},"structure",true}};
             cache.AppendContext(SerializePolicySignatureContextRecord(c));
-        });
+        },cancelled);
         Require(ok,error.c_str()); Require(summary.materializedResultPeak==0,"scale statistics streamed without retaining result vector");
         std::cerr<<"scale statistics emitted; building neutral rankings\n"; cache.Commit(summary);
     }
@@ -669,17 +828,17 @@ void Scale(const std::filesystem::path& root,uint64_t count)
     metadata.frameTimelines.push_back(timeline);
     std::string identity;
     {
-        NeutralStatisticsCacheReader neutral(root/"neutral",Identity);
+        NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
         metadata.aggregate.contentSha256=neutral.ContentSha256();
         std::cerr<<"scale neutral cache ready; building global/local candidate cache\n";
-        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata);
+        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata,policyOptions);
     }
     const auto policyBuilt=std::chrono::steady_clock::now();
     std::cerr<<"scale candidate cache published; reopening and verifying every candidate/ranking\n";
     uint64_t candidateCount=0,rankedCount=0,globalSelected=0,localSelected=0;
     json cacheSummary;
     {
-        CandidatePolicyCacheReader cache(root/"policy",identity);
+        CandidatePolicyCacheReader cache(root/"policy",identity,policyOptions);
         cacheSummary=json::parse(cache.SummaryJson());
         // Verification only: <=2 MB even at the maximum synthetic count.
         std::vector<uint8_t> seen(size_t(count),0);
@@ -746,17 +905,107 @@ void Scale(const std::filesystem::path& root,uint64_t count)
         {"neutral_build_ms",ms(start,neutralBuilt)},{"policy_build_ms",ms(neutralBuilt,policyBuilt)},{"reopen_verify_ms",ms(policyBuilt,end)},
         {"neutral_cache_bytes",DirectoryBytes(root/"neutral")},{"policy_cache_bytes",DirectoryBytes(root/"policy")},
         {"materialized_statistics_peak",summary.materializedResultPeak},{"retained_final_candidate_peak",cacheSummary.at("retained_final_candidate_peak")},
-        {"global_selected",globalSelected},{"local_selected",localSelected},{"verified",true}}.dump()<<'\n';
+        {"global_selected",globalSelected},{"local_selected",localSelected},{"verified",true},
+        {"workspace_peak_bytes",workspace->Snapshot().peakBytes},{"disk_peak_bytes",usage->Snapshot().peakBytes}}.dump()<<'\n';
+}
+
+void DenseSeriesScale(const std::filesystem::path& root)
+{
+    constexpr uint64_t Signatures=32, Frames=4096;
+    const auto started=std::chrono::steady_clock::now();
+    const auto cancelled=[&]{return std::chrono::steady_clock::now()-started>std::chrono::seconds(120);};
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(256ull<<20,128ull<<20);
+    auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+    AnalysisDiskActivity activity(usage);
+    auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage; disk->maximumBytes=512ull<<20;
+    NeutralStatisticsCacheOptions options; options.table.workspace=workspace;
+    options.table.disk=disk; options.table.cancelled=cancelled;
+    PagedRecordOptions seriesOptions; seriesOptions.workspace=workspace;
+    seriesOptions.disk=disk; seriesOptions.cancelled=cancelled;
+    NeutralStatisticsStreamSummary summary;
+    {
+        NeutralStatisticsStreamBuilder builder(root/"runs",1024,65536,workspace,disk);
+        NeutralStatisticsCacheWriter cache(root/"neutral",Identity,options);
+        PagedRecordWriter series(root/"series",Identity,sizeof(PolicySeriesRecord),seriesOptions);
+        for(uint64_t i=0;i<Signatures;++i) {
+            const auto id=ScaleId(i); builder.AddDenominator({"cpu",id,"Player",Frames});
+            for(uint64_t f=0;f<Frames;++f) Require(builder.AddRun({"cpu",id,"Player",f,
+                int64_t(1'000'000+i),int64_t(500'000+i),0,0,1,true,false}),"dense raw input");
+        }
+        builder.AddDomainAudit({"cpu",true,"complete",Signatures*Frames,Signatures*Frames,Signatures,Identity,Identity,true,{}});
+        std::string error;
+        const auto ok=builder.FinishToSink(summary,error,[&](const auto& stat,const auto& frames) {
+            const auto i=ScaleIndex(stat.signatureId,Signatures);
+            Require(frames.size()==Frames && stat.inclusive.perCompleteFrame.count==Frames &&
+                stat.inclusive.perCompleteFrame.median==double(1'000'000+i) &&
+                stat.inclusive.perCompleteFrame.mad==0 &&
+                stat.exclusive.perCompleteFrame.total==int64_t(Frames*(500'000+i)),"dense independent constant-distribution oracle");
+            cache.AppendStatistics(stat);
+            PolicySignatureContext context; context.domain="cpu"; context.signatureId=stat.signatureId;
+            context.frameScope="Player"; context.name="Dense"; context.path="Player/"+stat.signatureId;
+            context.threadOrQueue="thread:1"; context.sourceOrdinal=i; context.metricPreference="exclusive";
+            WritePolicyFrameSeries(series,context,frames);
+            cache.AppendContext(SerializePolicySignatureContextRecord(context));
+        },cancelled);
+        Require(ok,error.c_str()); Require(summary.qualityComplete,"dense reduce quality");
+        series.Commit(); cache.Commit(summary);
+    }
+    const auto reduced=std::chrono::steady_clock::now();
+    CandidatePolicyInput metadata; metadata.aggregateIdentity=Identity; metadata.aggregate.qualityComplete=true;
+    metadata.aggregate.domains=summary.domains;
+    metadata.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},{"module_budgets",json::array()},
+        {"resource_budgets",json::object()},{"user_focus",json::array()},
+        {"candidate_policy",{{"top_n",5},{"cumulative_contribution",0.8},{"per_domain_limit",50},
+            {"priorities",{"P0","P1","P2","P3","P4"}}}}};
+    metadata.profileIdentity=Sha(metadata.normalizedProfile);
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    AnalysisWorkspaceReservation timelineBudget(workspace,Frames*4ull*sizeof(PolicyFrameEvidence));
+    for(uint64_t f=0;f<Frames;++f) timeline.frames.push_back({f,20'000'000,{},"",true});
+    metadata.frameTimelines.push_back(std::move(timeline));
+    uint64_t seriesReads=0;
+    metadata.readFrameSeries=[&](const auto& context) {
+        auto frames=ReadPolicyFrameSeries(root/"series",context,32ull<<20,cancelled,Identity);
+        Require(frames.size()==Frames && frames.front().frameIndex==0 && frames.back().frameIndex==Frames-1,"dense series complete extent");
+        seriesReads+=frames.size(); return frames;
+    };
+    CandidatePolicyCacheOptions policyOptions; policyOptions.table=options.table;
+    std::string identity;
+    {
+        NeutralStatisticsCacheReader neutral(root/"neutral",Identity,options);
+        metadata.aggregate.contentSha256=neutral.ContentSha256();
+        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata,policyOptions);
+    }
+    const auto policyBuilt=std::chrono::steady_clock::now();
+    uint64_t candidates=0,ranks=0;
+    {
+        CandidatePolicyCacheReader reader(root/"policy",identity,policyOptions);
+        for(uint64_t ordinal=0;;) {const auto page=reader.Candidates(ordinal,7,1<<20);
+            for(const auto& row:page.records) {const auto c=json::parse(row.payload);
+                Require(reader.Candidate(c.at("candidate_id").get<std::string>())->payload==row.payload,"dense point lookup"); ++candidates;}
+            ordinal=page.nextOrdinal; Require(ordinal==candidates,"dense candidate pagination"); if(page.done)break;}
+        for(uint64_t ordinal=0;;) {const auto page=reader.RankedSignatures(ordinal,7,1<<20);
+            ranks+=page.records.size(); ordinal=page.nextOrdinal; Require(ordinal==ranks,"dense rank pagination"); if(page.done)break;}
+        Require(ranks==Signatures*3 && candidates>=Signatures && seriesReads>=Signatures*Frames,"dense complete rankings and frame-series consumption");
+    }
+    const auto ms=[](auto a,auto b){return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count();};
+    std::cout<<json{{"mode","dense-series"},{"signatures",Signatures},{"frames_per_signature",Frames},
+        {"reduce_cache_ms",ms(started,reduced)},{"policy_ms",ms(reduced,policyBuilt)},
+        {"reopen_verify_ms",ms(policyBuilt,std::chrono::steady_clock::now())},{"series_rows_read",seriesReads},
+        {"candidates",candidates},{"ranks",ranks},{"disk_final_bytes",DirectoryBytes(root)},
+        {"disk_peak_bytes",usage->Snapshot().peakBytes},{"workspace_peak_bytes",workspace->Snapshot().peakBytes},
+        {"verified",true}}.dump()<<'\n';
 }
 }
 int main(int argc,char** argv)
 {
     const auto root=std::filesystem::temp_directory_path()/("jn-policy-cache-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
+        if(argc==2 && std::string(argv[1])=="--scale-dense-series") { DenseSeriesScale(root); std::filesystem::remove_all(root); return 0; }
         if(argc==3 && std::string(argv[1])=="--scale-policy") { Scale(root,std::stoull(argv[2])); std::filesystem::remove_all(root); return 0; }
+        TopInputBinaryRoundTrip();
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
         CandidateJoinWorkspace(root/"candidate-join");
-        LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
+        WindowGrowthChargesSharedBudget(); LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); LargeFrameTimeline(root/"large-timeline"); SparseTimelineWithConcurrentWorkspace(root/"sparse-concurrent"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\nfixture: "<<root<<'\n'; return 1; }
 }

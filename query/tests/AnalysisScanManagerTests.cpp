@@ -1,5 +1,6 @@
 #include "TracyAnalysisScanManager.hpp"
 #include "TracyAnalysisScanCache.hpp"
+#include "TracyAnalysisIoPath.hpp"
 #include "TracyAnalysisProfile.hpp"
 #include "TracyBoundedScanCursor.hpp"
 #include "TracyExactStatistics.hpp"
@@ -259,13 +260,17 @@ class SourceDegradedTrace final : public tracy::query::test::FakeTraceSource,
 {
 public:
     bool nestedCpu = false;
+    std::string storageIdentity="fixture-generation-1";
+    std::string GetScanStorageIdentity() const {return storageIdentity;}
     bool unknownCpu = false;
     bool wideNames = false;
     size_t wideSignatureCount = 0;
     bool compactScaleNames = false;
+    bool dynamicCpuNames = false;
     int gpuFrameScopeProbe = 0;
     bool gpuProbeLongCosts = false;
     size_t wideGpuSignatureCount = 0;
+    size_t syntheticFrameCount = 0;
     bool wideCorrelatedPayload = false;
     std::function<void( std::string_view )> readHook;
     std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override
@@ -306,8 +311,10 @@ public:
                 CpuZoneDto zone;
                 zone.ref=MakeEntityRef("cpu-zone",index);
                 zone.threadRef=MakeEntityRef("thread",1);
-                zone.sourceLocationRef="source:wide-"+std::to_string(index);
-                zone.name=compactScaleNames?"ScaleCpu":"Wide"+std::string(64*1024,'x');
+                zone.sourceLocationRef=dynamicCpuNames?"source:dynamic":"source:wide-"+std::to_string(index);
+                zone.name=dynamicCpuNames?"Resource tag:"+std::to_string(index):
+                    compactScaleNames?"ScaleCpu":"Wide"+std::string(64*1024,'x');
+                if(dynamicCpuNames) { zone.extraName=zone.name; zone.function="StableResourceSite"; }
                 zone.startNs=1; zone.endNs=2; zone.complete=true; zone.timingValid=true;
                 values.push_back(std::move(zone));
             }
@@ -336,6 +343,7 @@ public:
     }
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override
     {
+        if(readHook)readHook("gpu");
         if(gpuFrameScopeProbe)
         {
             std::vector<GpuZoneDto> values;
@@ -387,6 +395,10 @@ public:
     std::vector<FrameSetDto> GetFrameSets() const override
     {
         if( readHook ) readHook( "frame_set_metadata" );
+        if( syntheticFrameCount ) return {
+            { MakeEntityRef( "frame-set", 0 ), 0, "Player.Frame", false,
+                syntheticFrameCount, syntheticFrameCount }
+        };
         return {
             { MakeEntityRef( "frame-set", 0 ), 0, "Player.Frame", true, 2, 2 },
             { MakeEntityRef( "frame-set", 1 ), 1, "Render.Frame", false, 1, 1 }
@@ -395,6 +407,17 @@ public:
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override
     {
         if( readHook ) readHook( "frame" );
+        if( syntheticFrameCount )
+        {
+            std::vector<FrameDto> values;
+            const auto first = std::min( range.offset, syntheticFrameCount );
+            const auto last = first + std::min( range.limit, syntheticFrameCount - first );
+            values.reserve( last - first );
+            for( auto index = first; index < last; ++index ) values.push_back( {
+                MakeEntityRef( "frame", index ), MakeEntityRef( "frame-set", 0 ), index,
+                int64_t( index * 100 ), int64_t( ( index + 1 ) * 100 ), {}, true } );
+            return values;
+        }
         const std::vector<FrameDto> values = {
             { MakeEntityRef( "frame", 0 ), MakeEntityRef( "frame-set", 0 ), 0, 0, 100, {}, true },
             // This second FrameMark proves the first continuous Player frame;
@@ -435,9 +458,121 @@ public:
     }
 };
 
+void FrameTimelineWorkspace(const std::filesystem::path& root)
+{
+    constexpr uint64_t FrameCount = 65'536;
+    auto source=std::make_shared<SourceDegradedTrace>(); source->syntheticFrameCount=FrameCount;
+    const auto validation=ValidateAndNormalizeAnalysisProfile(Profile());
+    if(!validation.valid) throw std::runtime_error("Frame Timeline test profile invalid");
+    AnalysisScanExecutionRequest request;
+    request.source=source;
+    request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),
+        "1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+    request.temporaryRoot=root/"frame-timeline-workspace";
+    request.normalizedProfile=validation.normalized;
+    request.profileIdentity=validation.profileSha256;
+    request.workspace=std::make_shared<AnalysisWorkspaceBudget>(96*1024*1024,48*1024*1024);
+    AnalysisScanProducts products; std::string error;
+    if(!ExecuteDefaultAnalysisScan(request,std::stop_token{},[](auto,auto,auto,auto){},products,error))
+        throw std::runtime_error("Frame Timeline must fit its actual ownership under 96 MiB: "+error);
+    NeutralStatisticsCacheReader neutral(products.neutralCachePath,products.neutralCacheIdentity);
+    const auto frameScope=source->GetFrameSets().front().ref;
+    bool found=false;
+    neutral.VisitSignatureContexts([&](const NeutralSignatureAggregate*,const PolicySignatureContext& context) {
+        if(!context.frameRoot || context.frameScope!=frameScope) return;
+        found=true;
+        if(!context.frames.empty() || context.seriesCount!=FrameCount)
+            throw std::runtime_error("Frame Root must reference the disk series without retaining a duplicate");
+        const auto frames=ReadPolicyFrameSeries(products.frameSeriesPath,context,64*1024*1024,{},products.neutralCacheIdentity);
+        if(frames.size()!=FrameCount || frames.front().frameIndex!=0 || frames.back().frameIndex!=FrameCount-1)
+            throw std::runtime_error("Frame Root disk series changed identity or extent");
+    });
+    if(!found) throw std::runtime_error("Frame Root context missing");
+    const auto snapshot=request.workspace->Snapshot();
+    if(snapshot.peakBytes>96*1024*1024) throw std::runtime_error("Frame Timeline exceeded its workspace contract");
+}
+
+// A valid long-capture timeline can exceed the old 128 MiB private metadata
+// admission cap while remaining well inside the shared workspace budget.
+void LargeBundleMetadataUsesSharedBudget( const std::filesystem::path& root )
+{
+    const auto generation=root/"large-metadata-bundle";
+    std::filesystem::create_directories(generation);
+    auto products=Products(generation);
+    PolicyFrameTimeline timeline;
+    timeline.frameScope="Player.Frame";timeline.name="Long timeline";
+    const std::string reference(1024,'r');
+    for(uint64_t ordinal=0;ordinal<30000;++ordinal)
+        timeline.frames.push_back({ordinal,1,{reference},"Root",true,ordinal,ordinal+1});
+    products.frameTimelines.push_back(std::move(timeline));
+    const std::string identity(64,'a');
+    const auto sha=PublishAnalysisNeutralBundle(generation,identity,products);
+    AnalysisCacheTableOptions options;
+    options.workspace=std::make_shared<AnalysisWorkspaceBudget>(512ull*1024*1024,256ull*1024*1024);
+    {
+        const auto loaded=OpenAnalysisNeutralBundle(generation,identity,sha,options);
+        assert(loaded.frameTimelines.size()==1 && loaded.frameTimelines[0].frames.size()==30000);
+        assert(loaded.frameTimelines[0].frames.front().frameIndex==0);
+        assert(loaded.frameTimelines[0].frames.back().frameIndex==29999);
+        assert(options.workspace->Snapshot().currentBytes>128ull*1024*1024);
+        assert(options.workspace->Snapshot().rejectedReservations==0);
+    }
+    assert(options.workspace->Snapshot().currentBytes==0);
+    RejectCache([&]{OpenAnalysisNeutralBundle(generation,identity,sha);},"metadata_budget");
+    AnalysisCacheTableOptions tight;
+    tight.workspace=std::make_shared<AnalysisWorkspaceBudget>(64ull*1024*1024,32ull*1024*1024);
+    RejectCache([&]{OpenAnalysisNeutralBundle(generation,identity,sha,tight);},"workspace_budget");
+    assert(tight.workspace->Snapshot().currentBytes==0);
+}
+
 // Removing control-document ownership must fail cold Status and new Start
 // under pressure; neither may silently report a missing scan or lose profile
 // ownership once its parsing stack frame has returned.
+void PublicationIntegrityFailures(const std::filesystem::path& root,const std::filesystem::path& tracePath)
+{
+    for(const int fault:{0,1,2}) {
+        const bool corrupt=fault==0;
+        const auto name=corrupt ? "corrupt-publication" : fault==1 ? "state-write-denial" : "state-ledger-overflow";
+        const auto stateRoot=root/name,cacheRoot=root/(std::string(name)+"-cache");
+        auto native=std::make_shared<SourceDegradedTrace>();
+        const auto validated=ValidateAndNormalizeAnalysisProfile(Profile()); assert(validated.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId=name; request.tracePath=tracePath; request.source=native;
+        request.normalizedProfile=validated.normalized; request.profileIdentity=validated.profileSha256;
+        AnalysisScanExecutor executor=[&](const auto& input,std::stop_token token,const auto& progress,auto& products,auto& error) {
+            if(!ExecuteDefaultAnalysisScan(input,token,progress,products,error)) return false;
+            if(corrupt) {
+                const auto blocks=products.neutralCachePath/"statistics"/"blocks";
+                const auto block=std::filesystem::directory_iterator(AnalysisIoPath(blocks))->path();
+                std::fstream file(block,std::ios::in|std::ios::out|std::ios::binary);
+                assert(file); file.seekg(-1,std::ios::end); char last; file.get(last);
+                file.seekp(-1,std::ios::end); file.put(char(last^1));
+            } else if(fault==1) {
+                assert(std::filesystem::create_directory(stateRoot/"scans"/input.scanId/"scan-state.json.tmp"));
+            } else {
+                // Exercise an exception (not only a false return) in state
+                // persistence, using the existing shared-budget seam.
+                input.disk->usage->Grow(UINT64_MAX-input.disk->usage->Current(),UINT64_MAX,false);
+            }
+            return true;
+        };
+        std::string scanId;
+        {
+            AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),AnalysisScanSourceResolver{},executor);
+            scanId=manager.Start(request).scanId;
+            const auto failed=WaitFor(manager,scanId,ScanState::Failed,8s);
+            assert(!failed.completed);
+            if(corrupt) assert(failed.error.find("block_checksum")!=std::string::npos);
+            else assert(failed.stage=="state_persist_failed");
+        }
+        if(corrupt) for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(cacheRoot)))
+            assert(file.path().filename()!="current.json");
+        const auto statePath=stateRoot/"scans"/scanId/"scan-state.json";
+        json persisted; { std::ifstream input(statePath); input>>persisted; }
+        assert(!persisted.at("completed").get<bool>());
+    }
+}
+
 void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesystem::path& tracePath)
 {
     constexpr uint64_t maximum=1024ull*1024*1024;
@@ -470,7 +605,14 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
         scanId=warm.Start(request).scanId; WaitFor(warm,scanId,ScanState::Complete,6s);
         // Resume of an already complete entry only joins its finished worker;
         // no transient scan locals can influence this retained-owner check.
-        assert(warm.Resume(scanId).completed);
+        assert(warm.Resume(scanId).completed);        for(const auto& ownedRoot:{root/"control-state",root/"control-cache"})
+            for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(ownedRoot)))
+                if(file.is_directory() && (file.path().filename()=="ranking-input" ||
+                    file.path().filename()=="local-top-input" ||
+                    file.path().filename()=="local-observations" ||
+                    file.path().filename()=="local-signals" ||
+                    file.path().filename()=="context-order"))
+                    throw std::runtime_error("published scan retained disposable Policy input");
         const auto held=workspace->Snapshot().currentBytes;
         if(held<65536+32768) std::cerr<<"completed entry retained an uncharged profile\n";
         protectedControl&=held>=65536+32768;
@@ -496,6 +638,50 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
     }
     if(workspace->Snapshot().currentBytes!=0) throw std::runtime_error("Cold Manager destruction leaked control workspace");
     if(!protectedControl) throw std::runtime_error("Manager control JSON must be admitted before copying/parsing and charged for its retained lifetime");
+    // Simulate a process ending after durable completion but before cleanup.
+    const auto scanRoot=root/"control-state"/"scans"/scanId;
+    json state; { std::ifstream input(scanRoot/"scan-state.json"); input>>state; }
+    const auto policyRoot=scanRoot/"policy-generations"/state.at("policy_generation").get<std::string>()/"policy-cache";
+    const auto marker=policyRoot/"cleanup.json";
+    json cleanup; { std::ifstream input(marker); input>>cleanup; }
+    assert(cleanup.at("state")=="done");
+    std::filesystem::create_directory(policyRoot/"facts");
+    const auto retained=policyRoot/"facts"/"held.bin";
+    { std::ofstream output(retained); output<<"disposable"; }
+    cleanup["state"]="pending";
+    { std::ofstream output(marker); output<<cleanup.dump(); }
+#ifdef _WIN32
+    const auto held=CreateFileW(retained.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    assert(held!=INVALID_HANDLE_VALUE);
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && std::filesystem::exists(retained));
+        json pending; { std::ifstream input(marker); input>>pending; }
+        assert(pending.at("state")=="pending");        CloseHandle(held);
+        cold.Close(scanId);
+        cold.Summary(scanId);
+        assert(!std::filesystem::exists(retained));
+    }
+#endif
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && !std::filesystem::exists(policyRoot/"facts"));
+        json done; { std::ifstream input(marker); input>>done; }
+        assert(done.at("state")=="done" && executions==beforeCold);
+    }
+    // An altered cleanup record cannot widen the fixed deletion whitelist.
+    const auto protectedFile=scanRoot/"keep-evidence.txt";
+    { std::ofstream output(protectedFile); output<<"must remain"; }
+    cleanup["paths"]=json::array({"../../../keep-evidence.txt"});
+    { std::ofstream output(marker); output<<cleanup.dump(); }
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && std::filesystem::exists(protectedFile));
+    }
+
 }
 
 void ManagerColdBundleWorkspace(const std::filesystem::path& root,const std::filesystem::path& tracePath)
@@ -524,7 +710,7 @@ void ManagerColdBundleWorkspace(const std::filesystem::path& root,const std::fil
         auto document=json::parse(header.GetAt(0).payload);
         document["extension"]=std::string(1024*1024,'h'); payload=document.dump();
     }
-    std::filesystem::remove_all(generation/"bundle-header");
+    std::filesystem::remove_all(AnalysisIoPath(generation/"bundle-header"));
     {
         AnalysisCacheTableWriter header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1");
         header.Append("header",payload); state["neutral_header_sha256"]=header.Commit().contentSha256;
@@ -562,6 +748,8 @@ void NativeContextReadLocality(const std::filesystem::path& root)
     const auto profile=ValidateAndNormalizeAnalysisProfile(Profile()); assert(profile.valid);
     request.normalizedProfile=profile.normalized; request.profileIdentity=profile.profileSha256;
     request.workspace=std::make_shared<AnalysisWorkspaceBudget>();
+    uint64_t diskChecks=0;
+    request.checkDiskSpace=[&]{++diskChecks;};
     const auto before=readBytes();
     AnalysisScanProducts products; std::string error;
     if(!ExecuteDefaultAnalysisScan(request,std::stop_token{},[](auto,auto,auto,auto){},products,error))
@@ -570,9 +758,12 @@ void NativeContextReadLocality(const std::filesystem::path& root)
     const auto bytes=AnalysisDiskUsage::Bytes(request.temporaryRoot);
     NeutralStatisticsCacheReader neutral(products.neutralCachePath,products.neutralCacheIdentity);
     if(neutral.SignatureCount()!=132) throw std::runtime_error("native I/O fixture must preserve both CPU FrameSets and fixed other domains");
-    std::cerr<<"native context locality: read_bytes="<<transferred<<" cache_bytes="<<bytes<<'\n';
+    std::cerr<<"native context locality: read_bytes="<<transferred<<" cache_bytes="<<bytes
+        <<" disk_checks="<<diskChecks<<'\n';
     if(transferred>128*1024*1024+8*bytes)
         throw std::runtime_error("native statistics must not reread wide Context blocks once per source signature");
+    if(diskChecks==0 || diskChecks>1024)
+        throw std::runtime_error("native inner cancellation checks must not lock the disk-space sampler per record");
 #endif
 }
 
@@ -646,12 +837,17 @@ void GpuLocalQualityRecovery(const std::filesystem::path& root)
             value->outsideCompleteFrameCount!=test.outside || value->inclusive.perCompleteFrame.zeroCount!=test.zeros ||
             value->inclusive.perCompleteFrame.exact!=(test.complete!=0))
             throw std::runtime_error("Valid Pass observations from both L0s must survive; complete-frame statistics use only the one complete L0");
-        const auto rows=ReadPolicyFrameSeries(products.frameSeriesPath,context,1024*1024);
+        const auto rows=ReadPolicyFrameSeries(products.frameSeriesPath,context,1024*1024,{},products.neutralCacheIdentity);
         if(rows.size()!=test.present || std::any_of(rows.begin(),rows.end(),[](const auto& row){return !row.exact || row.valueNs!=1000000;}))
             throw std::runtime_error("Local GPU cost evidence must retain both valid one-millisecond Pass observations");
     });
     if(!found || !products.aggregate.qualityComplete || products.aggregate.unreportedGapCount!=0)
         throw std::runtime_error("GPU source degradation must remain explicit without an internal transfer gap");
+    const auto frameEvidence=std::find_if(products.aggregate.domains.begin(),products.aggregate.domains.end(),
+        [](const auto& domain){return domain.domain=="gpu_frame_evidence";});
+    if(frameEvidence==products.aggregate.domains.end() || frameEvidence->status!="unsupported" ||
+        frameEvidence->unavailableReason!="native_policy_frame_evidence_not_evaluated")
+        throw std::runtime_error("Native policy projection silently reported skipped GPU frame evidence as healthy");
     if(test.mode==3 || test.mode==4 || test.mode==8) continue;
     const auto stateRoot=root/("gpu-quality-manager-"+std::to_string(test.mode));
     const auto cacheRoot=root/("gpu-quality-cache-"+std::to_string(test.mode));
@@ -674,6 +870,8 @@ void GpuLocalQualityRecovery(const std::filesystem::path& root)
         summary=manager.Summary(scanId); quality=manager.Quality(scanId);
         signatures=manager.Signatures(scanId,100,"",{},json::object());
         candidates=manager.Candidates(scanId,100,"",{},json::object());
+        if(quality.dump().find("native_policy_frame_evidence_not_evaluated")==std::string::npos)
+            throw std::runtime_error("Query quality response omitted the unsupported GPU frame-evidence capability");
         bool selected=false;
         for(const auto& candidate:candidates.at("items")) if(candidate.at("signature_id")==goodId) {
             selected=candidate.at("selected").get<bool>();
@@ -912,6 +1110,165 @@ int main(int argc,char** argv)
 
     const auto validation = ValidateAndNormalizeAnalysisProfile( Profile() );
     assert( validation.valid );
+    if(argc==2 && std::string(argv[1])=="--phase-metadata-budget") {
+        constexpr uint64_t Count=65536;const std::string identity(64,'e');
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(96ull<<20,48ull<<20);
+        AnalysisCacheTableOptions options;options.workspace=workspace;
+        std::string hash;
+        {
+            AnalysisScanProducts input;input.metadataWorkspace=AnalysisWorkspaceReservation(workspace,Count*2*sizeof(PolicyFrameEvidence));
+            PolicyFrameTimeline timeline;timeline.frameScope="Player";timeline.name="Player";
+            timeline.frames.reserve(Count);
+            for(uint64_t i=0;i<Count;++i)timeline.frames.push_back({i,int64_t(i+1),{},"",true});
+            input.frameTimelines.push_back(std::move(timeline));
+            hash=SaveAnalysisPhaseMetadata(root/"phase-metadata",identity,input,options).contentSha256;
+        }
+        try {
+            const auto restored=LoadAnalysisPhaseMetadata(root/"phase-metadata",identity,hash,options);
+            assert(restored.frameTimelines.size()==1 && restored.frameTimelines[0].frames.size()==Count &&
+                restored.frameTimelines[0].frames.back().valueNs==Count);
+        } catch(const std::exception& e) {std::cerr<<"phase metadata restore exceeds bounded fixture: "<<e.what()<<std::endl;return 1;}
+        assert(workspace->Snapshot().currentBytes==0);
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--phase-storage-identity") {
+        auto source=std::make_shared<SourceDegradedTrace>();AnalysisScanExecutionRequest request;
+        request.source=source;request.aggregateRoot=root/"aggregate";request.temporaryRoot=root/"generation";
+        request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),"1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        std::stop_source stop;AnalysisScanProducts products;std::string error;
+        assert(!ExecuteDefaultAnalysisScan(request,stop.get_token(),[&](auto,auto,auto,auto stage){if(stage=="gpu_job_managed_relation_scan")stop.request_stop();},products,error));
+        source->storageIdentity="fixture-generation-2";
+        const auto ok=ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},products,error);
+        if(ok || error.find("storage_identity")==std::string::npos) {std::cerr<<"phase accepted a different source generation: "<<error<<std::endl;return 1;}
+        source->storageIdentity="fixture-generation-1";
+        assert(ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},products,error));
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--phase-recovery") {
+        auto source=std::make_shared<SourceDegradedTrace>();
+        AnalysisScanExecutionRequest request; request.source=source;
+        request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),"1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        request.temporaryRoot=root/"baseline";
+        AnalysisScanProducts baseline;std::string error;
+        if(!ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},baseline,error))throw std::runtime_error(error);
+        std::string expectedHash;
+        {NeutralStatisticsCacheReader expected(baseline.neutralCachePath,baseline.neutralCacheIdentity);expectedHash=expected.ContentSha256();}
+        for(const std::string boundary:{"gpu_job_managed_relation_scan","memory_io_sampling_telemetry_scan","exact_statistics"}) {
+            std::map<std::string,uint64_t> reads;source->readHook=[&](auto domain){++reads[std::string(domain)];};
+            request.aggregateRoot=root/"aggregate";request.temporaryRoot=root/boundary;
+            std::stop_source stop;AnalysisScanProducts interrupted;
+            const auto ok=ExecuteDefaultAnalysisScan(request,stop.get_token(),[&](auto,auto,auto,auto stage){if(stage==boundary)stop.request_stop();},interrupted,error);
+            if(ok || !stop.stop_requested())throw std::runtime_error("phase cancellation boundary not reached");
+            const auto before=reads;interrupted={};AnalysisScanProducts resumed;
+            if(!ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},resumed,error)) {
+                std::cerr<<"phase recovery failed at "<<boundary<<": "<<error<<std::endl;return 1;
+            }
+            if(reads["cpu"]!=before.at("cpu")) {std::cerr<<"phase recovery rescanned completed CPU"<<std::endl;return 1;}
+            if(boundary!="gpu_job_managed_relation_scan" && reads["gpu"]!=before.at("gpu"))throw std::runtime_error("phase recovery rescanned completed GPU");
+            if(boundary=="exact_statistics" && reads["memory"]!=before.at("memory"))throw std::runtime_error("phase recovery rescanned completed System");
+            NeutralStatisticsCacheReader actual(resumed.neutralCachePath,resumed.neutralCacheIdentity);
+            if(actual.ContentSha256()!=expectedHash)throw std::runtime_error("phase recovery changed complete neutral output");
+        }
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--trace-disk-admission") {
+        auto source=std::make_shared<SourceDegradedTrace>();
+        AnalysisScanManager manager(root/"admission",root/"admission-cache",std::string(64,'d'),
+            [source](const auto&,auto){return source;},ExecuteDefaultAnalysisScan);
+        AnalysisScanStartRequest request;
+        request.tracePath=tracePath; request.traceSessionId="tiny"; request.source=source;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        bool rejected=false;
+        try { manager.Start(request); } catch(const std::exception& error) {
+            rejected=std::string(error.what()).find("disk")!=std::string::npos;
+        }
+        if(!rejected) { std::cerr<<"tiny input admitted a cache larger than its trace-relative quota\n"; return 1; }
+        std::cout<<"trace disk admission passed\n"; return 0;
+    }
+    // Other tests use an injected source; its physical fixture must have
+    // sufficient capacity for the cache they intentionally construct.
+    std::filesystem::resize_file(tracePath,16*1024*1024);
+    if(argc==2 && (std::string(argv[1])=="--manager-phase-recovery" || std::string(argv[1])=="--publication-phase-recovery")) {
+        const bool publicationCrash=std::string(argv[1])=="--publication-phase-recovery";
+        auto source=std::make_shared<SourceDegradedTrace>();uint64_t cpuReads=0;bool first=true;
+        AnalysisScanExecutionRequest savedExecution;
+        source->readHook=[&](auto domain){if(domain=="cpu")++cpuReads;};
+        AnalysisScanExecutor execute=[&](const auto& input,auto token,const auto& progress,auto& products,auto& error) {
+            savedExecution=input;
+            if(!first)return ExecuteDefaultAnalysisScan(input,token,progress,products,error);
+            first=false;std::stop_source stop;
+            return ExecuteDefaultAnalysisScan(input,stop.get_token(),[&](auto state,auto done,auto total,auto stage) {
+                progress(state,done,total,stage);if(stage=="gpu_job_managed_relation_scan")stop.request_stop();
+            },products,error);
+        };
+        AnalysisScanStartRequest request;request.traceSessionId="phase";request.tracePath=tracePath;request.source=source;
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        std::string scan;uint64_t before=0;
+        {
+            AnalysisScanManager manager(root/"state",root/"phase-cache",std::string(64,'e'),[source](const auto&,auto){return source;},execute);
+            scan=manager.Start(request).scanId;WaitFor(manager,scan,ScanState::CancelledResumable);before=cpuReads;
+        }
+        if(publicationCrash) {
+            AnalysisScanProducts ready;std::string error;
+            assert(ExecuteDefaultAnalysisScan(savedExecution,{},[](auto,auto,auto,auto){},ready,error));
+            AnalysisCacheTableOptions options;options.workspace=savedExecution.workspace;options.disk=savedExecution.disk;
+            PublishAnalysisNeutralBundle(AnalysisIoPath(savedExecution.temporaryRoot),ComputeNeutralAggregateIdentity(savedExecution.aggregateIdentity),ready,options);
+        }
+        {
+            AnalysisScanManager manager(root/"state",root/"phase-cache",std::string(64,'e'),[source](const auto&,auto){return source;},execute);
+            manager.Resume(scan);WaitFor(manager,scan,ScanState::Complete);
+            if(cpuReads!=before) {std::cerr<<"cold Manager discarded a completed CPU phase"<<std::endl;return 1;}
+            assert(!manager.Candidates(scan,100,"",{},json::object()).at("items").empty());
+            const auto cleanup=AnalysisIoPath(savedExecution.temporaryRoot)/"phase-cleanup.json";
+            const auto cleanupHash=Sha256File(cleanup);
+            const auto changed=ValidateAndNormalizeAnalysisProfile(Profile(2));assert(changed.valid);
+            request.normalizedProfile=changed.normalized;request.profileIdentity=changed.profileSha256;
+            WaitFor(manager,manager.Start(request).scanId,ScanState::Complete);
+            if(Sha256File(cleanup)!=cleanupHash) {std::cerr<<"reused neutral cache overwrote the cleanup receipt"<<std::endl;return 1;}
+        }
+        AnalysisScanProducts rejected;std::string error;
+        if(ExecuteDefaultAnalysisScan(savedExecution,{},[](auto,auto,auto,auto){},rejected,error) ||
+            error.find("generation_published")==std::string::npos)
+        {std::cerr<<"phase executor did not reject a published generation: "<<error<<std::endl;return 1;}
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--frame-timeline-workspace-only") {
+        FrameTimelineWorkspace(root); RemoveTestRoot(root);
+        std::cout<<"frame timeline workspace passed\n"; return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--publication-lock-only") {
+#ifdef _WIN32
+        for(const bool transient : {true,false}) {
+            const auto stateRoot=root/(transient?"transient-lock":"permanent-lock");
+            AnalysisScanExecutor locked=[&](const auto& execution,std::stop_token,const auto& progress,auto& products,auto&) {
+                const auto scans=stateRoot/"scans";
+                const auto state=std::filesystem::directory_iterator(scans)->path()/"scan-state.json";
+                const auto handle=CreateFileW(state.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
+                    nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+                if(handle==INVALID_HANDLE_VALUE) throw std::runtime_error("publication lock setup failed");
+                std::jthread release([handle,transient]{std::this_thread::sleep_for(transient?80ms:800ms);CloseHandle(handle);});
+                progress(ScanState::Scanning,1,2,"locked_publication");
+                products=Products(execution.temporaryRoot);
+                return true;
+            };
+            AnalysisScanManager manager(stateRoot,root/(transient?"transient-cache":"permanent-cache"),
+                std::string(64,'e'),AnalysisScanSourceResolver{},locked);
+            AnalysisScanStartRequest start;
+            start.tracePath=tracePath; start.traceSessionId="publication-lock";
+            start.source=std::make_shared<tracy::query::test::FakeTraceSource>();
+            start.normalizedProfile=validation.normalized; start.profileIdentity=validation.profileSha256;
+            const auto begin=std::chrono::steady_clock::now();
+            const auto id=manager.Start(start).scanId;
+            const auto result=WaitFor(manager,id,transient?ScanState::Complete:ScanState::Failed,3s);
+            if(!transient && (result.completed || result.error.find("atomic_replace_failed")==std::string::npos))
+                throw std::runtime_error("permanent publication lock must remain explicit failure");
+            if(std::chrono::steady_clock::now()-begin>2s) throw std::runtime_error("publication retry exceeded bound");
+        }
+#endif
+        RemoveTestRoot(root); std::cout<<"publication lock regression passed\n"; return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--gpu-frame-scope-probe") {
         testStage="GPU L0 denominator diagnostic"; GpuFrameScopeProbe(root); RemoveTestRoot(root); return 0;
     }
@@ -934,12 +1291,15 @@ int main(int argc,char** argv)
     if(argc==2 && std::string(argv[1])=="--cold-bundle-only") {
         RemoveTestRoot(root); return 0;
     }
+    testStage="publication integrity failures"; PublicationIntegrityFailures(root,tracePath);
     testStage="manager control workspace"; ManagerControlWorkspace(root,tracePath);
     if(argc==2 && std::string(argv[1])=="--control-json-only") {
         RemoveTestRoot(root); return 0;
     }
     testStage="bundle metadata"; BundleMetadata(root);
+    testStage="large bundle metadata shared budget"; LargeBundleMetadataUsesSharedBudget(root);
     testStage="bundle JSON workspace"; BundleJsonWorkspace(root);
+    testStage="frame timeline workspace"; FrameTimelineWorkspace(root);
     if(argc==2 && std::string(argv[1])=="--bundle-json-only") {
         RemoveTestRoot(root); return 0;
     }
@@ -1059,6 +1419,28 @@ int main(int argc,char** argv)
             assert(cpuCount==256); // 128 distinct source identities in two independent FrameSets.
             assert(bounded.workspace->Snapshot().peakBytes<=128*1024*1024);
         }
+        {
+            testStage="dynamic CPU policy identity";
+            auto dynamic=std::make_shared<SourceDegradedTrace>();
+            dynamic->wideSignatureCount=128; dynamic->dynamicCpuNames=true;
+            auto bounded=request; bounded.source=dynamic; bounded.temporaryRoot=root/"default-cpu-dynamic-policy";
+            bounded.workspace=std::make_shared<AnalysisWorkspaceBudget>(128*1024*1024,64*1024*1024);
+            AnalysisScanProducts streamed;
+            if(!ExecuteDefaultAnalysisScan(bounded,stop.get_token(),[](ScanState,uint64_t,uint64_t,std::string_view){},streamed,scanError))
+                throw std::runtime_error("Dynamic CPU policy fixture must complete: "+scanError);
+            NeutralStatisticsCacheReader reader(streamed.neutralCachePath,streamed.neutralCacheIdentity);
+            uint64_t cpuCount=0;
+            reader.VisitSignatureContexts([&](const NeutralSignatureAggregate* aggregate,const PolicySignatureContext& context) {
+                if(context.domain!="cpu" || context.frameRoot) return;
+                ++cpuCount;
+                if(!aggregate || !aggregate->logical || context.name!="StableResourceSite" ||
+                    context.path!="StableResourceSite" || context.threadOrQueue!="Main")
+                    throw std::runtime_error("Native Scan did not use canonical logical CPU policy identity: logical="+
+                        std::to_string(aggregate?aggregate->logical:false)+" name="+context.name+" path="+
+                        context.path+" thread="+context.threadOrQueue);
+            });
+            if(cpuCount!=2) throw std::runtime_error("Dynamic CPU names created unbounded policy signatures");
+        }
         testStage="default producer";
         if( !ExecuteDefaultAnalysisScan( request, stop.get_token(),
             []( ScanState, uint64_t, uint64_t, std::string_view ) {},
@@ -1137,7 +1519,7 @@ int main(int argc,char** argv)
         bool observedUnknown=false;
         unknownReader.VisitSignatureContexts([&](const NeutralSignatureAggregate*,const PolicySignatureContext& context) {
             if(context.domain!="cpu" || context.seriesCount==0) return;
-            const auto full=ReadPolicyFrameSeries(unknown.frameSeriesPath,context,32*1024*1024);
+            const auto full=ReadPolicyFrameSeries(unknown.frameSeriesPath,context,32*1024*1024,{},unknown.neutralCacheIdentity);
             for(const auto& frame:full) if(!frame.exact) observedUnknown=true;
             for(const auto& representative:context.frames) {
                 const auto source=std::find_if(full.begin(),full.end(),[&](const auto& f){return f.frameIndex==representative.frameIndex;});
@@ -1227,6 +1609,177 @@ int main(int argc,char** argv)
             throw std::runtime_error("Budget-paused scan must complete after capacity becomes available");
     }
     {
+        testStage="manager workspace failure diagnostic";
+        const auto stateRoot=root/"resource-workspace-failure";
+        const auto cacheRoot=cache/"resource-workspace-failure";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=8ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=4ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor denyWorkspace=[](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback&,AnalysisScanProducts&,std::string&) {
+            AnalysisWorkspaceReservation denied(execution.workspace,
+                execution.workspace->Snapshot().maximumBytes);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},denyWorkspace);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-workspace-failure"; request.tracePath=tracePath;
+        request.source=native; request.resourceContext=resources;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        const auto started=manager.Start(request);
+        const auto paused=WaitFor(manager,started.scanId,ScanState::CancelledResumable,6s);
+        const auto diagnostic=stateRoot/"scans"/started.scanId/"resource-diagnostic.json";
+        if(paused.stage!="workspace_budget" || !std::filesystem::exists(diagnostic))
+            throw std::runtime_error("Workspace-paused Scan must save a resource diagnostic");
+        json document; {std::ifstream input(diagnostic); input>>document;}
+        if(document.at("failure_reason")!="workspace_limit" ||
+            document.at("requested_bytes").is_null() ||
+            std::stoull(document.at("workspace").at("rejected_reservations").get<std::string>())==0)
+            throw std::runtime_error("Workspace diagnostic must include exact refusal accounting");
+    }
+    {
+        testStage="manager Query resource context";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        auto managerWorkspace=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+        AnalysisWorkspaceReservation blockManagerWorkspace(managerWorkspace,1024*1024);
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=1024ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={root/"resource-manager",cache/"resource-manager"};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=1024*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        std::atomic<bool> shared=false;
+        AnalysisScanExecutor executorWithContext=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string& error) {
+            shared=execution.workspace==resources->Workspace() && execution.disk->usage==resources->Disk()->usage;
+            return ExecuteDefaultAnalysisScan(execution,token,progress,products,error);
+        };
+        AnalysisScanManager manager(root/"resource-manager",cache/"resource-manager",std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},executorWithContext,managerWorkspace);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-context"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        const auto started=manager.Start(request);
+        WaitFor(manager,started.scanId,ScanState::Complete,6s);
+        if(!shared) throw std::runtime_error("Scan did not reuse the indexed Trace resource context");
+        const auto resourceReport=root/"resource-manager"/"scans"/started.scanId/"resource-complete.json";
+        if(!std::filesystem::is_regular_file(resourceReport))
+            throw std::runtime_error("Completed Scan did not persist a shared resource ledger report");
+        std::ifstream resourceInput(resourceReport);
+        const auto reported=json::parse(resourceInput);
+        if(std::stoull(reported.at("disk").at("peak_bytes").get<std::string>())<
+            std::stoull(reported.at("disk").at("current_bytes").get<std::string>()))
+            throw std::runtime_error("Completed Scan resource peak is below its live file usage");
+        const auto completedDisk=resources->Snapshot().disk;
+        if(completedDisk.currentBytes>=completedDisk.finalLimitBytes)
+            throw std::runtime_error("Small completed Scan unexpectedly exhausted its final disk allowance");
+        const auto fillerBytes=completedDisk.finalLimitBytes-completedDisk.currentBytes-1;
+        resources->Disk()->Grow(fillerBytes);
+        const auto filler=root/"resource-manager"/"final-limit-filler.bin";
+        { std::ofstream out(filler,std::ios::binary); out.put('a'); out.seekp(fillerBytes-1); out.put('z'); }
+        const auto beforeFilter=resources->Snapshot().disk.currentBytes;
+        bool rejected=false;
+        try { (void)manager.Signatures(started.scanId,1,"",{},{{"domain","cpu"}}); }
+        catch(const std::exception& error) { rejected=std::string_view(error.what()).find("final_disk_ratio")!=std::string_view::npos; }
+        if(!rejected || resources->Snapshot().disk.currentBytes!=beforeFilter)
+            throw std::runtime_error("A post-Complete filter index must respect and roll back the cumulative final disk gate");
+    }
+    {
+        testStage="manager Query final disk gate";
+        const auto stateRoot=root/"resource-final",cacheRoot=cache/"resource-final";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor finalOverLimit=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string&) {
+            constexpr uint64_t survivorBytes=5ull*1024*1024;
+            const auto survivor=stateRoot/"survives-publication.bin";
+            execution.disk->Grow(survivorBytes);
+            { std::ofstream out(survivor,std::ios::binary); out.put('a'); out.seekp(survivorBytes-1); out.put('z'); }
+            progress(ScanState::Aggregating,3,4,"final_disk_fixture");
+            products=Products(execution.temporaryRoot);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},finalOverLimit);
+        auto profile=Profile(); profile["limits"]["cache_max_bytes"]=16ull*1024*1024;
+        const auto finalProfile=ValidateAndNormalizeAnalysisProfile(profile); assert(finalProfile.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-final"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=finalProfile.normalized; request.profileIdentity=finalProfile.profileSha256;
+        const auto started=manager.Start(request);
+        const auto paused=WaitFor(manager,started.scanId,ScanState::CancelledResumable,6s);
+        if(paused.completed || !paused.resumable || paused.stage!="disk_budget" ||
+            paused.error!="analysis_final_disk_ratio")
+            throw std::runtime_error("A Scan above the cumulative final disk limit must not publish Complete");
+        const auto disk=resources->Snapshot().disk;
+        if(disk.currentBytes<=disk.finalLimitBytes || disk.currentBytes>disk.peakLimitBytes)
+            throw std::runtime_error("Final disk rejection must occur between the final and peak limits");
+    }
+    {
+        testStage="manager Query transient disk allowance";
+        const auto stateRoot=root/"resource-transient",cacheRoot=cache/"resource-transient";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor transientOverFinal=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string&) {
+            constexpr uint64_t scratchBytes=5ull*1024*1024;
+            const auto scratch=stateRoot/"transient-build.work";
+            execution.disk->Grow(scratchBytes);
+            { std::ofstream out(scratch,std::ios::binary); out.put('a'); out.seekp(scratchBytes-1); out.put('z'); }
+            std::error_code cleanupError;
+            AnalysisDiskRemove(scratch,execution.disk,cleanupError);
+            if(cleanupError) throw std::runtime_error("Transient disk fixture cleanup failed");
+            progress(ScanState::Aggregating,3,4,"transient_disk_fixture");
+            products=Products(execution.temporaryRoot);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},transientOverFinal);
+        auto profile=Profile(); profile["limits"]["cache_max_bytes"]=16ull*1024*1024;
+        const auto transientProfile=ValidateAndNormalizeAnalysisProfile(profile); assert(transientProfile.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-transient"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=transientProfile.normalized; request.profileIdentity=transientProfile.profileSha256;
+        const auto started=manager.Start(request);
+        WaitFor(manager,started.scanId,ScanState::Complete,6s);
+        const auto disk=resources->Snapshot().disk;
+        if(disk.peakBytes<=disk.finalLimitBytes || disk.currentBytes>disk.finalLimitBytes)
+            throw std::runtime_error("Transient build bytes may use the peak allowance but final files must fit the final limit");
+    }
+    {
         testStage="manager response workspace";
         auto native=std::make_shared<SourceDegradedTrace>();
         auto workspace=std::make_shared<AnalysisWorkspaceBudget>(1024ull*1024*1024,512ull*1024*1024);
@@ -1298,7 +1851,7 @@ int main(int argc,char** argv)
         } // Join the paused worker and its writer-lease cleanup before walking files.
         uint64_t bytes=0;
         for(const auto& scope:{stateRoot/"scans",cacheRoot/AnalysisScanCacheFormatId})
-            for(const auto& file:std::filesystem::recursive_directory_iterator(scope))
+            for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(scope)))
                 if(file.is_regular_file()) bytes+=file.file_size();
         if(bytes>quota || std::filesystem::file_size(existing)!=oldBytes)
             throw std::runtime_error("Disk quota must reject growth before writing and must preserve older generation files");
@@ -1464,7 +2017,9 @@ int main(int argc,char** argv)
     }
     {
         testStage="default scanners process memory cancellation";
-        for( const auto* domain : { "frame", "gfx_entity", "memory" } )
+        // Native policy intentionally skips the Frame/Gfx association graph.
+        // Exercise one live boundary in each remaining default scanner.
+        for( const auto* domain : { "cpu", "io", "memory" } )
         {
             auto native=std::make_shared<SourceDegradedTrace>();
             std::atomic<uint64_t> processBytes=128;
@@ -1524,11 +2079,19 @@ int main(int argc,char** argv)
     auto source = std::make_shared<tracy::query::test::FakeTraceSource>();
     std::atomic<uint32_t> executions = 0;
     std::atomic<bool> release = false;
+    std::shared_ptr<AnalysisDiskBudget> attemptDisk;
     AnalysisScanExecutor executor = [&]( const AnalysisScanExecutionRequest& request,
         std::stop_token stopToken, const AnalysisScanProgressCallback& progress,
         AnalysisScanProducts& products, std::string& error ) {
-        ++executions;
+        const auto attempt = ++executions;
+        attemptDisk = request.disk;
         progress( ScanState::Scanning, 1, 4, "fixture_scan" );
+        if( attempt == 1 )
+        {
+            AnalysisDiskGrow( request.disk, 4096 );
+            std::ofstream partial( request.temporaryRoot / "partial-neutral-run.bin", std::ios::binary );
+            partial << std::string( 4096, 'p' );
+        }
         while( !release.load() && !stopToken.stop_requested() ) std::this_thread::sleep_for( 2ms );
         if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
         progress( ScanState::Aggregating, 3, 4, "fixture_aggregate" );
@@ -1558,21 +2121,101 @@ int main(int argc,char** argv)
 
         const auto duplicate = manager.Start( request );
         assert( duplicate.scanId == scanId );
-        std::this_thread::sleep_for( 20ms );
-        assert( executions == 1 );
+        const auto executionDeadline = std::chrono::steady_clock::now() + 2s;
+        while( executions.load() == 0 && std::chrono::steady_clock::now() < executionDeadline )
+            std::this_thread::sleep_for( 2ms );
+        assert( executions.load() == 1 );
 
         const auto cancelAt = std::chrono::steady_clock::now();
         manager.Cancel( scanId );
         const auto cancelled = WaitFor( manager, scanId, ScanState::CancelledResumable );
         assert( std::chrono::steady_clock::now() - cancelAt < 2s );
         assert( cancelled.resumable && !cancelled.completed );
+        json pausedState;
+        { std::ifstream input( root / "scans" / scanId / "scan-state.json" ); input >> pausedState; }
+        const auto neutralGenerations = std::filesystem::path(
+            pausedState.at( "aggregate_root" ).get<std::string>() ) / "generations";
+        size_t pausedGenerations = 0;
+        std::filesystem::path pausedGeneration;
+        for( const auto& candidate : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+            if( candidate.is_directory() )
+            {
+                pausedGenerations++;
+                pausedGeneration = candidate.path();
+                assert( std::filesystem::exists( candidate.path() / "partial-neutral-run.bin" ) );
+            }
+        assert( pausedGenerations == 1 );
+        const auto stalePolicy = root / "scans" / scanId /
+            "policy-generations" / "gen-1" / "policy-cache";
+        AnalysisDiskGrow( attemptDisk, 3072 );
+        std::filesystem::create_directories( stalePolicy );
+        { std::ofstream partial( stalePolicy / "partial-policy.bin", std::ios::binary );
+          partial << std::string( 3072, 'q' ); }
 
         release = true;
+        const auto foreignGeneration = neutralGenerations / "foreign";
+        std::filesystem::create_directories( foreignGeneration );
+        { std::ofstream held( foreignGeneration / "held.bin", std::ios::binary ); held << "foreign"; }
+        manager.Resume( scanId );
+        const auto unsafeCleanup = WaitFor( manager, scanId, ScanState::Failed );
+        assert( unsafeCleanup.error.find( "analysis_generation_cleanup_failed" ) != std::string::npos &&
+            std::filesystem::exists( foreignGeneration ) &&
+            std::filesystem::exists( pausedGeneration / "partial-neutral-run.bin" ) && executions == 1 );
+        json blockedCleanup;
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> blockedCleanup; }
+        assert( blockedCleanup.at( "state" ) == "failed" &&
+            blockedCleanup.at( "removed_bytes" ) == "0" );
+        std::filesystem::remove_all( foreignGeneration );
+#ifdef _WIN32
+        const auto heldCandidate = CreateFileW( ( pausedGeneration / "partial-neutral-run.bin" ).c_str(),
+            GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+        assert( heldCandidate != INVALID_HANDLE_VALUE );
+        manager.Resume( scanId );
+        const auto cleanupBlocked = WaitFor( manager, scanId, ScanState::Failed );
+        assert( cleanupBlocked.error.find( "analysis_generation_cleanup_failed" ) != std::string::npos );
+        size_t blockedGenerations = 0;
+        for( const auto& candidate : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+            if( candidate.is_directory() ) blockedGenerations++;
+        assert( blockedGenerations == 1 && executions == 1 );
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> blockedCleanup; }
+        assert( blockedCleanup.at( "state" ) == "failed" &&
+            blockedCleanup.at( "removed_bytes" ) == "0" );
+        CloseHandle( heldCandidate );
+#endif
         const auto resumed = manager.Resume( scanId );
         assert( resumed.scanId == scanId );
         const auto complete = WaitFor( manager, scanId, ScanState::Complete );
         assert( complete.completed && complete.progressCompleted == complete.progressTotal );
         assert( executions == 2 );
+        size_t completedGenerations = 0;
+        for( const auto& generation : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+        {
+            if( !generation.is_directory() ) continue;
+            completedGenerations++;
+            assert( !std::filesystem::exists( generation.path() / "partial-neutral-run.bin" ) );
+        }
+        if( completedGenerations != 1 )
+            throw std::runtime_error( "Resume retained an unpublished neutral generation beside the replacement" );
+        json cleanup;
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> cleanup; }
+        if( cleanup.at( "state" ) != "done" || cleanup.at( "candidates" ).size() != 1 ||
+            cleanup.at( "removed_bytes" ) != "4096" )
+            throw std::runtime_error( "Resume did not preserve the neutral generation cleanup receipt" );
+        const auto policyGenerations = root / "scans" / scanId / "policy-generations";
+        size_t completedPolicyGenerations = 0;
+        for( const auto& generation : std::filesystem::directory_iterator( AnalysisIoPath( policyGenerations ) ) )
+        {
+            if( !generation.is_directory() ) continue;
+            completedPolicyGenerations++;
+            assert( !std::filesystem::exists(
+                generation.path() / "policy-cache" / "partial-policy.bin" ) );
+        }
+        if( completedPolicyGenerations != 1 )
+            throw std::runtime_error( "Resume retained an unpublished policy generation beside the replacement" );
+        { std::ifstream input( root / "scans" / scanId / "policy-generation-cleanup.json" ); input >> cleanup; }
+        if( cleanup.at( "state" ) != "done" || cleanup.at( "candidates" ).size() != 1 ||
+            cleanup.at( "removed_bytes" ) != "3072" )
+            throw std::runtime_error( "Resume did not preserve the policy generation cleanup receipt" );
 
         const auto summary = manager.Summary( scanId );
         assert( summary.at( "quality" ).at( "complete" ) == true );
@@ -1600,6 +2243,34 @@ int main(int argc,char** argv)
         const auto status = restarted.Status( scanId );
         assert( status.state == ScanState::Complete && status.completed );
         assert( !restarted.Candidates( scanId, 100, "", {}, json::object() ).at( "items" ).empty() );
+
+        // Preserve the last durable journal exactly as an abruptly terminated
+        // process would leave it, then verify a cold manager converts the
+        // non-terminal state to a resumable checkpoint before publishing any
+        // further result.
+        const auto abruptRoot = root / "abrupt-restart-state";
+        const auto abruptScanRoot = abruptRoot / "scans" / scanId;
+        std::filesystem::create_directories( abruptScanRoot );
+        std::filesystem::copy_file( root / "scans" / scanId / "profile.json",
+            abruptScanRoot / "profile.json", std::filesystem::copy_options::overwrite_existing );
+        json abruptState;
+        { std::ifstream input( root / "scans" / scanId / "scan-state.json" ); input >> abruptState; }
+        abruptState["state"] = "scanning";
+        abruptState["resumable"] = false;
+        abruptState["completed"] = false;
+        abruptState["closed"] = false;
+        abruptState["stage"] = "fixture_scan";
+        abruptState["error"] = nullptr;
+        { std::ofstream output( abruptScanRoot / "scan-state.json", std::ios::binary | std::ios::trunc ); output << abruptState.dump(); }
+        const auto beforeAbruptResume = executions.load();
+        AnalysisScanManager abruptRestarted( abruptRoot, cache, std::string( 64, 'e' ), resolver, executor );
+        const auto interrupted = abruptRestarted.Status( scanId );
+        assert( interrupted.state == ScanState::CancelledResumable && interrupted.resumable &&
+            !interrupted.completed && interrupted.stage == "query_process_restart" );
+        abruptRestarted.Resume( scanId );
+        const auto recovered = WaitFor( abruptRestarted, scanId, ScanState::Complete );
+        assert( recovered.completed && executions == beforeAbruptResume );
+        assert( !abruptRestarted.Candidates( scanId, 100, "", {}, json::object() ).at( "items" ).empty() );
 
         // Changing only policy creates a new scan but reuses the completed neutral aggregate.
         const auto changedValidation = ValidateAndNormalizeAnalysisProfile( Profile( 3 ) );

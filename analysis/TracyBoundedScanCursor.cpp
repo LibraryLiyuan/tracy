@@ -56,6 +56,8 @@ template<typename T>
 std::string StableRef( const T& value ) { return value.ref; }
 std::string StableRef( const GpuAnalysisResourceSummary& value )
 { return "gpu-resource:" + std::to_string( value.resourceId ); }
+std::string StableRef( const SampleSummaryDto& value )
+{ return "sample-ordinal:" + std::to_string( value.ordinal ); }
 std::string StableRef( const GpuAllocationAnalysisRecord& value )
 { return "gpu-allocation:" + std::to_string( value.allocationId ); }
 std::string StableRef( const GpuPassWorkingSet& value )
@@ -70,6 +72,7 @@ int64_t EventTime( const JobDto& value ) { return value.scheduleNs; }
 int64_t EventTime( const RelationDto& value ) { return value.timeNs; }
 int64_t EventTime( const MemoryEventDto& value ) { return value.allocationNs; }
 int64_t EventTime( const SampleDto& value ) { return value.timeNs; }
+int64_t EventTime( const SampleSummaryDto& value ) { return value.timeNs; }
 int64_t EventTime( const ContextSwitchDto& value ) { return value.startNs; }
 int64_t EventTime( const RuntimeDomainStateDto& value ) { return value.timeNs; }
 int64_t EventTime( const ScriptFrameDto& value ) { return value.timeNs; }
@@ -109,7 +112,8 @@ size_t BoundedScanBatch::Count() const
     return std::visit( []( const auto& values ) { return SizeOf( values ); }, records );
 }
 
-BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source )
+BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source, bool cpuPolicyProjection,
+    bool jobPolicyProjection, bool systemSummaryProjection, std::function<void()> check )
     : m_source( source )
     , m_bounded( [&]() -> const NativeBoundedTraceSource& {
         const auto* bounded = dynamic_cast<const NativeBoundedTraceSource*>( &source );
@@ -118,10 +122,15 @@ BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source )
         return *bounded;
     }() )
     , m_gpu( dynamic_cast<const GpuCatalogBoundedScanSource*>( &source ) )
+    , m_cpuPolicyProjection( cpuPolicyProjection )
+    , m_jobPolicyProjection( jobPolicyProjection )
+    , m_systemSummaryProjection( systemSummaryProjection )
+    , m_check( std::move(check) )
 {}
 
 BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) const
 {
+    if( m_check ) m_check();
     if( request.limit == 0 || request.limit > NativeBoundedScanMaximumBatch )
         throw BoundedScanError( "bounded_scan_limit_out_of_range" );
     if( request.startNs >= request.endNs )
@@ -158,12 +167,34 @@ BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) 
     switch( request.domain )
     {
     case BoundedScanDomain::Frame: records = m_source.ScanFrames( RangeFor( cursor, request.limit ) ); break;
-    case BoundedScanDomain::CpuZone: records = m_source.ScanCpuZones( RangeFor( cursor, request.limit ) ); break;
+    case BoundedScanDomain::CpuZone: records = m_cpuPolicyProjection ?
+        m_source.ScanCpuZonesForPolicy( RangeFor( cursor, request.limit ) ) :
+        m_source.ScanCpuZones( RangeFor( cursor, request.limit ) ); break;
     case BoundedScanDomain::GpuZone: records = m_source.ScanGpuZones( RangeFor( cursor, request.limit ) ); break;
-    case BoundedScanDomain::Job: records = m_source.ScanJobs( offset, request.limit ); break;
+    case BoundedScanDomain::Job: records = m_jobPolicyProjection ?
+        m_source.ScanJobsForPolicy( offset, request.limit ) :
+        m_source.ScanJobs( offset, request.limit ); break;
     case BoundedScanDomain::Relation: records = m_source.ScanRelations( offset, request.limit ); break;
-    case BoundedScanDomain::Memory: records = m_source.ScanMemoryEvents( RangeFor( cursor, request.limit ) ); break;
-    case BoundedScanDomain::Sample: records = m_source.ScanSampleEvents( RangeFor( cursor, request.limit ) ); break;
+    case BoundedScanDomain::Memory:
+        if( m_systemSummaryProjection && request.startNs == std::numeric_limits<int64_t>::min() &&
+            request.endNs == std::numeric_limits<int64_t>::max() )
+            records = m_source.ScanMemoryEventsForSummary( offset, request.limit, m_check );
+        else records = m_source.ScanMemoryEvents( RangeFor( cursor, request.limit ) );
+        break;
+    case BoundedScanDomain::Sample:
+        if( m_systemSummaryProjection && request.startNs == std::numeric_limits<int64_t>::min() &&
+            request.endNs == std::numeric_limits<int64_t>::max() )
+        {
+            records=m_source.ScanSampleSummary(offset,request.limit,m_check);
+            break;
+        }
+        // The unfiltered native audit enumerates the complete logical view;
+        // filtered callers retain their existing matched-offset contract.
+        records = request.startNs == std::numeric_limits<int64_t>::min() &&
+            request.endNs == std::numeric_limits<int64_t>::max() ?
+            m_source.ScanSampleEventsRaw( RangeFor( cursor, request.limit ) ) :
+            m_source.ScanSampleEvents( RangeFor( cursor, request.limit ) );
+        break;
     case BoundedScanDomain::ContextSwitch: records = m_source.ScanContextSwitchEvents( RangeFor( cursor, request.limit ) ); break;
     case BoundedScanDomain::RuntimeDomain: records = m_source.ScanRuntimeDomainStates( offset, request.limit ); break;
     case BoundedScanDomain::ScriptFrame: records = m_source.ScanScriptFrames( offset, request.limit ); break;
@@ -191,6 +222,7 @@ BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) 
         records = m_gpu->ScanGpuCatalogRangesBounded( offset, request.limit ); break;
     }
 
+    if( m_check ) m_check();
     const auto count = std::visit( []( const auto& values ) { return SizeOf( values ); }, records );
     if( count > request.limit ) throw BoundedScanError( "bounded_scan_source_exceeded_batch" );
     std::visit( [&]( const auto& values ) { UpdateTail( values, cursor ); }, records );

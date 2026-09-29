@@ -363,6 +363,11 @@ public:
     mutable std::vector<uint64_t> ioScanIds;
     mutable bool jobScanIdsReady = false;
     mutable bool ioScanIdsReady = false;
+    mutable std::optional<AppInfoSummaryDto> appInfoSummary;
+    mutable bool appInfoHasCapture = false;
+    mutable bool appInfoHasCatalog = false;
+    mutable bool appInfoHasScriptStack = false;
+    mutable bool appInfoHasStructuredGc = false;
 
     // Called under readMutex. Allocation pagination must not resolve the
     // unrelated Pass/ResourceSet graph or keep its working sets resident.
@@ -384,9 +389,20 @@ public:
 
     std::string MakeRef( const char* kind, uint64_t id ) const
     {
-        std::ostringstream out;
-        out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
-        return out.str();
+        const auto fingerprintLength = std::min<size_t>( 16, fingerprint.size() );
+        const auto kindLength = std::strlen( kind );
+        std::string out;
+        out.reserve( 9 + fingerprintLength + 1 + kindLength + 1 + 16 );
+        out.append( "tracy:v1:" );
+        out.append( fingerprint.data(), fingerprintLength );
+        out.push_back( ':' );
+        out.append( kind, kindLength );
+        out.push_back( ':' );
+        char digits[16];
+        const auto result = std::to_chars( digits, digits + sizeof( digits ), id, 16 );
+        if( result.ec != std::errc {} ) throw std::runtime_error( "entity reference formatting failed" );
+        out.append( digits, result.ptr );
+        return out;
     }
 
     std::optional<uint64_t> ParseRef( std::string_view ref, std::string_view kind ) const
@@ -399,6 +415,27 @@ public:
         const auto parsed = std::from_chars( begin, end, value, 16 );
         if( parsed.ec != std::errc() || parsed.ptr != end ) return std::nullopt;
         return value;
+    }
+
+    const AppInfoSummaryDto& AppInfoSummary() const
+    {
+        if( appInfoSummary ) return *appInfoSummary;
+        AppInfoSummaryDto result;
+        result.recordCount = worker->GetAppInfo().size();
+        for( const auto& value : worker->GetAppInfo() )
+        {
+            const std::string_view record = Safe( worker->GetString( value ) );
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.totalBytes += record.size();
+            result.maximumRecordBytes = std::max<uint64_t>( result.maximumRecordBytes, record.size() );
+            if( record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" ) ) appInfoHasCapture = true;
+            if( record.starts_with( "JNCAT1|" ) ) appInfoHasCatalog = true;
+            if( record.starts_with( "JNSTK1|" ) ) appInfoHasScriptStack = true;
+            if( record.starts_with( "JNGC1|" ) ) appInfoHasStructuredGc = true;
+        }
+        appInfoSummary = result;
+        return *appInfoSummary;
     }
 
     SourceLocationDto SourceLocation( int16_t id ) const
@@ -681,6 +718,7 @@ public:
     std::string fingerprint;
     std::unique_ptr<FileRead> file;
     std::unique_ptr<Worker> worker;
+    SerializedCallstackSource* externalCallstacks = nullptr;
     std::vector<CpuEntry> cpuZones;
     std::vector<GpuEntry> gpuZones;
     std::unordered_map<const ZoneEvent*, size_t> cpuLookup;
@@ -730,7 +768,10 @@ std::string WorkerTraceSource::ComputeFingerprint( const std::filesystem::path& 
     return Sha256File( path );
 }
 
-std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink )
+std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback,
+    std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink,
+    std::shared_ptr<tracy::FileReadHooks> readHooks, SerializedStringSource* serializedStringSource,
+    SerializedCallstackSource* serializedCallstackSource )
 {
     auto impl = std::make_unique<Impl>( path, loadMode );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
@@ -739,7 +780,8 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
     try
     {
         impl->fingerprint = fingerprintOverride.empty() ? Sha256File( path ) : std::move( fingerprintOverride );
-        impl->file.reset( FileRead::Open( path.string().c_str() ) );
+        const auto loadHooks=readHooks;
+        impl->file.reset( FileRead::Open( path, std::move( readHooks ) ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
         // CPU/GPU zones and the high-volume JN relation streams are written to
         // dedicated memory-mapped sidecar sections. Every other persisted domain
@@ -748,14 +790,27 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         // locks, frame images, symbols, or source cache) into absent data.
         const auto eventMask = loadMode != WorkerTraceLoadMode::CompactIndex ? EventType::All : EventType::Type(
             EventType::Locks | EventType::Messages | EventType::Plots | EventType::Memory |
-            EventType::FrameImages | EventType::ContextSwitches | EventType::Samples |
+            EventType::FrameImages | EventType::ContextSwitches |
             EventType::SymbolCode | EventType::SourceCache );
-        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
-        while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink,
+            serializedStringSource, serializedCallstackSource );
+        while( !impl->worker->IsBackgroundDone() )
+        {
+            if(loadHooks && loadHooks->check) loadHooks->check();
+            std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+        }
+        if(loadHooks && loadHooks->check) loadHooks->check();
+        impl->externalCallstacks=serializedCallstackSource?serializedCallstackSource:
+            (serializedZoneSink?serializedZoneSink->GlobalCallstackSource():nullptr);
         if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         impl->BuildIndexes();
+        if(loadHooks && loadHooks->check) loadHooks->check();
         if( stateCallback ) stateCallback( TraceSourceState::Ready );
         return std::unique_ptr<WorkerTraceSource>( new WorkerTraceSource( std::move( impl ) ) );
+    }
+    catch( const TraceFormatError& error )
+    {
+        throw TraceLoadError( TraceLoadErrorCode::UnsupportedVersion, error.what(), ExtendedTraceVersion );
     }
     catch( const UnsupportedVersion& error )
     {
@@ -787,6 +842,10 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
     }
     catch( const std::exception& error )
     {
+        if( std::string_view( error.what() ).starts_with( "query_resource_" ) ||
+            std::string_view( error.what() ).find( "analysis_workspace_budget" ) != std::string_view::npos ||
+            std::string_view( error.what() ).find( "analysis_process_memory_budget" ) != std::string_view::npos )
+            throw TraceLoadError( TraceLoadErrorCode::ResourceLimit, error.what() );
         throw TraceLoadError( TraceLoadErrorCode::Internal, error.what() );
     }
 }
@@ -806,10 +865,11 @@ std::optional<std::string> WorkerTraceSource::ResolveStringIndex( uint32_t index
     return Safe( value );
 }
 
-void WorkerTraceSource::WriteCompactSnapshot( const std::filesystem::path& path )
+void WorkerTraceSource::WriteCompactSnapshot( const std::filesystem::path& path,
+    std::shared_ptr<tracy::FileWriteHooks> hooks )
 {
     std::lock_guard lock( m_impl->readMutex );
-    auto output = std::unique_ptr<FileWrite>( FileWrite::Open( path.string().c_str(), FileCompression::Zstd, 3, 4 ) );
+    auto output = std::unique_ptr<FileWrite>( FileWrite::Open( path, FileCompression::Zstd, 3, 4, std::move( hooks ) ) );
     if( !output ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to create compact trace index payload" );
     m_impl->worker->Write( *output, false );
     output->Finish();
@@ -1371,7 +1431,7 @@ TraceReadView WorkerTraceSource::AcquireReadView() const
 
 std::vector<Capability> WorkerTraceSource::GetCapabilities() const
 {
-    const auto info = GetTraceInfo();
+    const auto info = GetTraceInfoMetadata();
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
@@ -1383,19 +1443,20 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
     };
     const bool hasCpu = !GetCpuTopology().empty() || info.counts.contextSwitches != 0;
-    const bool hasCapture = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" );
-    } );
-    const bool hasCatalog = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNCAT1|" );
-    } );
+    bool hasCapture = false;
+    bool hasCatalog = false;
+    bool hasScriptStackAppInfo = false;
+    bool hasStructuredGc = false;
+    {
+        std::lock_guard lock( m_impl->readMutex );
+        (void)m_impl->AppInfoSummary();
+        hasCapture = m_impl->appInfoHasCapture;
+        hasCatalog = m_impl->appInfoHasCatalog;
+        hasScriptStackAppInfo = m_impl->appInfoHasScriptStack;
+        hasStructuredGc = m_impl->appInfoHasStructuredGc;
+    }
     const bool hasScriptStack = jnTrace.schemaVersion >= 6 && ( !jnTrace.scriptFrames.empty() || !jnTrace.scriptStacks.empty() ) ||
-        std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNSTK1|" );
-    } );
-    const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNGC1|" );
-    } );
+        hasScriptStackAppInfo;
     const bool hasGpuCatalog = jnTrace.gpuCatalogPresent;
     const std::vector<std::string> gpuCatalogMethods = {
         "gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get",
@@ -1521,6 +1582,16 @@ uint64_t GetContextSwitchSampleCount( Worker& worker )
 
 TraceInfoDto WorkerTraceSource::GetTraceInfo() const
 {
+    return GetTraceInfoImpl( true );
+}
+
+TraceInfoDto WorkerTraceSource::GetTraceInfoMetadata() const
+{
+    return GetTraceInfoImpl( false );
+}
+
+TraceInfoDto WorkerTraceSource::GetTraceInfoImpl( bool includeAppInfo ) const
+{
     std::lock_guard lock( m_impl->readMutex );
     auto& worker = *m_impl->worker;
     TraceInfoDto result;
@@ -1532,6 +1603,9 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     result.executableTime = worker.GetExecutableTime();
     result.processId = worker.GetPid();
     result.traceVersion = worker.GetTraceVersion();
+    result.traceFormatName = "JNTRACYX";
+    result.traceFormatVersion = ExtendedTraceVersion;
+    result.stringIndexBits = 32;
     result.resolution = worker.GetResolution();
     result.firstTimeNs = worker.GetFirstTime();
     result.lastTimeNs = worker.GetLastTime();
@@ -1561,8 +1635,8 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
         for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.emplace( thread );
         for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.emplace( thread );
         for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.emplace( thread );
-        for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.emplace( thread );
-        for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.emplace( thread );
+        worker.VisitThreadNameIds( [&]( uint64_t thread ) { threads.emplace( thread ); } );
+        worker.VisitExternalNameIds( [&]( uint64_t thread ) { threads.emplace( thread ); } );
         counts.threads = threads.size();
     }
     counts.locks = worker.GetLockCount();
@@ -1612,7 +1686,44 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.gpuReferenceUses = jn.gpuReferenceUses.size();
     counts.gpuReferenceEnds = jn.gpuReferenceEnds.size();
     counts.callsites = jn.callsites.size();
-    for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
+    if( includeAppInfo )
+        for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
+    return result;
+}
+
+AppInfoSummaryDto WorkerTraceSource::GetAppInfoSummary() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->AppInfoSummary();
+}
+
+AppInfoPageDto WorkerTraceSource::ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    auto& worker = *m_impl->worker;
+    AppInfoPageDto result;
+    result.offset = offset;
+    result.summary = m_impl->AppInfoSummary();
+    uint64_t selectedBytes = 0;
+    bool selectionStopped = false;
+    for( uint64_t ordinal = offset; ordinal < worker.GetAppInfo().size(); ordinal++ )
+    {
+        const std::string_view record = Safe( worker.GetString( worker.GetAppInfo()[size_t( ordinal )] ) );
+        if( selectionStopped || result.records.size() >= limit ) break;
+        if( record.size() > maximumBytes )
+        {
+            if( result.records.empty() ) result.oversizedRecordBytes = record.size();
+            selectionStopped = true;
+            continue;
+        }
+        if( record.size() > maximumBytes - selectedBytes )
+        {
+            selectionStopped = true;
+            continue;
+        }
+        selectedBytes += record.size();
+        result.records.emplace_back( record );
+    }
     return result;
 }
 
@@ -1626,8 +1737,8 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
     for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.try_emplace( thread, nullptr );
     for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.try_emplace( thread, nullptr );
     for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.try_emplace( thread, nullptr );
-    for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.try_emplace( thread, nullptr );
-    for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.try_emplace( thread, nullptr );
+    worker.VisitThreadNameIds( [&]( uint64_t thread ) { threads.try_emplace( thread, nullptr ); } );
+    worker.VisitExternalNameIds( [&]( uint64_t thread ) { threads.try_emplace( thread, nullptr ); } );
     result.reserve( threads.size() );
     for( const auto& [threadId, thread] : threads )
     {
@@ -1636,8 +1747,7 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
         dto.nativeId = threadId;
         dto.processId = worker.GetPidFromTid( threadId );
         dto.name = Safe( worker.GetThreadName( threadId ) );
-        const auto localName = worker.GetThreadNameMap().find( threadId );
-        if( localName != worker.GetThreadNameMap().end() ) dto.localName = Safe( localName->second );
+        if( const auto* localName = worker.TryGetLocalThreadName( threadId ) ) dto.localName = Safe( localName );
         if( worker.HasExternalName( threadId ) )
         {
             const auto external = worker.GetExternalName( threadId );
@@ -2650,11 +2760,26 @@ std::vector<GfxLinkDto> WorkerTraceSource::ScanGfxLinks( size_t offset, size_t l
 
 std::vector<CorrelatedFrameEventDto> WorkerTraceSource::GetCorrelatedFrameEvents() const
 {
+    return ScanCorrelatedFrameEvents( 0, size_t( std::min<uint64_t>(
+        GetCorrelatedFrameEventCount(), std::numeric_limits<size_t>::max() ) ) );
+}
+
+uint64_t WorkerTraceSource::GetCorrelatedFrameEventCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().frames.size();
+}
+
+std::vector<CorrelatedFrameEventDto> WorkerTraceSource::ScanCorrelatedFrameEvents(
+    size_t offset, size_t limit ) const
+{
     std::lock_guard lock( m_impl->readMutex );
     const auto& values = m_impl->worker->GetJnTraceData().frames;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
     std::vector<CorrelatedFrameEventDto> result;
-    result.reserve( values.size() );
-    for( size_t index = 0; index < values.size(); index++ )
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; index++ )
     {
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "frame-identity-event", index ), value.frameId, value.domainIndex,
@@ -3193,6 +3318,60 @@ std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const 
     return result;
 }
 
+std::vector<int64_t> WorkerTraceSource::GetContextSwitchStartTimes( uint64_t thread ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto* data = m_impl->worker->GetContextSwitchData( thread );
+    std::vector<int64_t> result;
+    if( !data ) return result;
+    result.reserve( data->v.size() );
+    for( const auto& event : data->v ) result.emplace_back( event.Start() );
+    return result;
+}
+
+std::vector<MemoryEventDto> WorkerTraceSource::ScanMemoryEventsForSummary( size_t offset, size_t limit,
+    const std::function<void()>& check ) const
+{
+    if( check ) check();
+    if( limit == 0 ) return {};
+    if( limit > NativeBoundedScanMaximumBatch ) throw BoundedScanError( "memory_summary_batch_out_of_range" );
+    std::unique_lock lock( m_impl->readMutex, std::defer_lock );
+    while( !lock.try_lock() ) { if( check ) check(); std::this_thread::sleep_for( std::chrono::milliseconds(1) ); }
+    std::vector<std::pair<uint64_t, const MemData*>> pools;
+    for( const auto& value : m_impl->worker->GetMemNameMap() ) pools.emplace_back( value.first, value.second );
+    std::sort( pools.begin(), pools.end(), [&]( const auto& a, const auto& b ) {
+        return m_impl->memoryPoolIndex.at(a.first) < m_impl->memoryPoolIndex.at(b.first);
+    } );
+    std::vector<MemoryEventDto> result;
+    result.reserve( limit );
+    for( const auto& [poolId, memory] : pools )
+    {
+        if( check ) check();
+        if( offset >= memory->data.size() ) { offset -= memory->data.size(); continue; }
+        const auto poolIndex = m_impl->memoryPoolIndex.at( poolId );
+        const auto poolRef = m_impl->MakeRef( "memory-pool", poolIndex );
+        const auto name = poolId == 0 ? std::string("Default allocator") : Safe(m_impl->worker->GetString(poolId));
+        const bool gpu = IsGpuD3D12PoolName( name );
+        for( size_t index = offset; index < memory->data.size() && result.size() < limit; ++index )
+        {
+            if( check && (index & 255) == 0 ) check();
+            const auto& event = memory->data[index];
+            MemoryEventDto value;
+            value.ref = m_impl->MakeRef( "memory-event", (uint64_t(poolIndex)<<40) | index );
+            value.poolRef = poolRef;
+            value.address = gpu ? std::to_string(event.Ptr()) : Hex(event.Ptr());
+            value.size = event.Size(); value.allocationNs = event.TimeAlloc();
+            if( event.TimeFree() >= 0 ) value.freeNs = event.TimeFree();
+            value.complete = event.TimeFree() >= 0;
+            result.emplace_back( std::move(value) );
+        }
+        if( result.size() == limit ) break;
+        offset = 0;
+    }
+    if( check ) check();
+    return result;
+}
+
 std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( const ScanRange& range ) const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -3299,7 +3478,15 @@ std::vector<GhostZoneDto> WorkerTraceSource::ScanGhostZones( const ScanRange& ra
             if( intersects && skipped++ >= range.offset && result.size() < range.limit )
             {
                 const auto& key = m_impl->worker->GetGhostFrame( zone.frame );
-                const auto* frame = m_impl->worker->GetCallstackFrame( key.frame );
+                const CallstackFrame* frameData=nullptr;uint8_t frameCount=0;
+                SerializedCallstackSource::FrameView externalFrame;
+                if(m_impl->externalCallstacks&&m_impl->externalCallstacks->Frame(key.frame,externalFrame))
+                { frameData=externalFrame.frames;frameCount=externalFrame.count; }
+                else if(!m_impl->externalCallstacks)
+                {
+                    const auto* frame=m_impl->worker->GetCallstackFrame(key.frame);
+                    if(frame){frameData=frame->data;frameCount=frame->size;}
+                }
                 GhostZoneDto dto;
                 dto.ref = m_impl->MakeRef( "ghost-zone", currentOrdinal );
                 dto.threadRef = m_impl->MakeRef( "thread", thread.id );
@@ -3308,10 +3495,10 @@ std::vector<GhostZoneDto> WorkerTraceSource::ScanGhostZones( const ScanRange& ra
                 dto.endNs = zone.end.Val();
                 dto.address = Hex( m_impl->worker->GetCanonicalPointer( key.frame ) );
                 dto.depth = depth;
-                dto.inlineFrame = frame && key.inlineFrame + 1 < frame->size;
-                if( frame && key.inlineFrame < frame->size )
+                dto.inlineFrame = frameData && key.inlineFrame + 1 < frameCount;
+                if( frameData && key.inlineFrame < frameCount )
                 {
-                    const auto& symbol = frame->data[key.inlineFrame];
+                    const auto& symbol = frameData[key.inlineFrame];
                     dto.name = Safe( m_impl->worker->TryGetString( symbol.name ) );
                     dto.file = Safe( m_impl->worker->TryGetString( symbol.file ) );
                     dto.line = symbol.line;
@@ -3526,29 +3713,50 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
     for( const auto callstack : callstacks )
     {
         if( callstack == 0 || callstack > worker.GetCallstackPayloadCount() ) continue;
-        const auto& entries = worker.GetCallstack( callstack );
         size_t depth = 0;
-        for( const auto& entry : entries )
+        const auto resolveEntry = [&]( const CallstackFrameId& entry )
         {
-            if( depth >= maxDepth ) break;
-            const auto* frameData = worker.GetCallstackFrame( entry );
-            if( !frameData )
+            if( depth >= maxDepth ) return;
+            const CallstackFrame* frames=nullptr;uint8_t frameCount=0;StringIdx imageNameIndex;
+            if(m_impl->externalCallstacks)
+            {
+                SerializedCallstackSource::FrameView view;
+                if(m_impl->externalCallstacks->Frame(entry,view)){frames=view.frames;frameCount=view.count;imageNameIndex=view.imageName;}
+            }
+            else if(const auto* frameData=worker.GetCallstackFrame(entry))
+            { frames=frameData->data;frameCount=frameData->size;imageNameIndex=frameData->imageName; }
+            if( !frames && frameCount == 0 )
             {
                 result.push_back( { m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
                 depth++;
-                continue;
+                return;
             }
             std::optional<std::string> imageName;
-            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
-            for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
+            if( imageNameIndex.Active() ) imageName = Safe( worker.TryGetString( imageNameIndex ) );
+            for( uint8_t frameIndex = 0; frameIndex < frameCount && depth < maxDepth; frameIndex++ )
             {
-                const auto& frame = frameData->data[frameIndex];
+                const auto& frame = frames[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameCount, callstack, depth, imageName
                 } );
                 depth++;
+            }
+        };
+        if( m_impl->externalCallstacks )
+        {
+            uint32_t count=0;const auto* entries=m_impl->externalCallstacks->Frames(callstack,count);
+            if(!entries)continue;
+            for(uint32_t index=0;index<count&&depth<maxDepth;++index)resolveEntry(entries[index]);
+        }
+        else
+        {
+            const auto& entries = worker.GetCallstack( callstack );
+            for( const auto& entry : entries )
+            {
+                if(depth>=maxDepth)break;
+                resolveEntry(entry);
             }
         }
     }
@@ -3573,22 +3781,29 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveParentCallstacks( const
         for( const auto& entry : entries )
         {
             if( depth >= maxDepth ) break;
-            const auto* frameData = entry.custom ? worker.GetParentCallstackFrame( entry ) : worker.GetCallstackFrame( entry );
-            if( !frameData )
+            const CallstackFrame* frames=nullptr;uint8_t frameCount=0;StringIdx imageNameIndex;
+            if(!entry.custom&&m_impl->externalCallstacks)
+            {
+                SerializedCallstackSource::FrameView view;
+                if(m_impl->externalCallstacks->Frame(entry,view)){frames=view.frames;frameCount=view.count;imageNameIndex=view.imageName;}
+            }
+            else if(const auto* frameData=entry.custom?worker.GetParentCallstackFrame(entry):worker.GetCallstackFrame(entry))
+            { frames=frameData->data;frameCount=frameData->size;imageNameIndex=frameData->imageName; }
+            if( !frames && frameCount == 0 )
             {
                 result.push_back( { m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
                 depth++;
                 continue;
             }
             std::optional<std::string> imageName;
-            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
-            for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
+            if( imageNameIndex.Active() ) imageName = Safe( worker.TryGetString( imageNameIndex ) );
+            for( uint8_t frameIndex = 0; frameIndex < frameCount && depth < maxDepth; frameIndex++ )
             {
-                const auto& frame = frameData->data[frameIndex];
+                const auto& frame = frames[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameCount, callstack, depth, imageName
                 } );
                 depth++;
             }

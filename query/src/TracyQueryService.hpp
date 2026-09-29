@@ -113,6 +113,7 @@ const std::vector<std::string>& QueryMethodRegistry();
 const nlohmann::json& QueryOperationSchemaRegistry();
 const nlohmann::json& QueryEnvelopeOutputSchema();
 bool IsPublicQueryMethod( std::string_view method );
+std::vector<uint32_t> QueryGpuTaxonomyIds( const analysis::TraceInfoDto& info );
 std::string DumpProtocolJson( const nlohmann::json& value );
 
 }

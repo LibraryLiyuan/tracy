@@ -609,6 +609,7 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
 
     while( offset < result.fileSize )
     {
+        if(options.check)options.check();
         if( ended )
         {
             return tailFailure( ScanCode::CorruptTail, "bytes follow the terminal SessionEnd record" );
@@ -675,6 +676,7 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         uint64_t payloadRemaining = payloadSize;
         while( payloadRemaining != 0 )
         {
+            if(options.check)options.check();
             const size_t chunk = size_t( std::min<uint64_t>( payloadRemaining, payloadBuffer.size() ) );
             if( !source.Read( payloadOffset, payloadBuffer.data(), chunk, result.message ) )
             {

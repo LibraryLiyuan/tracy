@@ -5,6 +5,10 @@
 #include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 using namespace tracy::analysis;
 using nlohmann::json;
 namespace
@@ -173,11 +177,60 @@ void Queries(const std::filesystem::path& root)
     Require(reads==0 && AnalysisDiskUsage::Bytes(diskRoot)==diskBytes,
         "a new over-quota filter must reject growth before scanning or writing an index");
 }
+#ifdef _WIN32
+void WindowsPublishRetry(const std::filesystem::path& root)
+{
+    const auto folder=root/"publish-retry";
+    std::filesystem::create_directories(folder);
+    const auto makeTemporary=[&](const char* name){
+        const auto path=folder/name;
+        std::filesystem::create_directory(path);
+        std::ofstream manifest(path/"manifest.json");
+        manifest<<"{}";
+        manifest.close();
+        Require(bool(manifest),"filter publish fixture manifest write failed");
+        return path;
+    };
+    const auto openWithoutDelete=[&](const std::filesystem::path& path){
+        auto handle=CreateFileW((path/"manifest.json").c_str(),GENERIC_READ,FILE_SHARE_READ,
+            nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+        Require(handle!=INVALID_HANDLE_VALUE,"filter publish fixture file lock failed");
+        return handle;
+    };
+    const auto temporary=makeTemporary("transient");
+    const auto target=folder/"transient-complete";
+    auto held=openWithoutDelete(temporary);
+    std::thread release([&]{std::this_thread::sleep_for(std::chrono::milliseconds(80));CloseHandle(held);});
+    const auto start=std::chrono::steady_clock::now();
+    try {AnalysisCacheQuery::PublishFilterForTesting(temporary,target);}
+    catch(...) {release.join();throw;}
+    release.join();
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-start).count();
+    Require(elapsed>=60 && elapsed<1000 && std::filesystem::exists(target/"manifest.json") &&
+        !std::filesystem::exists(temporary),"filter publish did not recover a transient directory lock");
+    const auto blocked=makeTemporary("blocked");
+    const auto blockedTarget=folder/"blocked-complete";
+    held=openWithoutDelete(blocked);
+    const auto blockedStart=std::chrono::steady_clock::now();
+    try {Reject([&]{AnalysisCacheQuery::PublishFilterForTesting(blocked,blockedTarget);},"filter_publish_failed");}
+    catch(...) {CloseHandle(held);throw;}
+    const auto blockedElapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-blockedStart).count();
+    CloseHandle(held);
+    Require(blockedElapsed<1500 && std::filesystem::exists(blocked/"manifest.json") &&
+        !std::filesystem::exists(blockedTarget),"filter publish persistent lock was not bounded");
+}
+#endif
 }
 int main()
 {
     const auto root=std::filesystem::temp_directory_path()/
         ("jn-cache-query-test-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { Queries(root); std::filesystem::remove_all(root); std::cout<<"cache query tests passed\n"; return 0; }
+    try { Queries(root);
+#ifdef _WIN32
+        WindowsPublishRetry(root);
+#endif
+        std::filesystem::remove_all(root); std::cout<<"cache query tests passed\n"; return 0; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\nfixture: "<<root<<'\n'; return 1; }
 }

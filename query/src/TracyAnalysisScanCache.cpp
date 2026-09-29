@@ -3,6 +3,8 @@
 #include "TracyAnalysisCacheKey.hpp"
 #include "TracyNeutralStatisticsCache.hpp"
 #include "TracyHash.hpp"
+#include "../../server/TracyTraceFormat.hpp"
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <stdexcept>
@@ -18,6 +20,11 @@ json Descriptor(const AnalysisCacheTableDescriptor& d)
 { return {{"records",d.records},{"blocks",d.blocks},{"content_sha256",d.contentSha256}}; }
 json FileIdentity(const std::filesystem::path& path,const AnalysisCacheTableOptions& options)
 {
+    if(std::filesystem::is_directory(path)) {
+        json files=json::object();
+        for(const auto name:{"header.bin","directory.bin","data.bin"}) files[name]=FileIdentity(path/name,options);
+        return {{"format","paged-records-v1"},{"files",std::move(files)}};
+    }
     std::ifstream input(path,std::ios::binary); if(!input) Fail("series_missing");
     std::array<char,65536> buffer; Sha256Builder hash; uint64_t bytes=0;
     while(input) {
@@ -64,6 +71,91 @@ void PersistInjected(const std::filesystem::path& generation,const std::string& 
     std::vector<PolicySignatureContext>().swap(p.signatureContexts);
 }
 }
+AnalysisCacheTableDescriptor SaveAnalysisPhaseMetadata(const std::filesystem::path& path,
+    const std::string& identity,const AnalysisScanProducts& products,AnalysisCacheTableOptions options)
+{
+    AnalysisCacheTableWriter writer(path,identity,"analysis-phase-metadata-v1",options);
+    uint64_t ordinal=0;
+    const auto append=[&](const json& row) {Check(options);writer.Append(cache_key::Unsigned(ordinal++),row.dump());};
+    append({{"type","header"},{"contexts",products.signatureContexts.size()},
+        {"capacity",products.capacityFacts.size()},{"timelines",products.frameTimelines.size()}});
+    for(const auto& context:products.signatureContexts) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(context.path.size()+context.name.size()+context.signatureId.size()+context.frameScope.size()));
+        append({{"type","context"},{"context",SerializePolicySignatureContextRecord(context)}});
+    }
+    for(const auto& f:products.capacityFacts) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(f.description.size()+f.domain.size()+f.signatureId.size()+f.familyId.size()+f.metric.size()));
+        append({{"type","capacity"},{"domain",f.domain},{"signature",f.signatureId},{"family",f.familyId},
+            {"metric",f.metric},{"value",f.valueBytes},{"frame",f.frameIndex?json(*f.frameIndex):json(nullptr)},
+            {"exact",f.exact},{"description",f.description}});
+    }
+    for(const auto& timeline:products.frameTimelines) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(timeline.frameScope.size()+timeline.name.size()+timeline.observationUnit.size()));
+        append({{"type","timeline"},{"scope",timeline.frameScope},{"name",timeline.name},
+            {"unit",timeline.observationUnit},{"count",timeline.frames.size()}});
+        for(const auto& frame:timeline.frames) {
+            AnalysisWorkspaceReservation frameBudget(options.workspace,65536+32ull*frame.structureKey.size());
+            for(const auto& ref:frame.eventRefs)frameBudget.Add(2048+32ull*ref.size());
+            append({{"type","frame"},{"frame",Frame(frame)}});
+        }
+    }
+    return writer.Commit();
+}
+
+AnalysisScanProducts LoadAnalysisPhaseMetadata(const std::filesystem::path& path,
+    const std::string& identity,const std::string& contentSha,AnalysisCacheTableOptions options)
+{
+    AnalysisCacheTableReader reader(path,identity,"analysis-phase-metadata-v1",options);
+    if(reader.Descriptor().contentSha256!=contentSha)Fail("phase_metadata_identity");
+    AnalysisScanProducts products;
+    products.metadataWorkspace=AnalysisWorkspaceReservation(options.workspace);
+    products.contextWorkspace=AnalysisWorkspaceReservation(options.workspace);
+    uint64_t ordinal=0;
+    AnalysisWorkspaceReservation parseBudget(options.workspace);
+    const auto read=[&](std::string_view type) {
+        Check(options);if(ordinal>=reader.RecordCount())Fail("phase_metadata_truncated");
+        const auto row=reader.GetAt(ordinal);
+        if(row.key!=cache_key::Unsigned(ordinal++))Fail("phase_metadata_order");
+        parseBudget.Resize(65536+32ull*row.payload.size());
+        auto value=json::parse(row.payload);
+        if(value.at("type").get<std::string>()!=type)Fail("phase_metadata_type");
+        if(type=="context")products.contextWorkspace.Add(2048+16ull*row.payload.size());
+        else if(type=="frame") {
+            // Fixed frame/vector storage and owned strings survive this read;
+            // the JSON DOM belongs to parseBudget, not every retained frame.
+            products.metadataWorkspace.Add(4ull*sizeof(PolicyFrameEvidence)+4ull*row.payload.size());
+        }
+        else products.metadataWorkspace.Add(2048+16ull*row.payload.size());
+        return value;
+    };
+    const auto header=read("header");
+    for(const auto* field:{"contexts","capacity","timelines"})
+        if(!header.at(field).is_number_unsigned() || header.at(field).get<uint64_t>()>reader.RecordCount())Fail("phase_metadata_count");
+    for(uint64_t i=0;i<header.at("contexts").get<uint64_t>();++i) {
+        const auto row=read("context");PolicySignatureContext context;std::string error;
+        if(!DeserializePolicySignatureContextRecord(row.at("context").get<std::string>(),context,error))Fail("phase_context_invalid");
+        products.signatureContexts.push_back(std::move(context));
+    }
+    for(uint64_t i=0;i<header.at("capacity").get<uint64_t>();++i) {
+        const auto row=read("capacity");PolicyCapacityFact f;
+        f.domain=row.at("domain").get<std::string>();f.signatureId=row.at("signature").get<std::string>();
+        f.familyId=row.at("family").get<std::string>();f.metric=row.at("metric").get<std::string>();
+        f.valueBytes=row.at("value").get<uint64_t>();if(!row.at("frame").is_null())f.frameIndex=row.at("frame").get<uint64_t>();
+        f.exact=row.at("exact").get<bool>();f.description=row.at("description").get<std::string>();
+        products.capacityFacts.push_back(std::move(f));
+    }
+    for(uint64_t i=0;i<header.at("timelines").get<uint64_t>();++i) {
+        const auto row=read("timeline");const auto count=row.at("count").get<uint64_t>();
+        if(count>reader.RecordCount()-ordinal)Fail("phase_frame_count");
+        PolicyFrameTimeline timeline;timeline.frameScope=row.at("scope").get<std::string>();
+        timeline.name=row.at("name").get<std::string>();timeline.observationUnit=row.at("unit").get<std::string>();
+        for(uint64_t f=0;f<count;++f)timeline.frames.push_back(ParseFrame(read("frame").at("frame")));
+        products.frameTimelines.push_back(std::move(timeline));
+    }
+    if(ordinal!=reader.RecordCount())Fail("phase_metadata_extra");
+    reader.ValidateAll();return products;
+}
+
 std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation,
     const std::string& identity,AnalysisScanProducts& products,AnalysisCacheTableOptions options)
 {
@@ -80,8 +172,16 @@ std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation
         std::ofstream output(series,std::ios::binary); if(!output) Fail("series_create");
     }
     else if(products.frameSeriesPath!=series) {
-        AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath));
-        std::filesystem::copy_file(products.frameSeriesPath,series);
+        if(std::filesystem::is_directory(products.frameSeriesPath)) {
+            std::filesystem::create_directory(series);
+            for(const auto name:{"data.bin","directory.bin","header.bin"}) {
+                AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath/name));
+                std::filesystem::copy_file(products.frameSeriesPath/name,series/name);
+            }
+        } else {
+            AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath));
+            std::filesystem::copy_file(products.frameSeriesPath,series);
+        }
     }
     products.frameSeriesPath=series;
     const auto seriesIdentity=FileIdentity(series,options);
@@ -112,7 +212,7 @@ std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation
         }
     }
     const auto md=metadata.Commit();
-    const json document={{"schema",1},{"format",AnalysisScanCacheFormatId},{"identity",identity},
+    const json document={{"schema",1},{"format",AnalysisScanCacheFormatId},{"identity",identity},{"decoder",ExtendedTraceDecoderIdentity},
         {"neutral_content_sha256",neutral.ContentSha256()},{"metadata",Descriptor(md)},{"frame_series",seriesIdentity}};
     Check(options);
     AnalysisCacheTableWriter header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
@@ -122,12 +222,17 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
     const std::string& identity,const std::string& headerSha,AnalysisCacheTableOptions options,uint64_t metadataBytes)
 {
     Check(options);
+    // The shared workspace is the actual memory contract for managed scans.
+    // Keep a conservative fallback for stand-alone readers without a budget;
+    // an explicit caller cap may only lower either limit.
+    const auto sharedLimit=options.workspace ? options.workspace->Snapshot().maximumBytes : 128ull*1024*1024;
+    const auto metadataLimit=std::min(metadataBytes,sharedLimit);
     AnalysisCacheTableReader header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
     if(header.RecordCount()!=1 || header.Descriptor().contentSha256!=headerSha) Fail("header_identity");
     const auto record=header.GetAt(0);
     AnalysisWorkspaceReservation headerWorkspace(options.workspace,65536+32ull*record.payload.size());
     const auto j=json::parse(record.payload);
-    if(record.key!="header" || j.at("schema")!=1 || j.at("format")!=AnalysisScanCacheFormatId || j.at("identity")!=identity) Fail("header_schema");
+    if(record.key!="header" || j.at("schema")!=1 || j.at("format")!=AnalysisScanCacheFormatId || j.at("identity")!=identity || j.value("decoder",std::string())!=ExtendedTraceDecoderIdentity) Fail("header_schema");
     AnalysisScanProducts products;
     products.metadataWorkspace=AnalysisWorkspaceReservation(options.workspace);
     products.neutralCachePath=generation/"neutral-statistics-v1"; products.neutralCacheIdentity=identity;
@@ -145,7 +250,7 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
     for(uint64_t i=0;i<metadata.RecordCount();++i) {
         Check(options); const auto row=metadata.GetAt(i);
         const auto bytes=uint64_t(row.payload.size())*4+512;
-        if(retained>metadataBytes || bytes>metadataBytes-retained) Fail("metadata_budget");
+        if(retained>metadataLimit || bytes>metadataLimit-retained) Fail("metadata_budget");
         products.metadataWorkspace.Add(bytes);
         AnalysisWorkspaceReservation parseWorkspace(options.workspace,65536+32ull*row.payload.size());
         retained+=bytes; const auto v=json::parse(row.payload); const auto type=v.at("type").get<std::string>();
@@ -162,7 +267,7 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
             finishTimeline(); const auto index=products.frameTimelines.size();
             if(v.at("ordinal")!=index || row.key!="timeline"+cache_key::Unsigned(index)+"0") Fail("timeline_order");
             expectedFrames=v.at("frame_count").get<uint64_t>();
-            if(expectedFrames>metadataBytes/(4*sizeof(PolicyFrameEvidence))) Fail("metadata_budget");
+            if(expectedFrames>metadataLimit/(4*sizeof(PolicyFrameEvidence))) Fail("metadata_budget");
             products.frameTimelines.push_back({v.at("frame_scope").get<std::string>(),v.at("name").get<std::string>(),{},
                 v.at("observation_unit").get<std::string>()});
         } else if(type=="frame") {

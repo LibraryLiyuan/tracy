@@ -15,6 +15,8 @@ struct AnalysisProcessMemorySample
 {
     bool available=false;
     uint64_t residentBytes=0,privateBytes=0;
+    bool systemCommitAvailable=false;
+    uint64_t systemCommitLimitBytes=0,systemCommitBytes=0,systemCommitHeadroomBytes=0;
 };
 AnalysisProcessMemorySample ReadAnalysisProcessMemory();
 struct AnalysisProcessMemoryOptions
@@ -27,10 +29,16 @@ struct AnalysisProcessMemorySnapshot
 {
     uint64_t maximumBytes=0,samples=0,residentBytes=0,privateBytes=0;
     uint64_t peakResidentBytes=0,peakPrivateBytes=0;
+    bool systemCommitAvailable=false;
+    uint64_t systemCommitLimitBytes=0,systemCommitBytes=0,peakSystemCommitBytes=0;
+    uint64_t systemCommitHeadroomBytes=0,minimumSystemCommitHeadroomBytes=0;
     std::string error;
 };
 // Cooperative, sampled whole-process protection, NOT an allocator or OS cap.
 // Windows measures WorkingSetSize and PrivateUsage, including the source Worker.
+// Working set remains telemetry because mapped file pages can make it much
+// larger than committed private memory; maximumBytes is enforced on private
+// bytes only.
 // Linux private bytes are private resident + swap; macOS uses physical footprint.
 // Each execution owns a fresh guard: a failure is latched until that execution
 // has stopped. A later resume may succeed once capacity becomes available.

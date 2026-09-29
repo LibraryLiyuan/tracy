@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -21,6 +22,9 @@
 #include "tracy_robin_hood.h"
 #include "TracyEvent.hpp"
 #include "TracyJnData.hpp"
+#include "TracyMemoryAttribution.hpp"
+#include "TracyOfflineStorage.hpp"
+#include "TracyTraceFormat.hpp"
 #include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -35,6 +39,7 @@ namespace tracy
 
 class FileRead;
 class FileWrite;
+class BufferedFileWrite;
 
 // Offline conversion uses the normal Full Worker data model without opening a
 // localhost socket.  The transport is deliberately small: the converter owns
@@ -73,6 +78,32 @@ namespace EventType
     };
 }
 
+// Read-only, stable-lifetime string storage supplied by a manifest-bound
+// Query sidecar. Returned pointers remain valid for the source lifetime.
+class SerializedStringSource
+{
+public:
+    virtual ~SerializedStringSource() = default;
+    virtual uint64_t StringCount() const = 0;
+    virtual uint64_t PointerCount( uint8_t kind ) const = 0;
+    virtual const char* StringAt( uint32_t ordinal ) const = 0;
+    virtual const char* PointerString( uint8_t kind, uint64_t id ) const = 0;
+    virtual std::pair<const char*, const char*> ExternalName( uint64_t id ) const = 0;
+    virtual bool HasPointer( uint8_t kind, uint64_t id ) const = 0;
+    virtual void VisitPointerIds( uint8_t kind, const std::function<void( uint64_t )>& visitor ) const = 0;
+};
+
+class SerializedCallstackSource
+{
+public:
+    struct FrameView { StringIdx imageName; const CallstackFrame* frames = nullptr; uint8_t count = 0; };
+    virtual ~SerializedCallstackSource() = default;
+    virtual uint64_t CallstackCount() const = 0;
+    virtual const CallstackFrameId* Frames( uint32_t id, uint32_t& count ) const = 0;
+    virtual uint64_t FrameCount() const = 0;
+    virtual bool Frame( CallstackFrameId id, FrameView& output ) const = 0;
+};
+
 class SerializedZoneSink
 {
 public:
@@ -84,10 +115,56 @@ public:
         Relation,
         GpuReferencePass,
         GpuReferenceUse,
-        GpuReferenceEnd
+        GpuReferenceEnd,
+#define X(name,field,type) name,
+        TRACY_OFFLINE_BASE_APPEND_DOMAINS(X)
+#undef X
+        JobType,
+#define X(name,field,type,mut) name,
+        TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
     };
+    // Query index section ordinals are stable even as offline storage domains grow.
+    static_assert(uint8_t(JnDomain::GfxEntity)==1&&uint8_t(JnDomain::GfxLink)==2&&uint8_t(JnDomain::GpuReferencePass)==4&&uint8_t(JnDomain::GpuReferenceEnd)==6);
 
     virtual ~SerializedZoneSink() = default;
+    virtual bool ValidatesCatalog()const{return false;}
+    virtual void CatalogMetadata(OfflineCatalogQuality){}
+    virtual bool WantsCatalogStrings()const{return false;}
+    virtual bool WantsGlobalStrings()const{return false;}
+    virtual void GlobalStringsBegin(uint64_t){}
+    virtual void GlobalStringBegin(uint64_t,uint64_t,uint64_t){}
+    virtual void GlobalStringBytes(uint64_t,uint64_t,const void*,uint64_t){}
+    virtual void GlobalStringEnd(uint64_t){}
+    virtual void GlobalStringsEnd(){}
+    virtual void GlobalPointerTableBegin(uint8_t,uint64_t){}
+    virtual void GlobalPointerRecord(uint8_t,uint64_t,uint64_t,uint64_t,uint64_t){}
+    virtual void GlobalPointerTableEnd(uint8_t){}
+    virtual SerializedStringSource* GlobalStringSource(){return nullptr;}
+    virtual bool WantsCallstacks()const{return false;}
+    virtual void CallstacksBegin(uint64_t){}
+    virtual void CallstackBegin(uint32_t,uint32_t){}
+    virtual void CallstackFrames(uint32_t,uint32_t,const CallstackFrameId*,uint32_t){}
+    virtual void CallstackEnd(uint32_t){}
+    virtual void CallstacksEnd(){}
+    virtual bool WantsCallstackFrames()const{return false;}
+    virtual void CallstackFrameDefinitionsBegin(uint64_t){}
+    virtual void CallstackFrameDefinitionBegin(uint64_t,CallstackFrameId,uint8_t,StringIdx){}
+    virtual void CallstackFrameDefinitionRecords(uint64_t,uint32_t,const CallstackFrame*,uint32_t){}
+    virtual void CallstackFrameDefinitionEnd(uint64_t){}
+    virtual void CallstackFrameDefinitionsEnd(){}
+    virtual SerializedCallstackSource* GlobalCallstackSource(){return nullptr;}
+    virtual bool WantsSamples()const{return false;}
+    virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
+    virtual void SampleRecord(uint64_t,uint8_t,uint64_t,int64_t,uint32_t){}
+    virtual void SamplesEnd(uint64_t,uint8_t){}
+    virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
+    virtual void CatalogStringsBegin(uint64_t){}
+    virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
+    virtual void CatalogStringsEnd(){}
+    virtual bool WantsZoneExtras() const { return false; }
+    virtual void ZoneExtrasRawBlock(uint64_t,const void*,uint64_t) {}
+    virtual void ValidateZoneExtraIndex(uint32_t) {}
     virtual void ZoneExtrasBegin( uint64_t count ) = 0;
     virtual void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) = 0;
     virtual void ZoneExtrasEnd() = 0;
@@ -101,6 +178,9 @@ public:
     virtual void GpuZoneEnd( uint64_t index, int64_t cpuEnd, int64_t gpuEnd, uint16_t queryId ) = 0;
     virtual void GpuZonesEnd() = 0;
     virtual bool WantsJnRecords( JnDomain, uint32_t ) const { return false; }
+    virtual bool AllowsLargeJnRecords( JnDomain, uint64_t, uint32_t ) const { return false; }
+    virtual void JnBufferBytes(uint64_t) {}
+    virtual void CheckRead() {}
     virtual void JnRecordsBegin( JnDomain, uint64_t, uint32_t ) {}
     virtual void JnRecordsBlock( JnDomain, uint64_t, const void*, uint64_t, uint32_t ) {}
     virtual void JnRecordsEnd( JnDomain ) {}
@@ -158,6 +238,7 @@ struct LoadProgress
 
 class Worker
 {
+    friend struct OfflineStorageSemanticTest;
 public:
     struct OfflineEventStat
     {
@@ -170,6 +251,9 @@ public:
     {
         uint64_t fullResolveCalls = 0;
         uint64_t fullResolveInputUnits = 0;
+        uint64_t batchRowsExamined = 0;
+        uint64_t batchRowsMatched = 0;
+        uint64_t catalogRowsProcessed = 0;
         uint64_t fullResolveNanoseconds = 0;
         uint64_t generationEndCalls = 0;
         uint64_t postEndBatchCalls = 0;
@@ -552,9 +636,12 @@ public:
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
         bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false,
-        WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false );
+        WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false,
+        WorkerOfflineStorage* offlineStorage = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
-    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
+    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false,
+        SerializedZoneSink* serializedZoneSink = nullptr, SerializedStringSource* serializedStringSource = nullptr,
+        SerializedCallstackSource* serializedCallstackSource = nullptr );
     ~Worker();
 
     const std::string& GetAddr() const { return m_addr; }
@@ -572,6 +659,10 @@ public:
     const char* GetCpuManufacturer() const { return m_data.cpuManufacturer; }
 
     std::mutex& GetDataLock() { return m_data.lock; }
+
+    // Diagnostic only. Caller holds ObtainLockForMainThread; OfflineConvert
+    // with deferred sample analysis has one owner for these model containers.
+    MemoryAttribution CollectMemoryAttributionLocked() const;
 
     // This guard helps prevent main thread starvation by coordinating lock acquisition between
     // the main thread and worker threads. It uses an atomic flag (mainThreadWantsLock) to signal
@@ -603,7 +694,16 @@ public:
     int64_t GetFirstTime() const;
     int64_t GetLastTime() const { return m_data.lastTime; }
     uint64_t GetZoneCount() const { return m_data.zonesCnt; }
-    uint64_t GetZoneExtraCount() const { return m_data.zoneExtra.size() - 1; }
+    uint64_t GetZoneExtraCount() const { return (m_offlineStorage?m_offlineStorage->ZoneExtraCount():m_data.zoneExtra.size()) - 1; }
+    // Diagnostic caller must first join offline replay (or hold the data lock).
+    std::array<uint64_t,4> GetOfflineMemoryWitness() const {
+        return {m_slab.AllocatedBytes(),m_data.zoneExtra.size(),m_data.zoneExtra.OwnedCapacityBytes(),reinterpret_cast<uintptr_t>(&m_data.zoneExtra)};
+    }
+    // Caller joins replay before reading; no traversal or large snapshot allocation.
+    std::array<uint64_t,8> GetOfflineCoreCounts() const {
+        return {StringTableCount(),GetCallstackPayloadCount(),m_data.zonesCnt,m_data.gpuCnt,
+            m_data.zoneChildren.size(),m_data.callstackFrameMap.size(),m_data.stringMap.size(),m_slab.AllocatedBytes()};
+    }
     uint64_t GetGpuZoneCount() const { return m_data.gpuCnt; }
     uint64_t GetLockCount() const;
     uint64_t GetPlotCount() const;
@@ -612,19 +712,19 @@ public:
     uint64_t GetContextSwitchPerCpuCount() const;
     bool HasContextSwitches() const { return !m_data.ctxSwitch.empty(); }
     uint64_t GetSrcLocCount() const { return m_data.sourceLocationPayload.size() + m_data.sourceLocation.size(); }
-    uint64_t GetCallstackPayloadCount() const { return m_data.callstackPayload.size() - 1; }
+    uint64_t GetCallstackPayloadCount() const { return m_externalCallstackSource?m_externalCallstackSource->CallstackCount():(m_externalCallstacks?m_externalCallstackCount:m_data.callstackPayload.size() - 1); }
 #ifndef TRACY_NO_STATISTICS
     uint64_t GetCallstackParentPayloadCount() const { return m_data.parentCallstackPayload.size(); }
     uint64_t GetCallstackParentFrameCount() const { return m_callstackParentNextIdx; }
 #endif
-    uint64_t GetCallstackFrameCount() const { return m_data.callstackFrameMap.size() - m_pendingCallstackFrames; }
+    uint64_t GetCallstackFrameCount() const { return m_externalCallstackSource?m_externalCallstackSource->FrameCount():m_data.callstackFrameMap.size() - m_pendingCallstackFrames; }
     uint64_t GetCallstackSampleCount() const { return m_data.samplesCnt; }
     uint64_t GetSymbolsCount() const { return m_data.symbolMap.size(); }
     uint64_t GetSymbolCodeCount() const { return m_data.symbolCode.size(); }
     uint64_t GetSymbolCodeSize() const { return m_data.symbolCodeSize; }
     uint64_t GetGhostZonesCount() const { return m_data.ghostCnt; }
     uint32_t GetFrameImageCount() const { return (uint32_t)m_data.frameImage.size(); }
-    uint64_t GetStringsCount() const { return m_data.strings.size() + m_data.stringData.size(); }
+    uint64_t GetStringsCount() const { return (m_externalStringSource?m_externalStringSource->PointerCount(0):m_data.strings.size()) + StringTableCount(); }
     uint64_t GetHwSampleCountAddress() const { return m_data.hwSamples.size(); }
     uint64_t GetHwSampleCount() const;
     bool HasHwBranchRetirement() const { return m_data.hasBranchRetirement; }
@@ -646,9 +746,12 @@ public:
     int GetCpuDataCpuCount() const { return m_data.cpuDataCount; }
     uint64_t GetPidFromTid( uint64_t tid ) const;
     const unordered_flat_map<uint64_t, CpuThreadData>& GetCpuThreadData() const { return m_data.cpuThreadData; }
-    bool HasExternalName( uint64_t id ) const { return m_data.externalNames.find( id ) != m_data.externalNames.end(); }
+    bool HasExternalName( uint64_t id ) const;
     const unordered_flat_map<uint64_t, const char*>& GetThreadNameMap() const { return m_data.threadNames; }
     const unordered_flat_map<uint64_t, std::pair<const char*, const char*>>& GetExternalNameMap() const { return m_data.externalNames; }
+    const char* TryGetLocalThreadName( uint64_t id ) const;
+    void VisitThreadNameIds( const std::function<void( uint64_t )>& visitor ) const;
+    void VisitExternalNameIds( const std::function<void( uint64_t )>& visitor ) const;
     const unordered_flat_map<uint64_t, uint64_t>& GetTidToPidMap() const { return m_data.tidToPid; }
     const unordered_flat_map<const char*, MemoryBlock, charutil::Hasher, charutil::Comparator>& GetSourceFileCache() const { return m_data.sourceFileCache; }
     uint64_t GetSourceFileCacheCount() const { return m_data.sourceFileCache.size(); }
@@ -676,7 +779,7 @@ public:
     const JnTraceData& GetJnTraceData() const { return m_data.jnTrace; }
     bool HasJnTraceData() const { return m_data.jnTrace.present; }
 
-    const VarArray<CallstackFrameId>& GetCallstack( uint32_t idx ) const { return *m_data.callstackPayload[idx]; }
+    const VarArray<CallstackFrameId>& GetCallstack( uint32_t idx ) const { if(m_externalCallstackSource)throw std::runtime_error("external_callstack_requires_value_access");return *m_data.callstackPayload[idx]; }
     const CallstackFrameData* GetCallstackFrame( const CallstackFrameId& ptr ) const;
     CallstackFrameId PackPointer( uint64_t ptr ) const;
     uint64_t GetCanonicalPointer( const CallstackFrameId& id ) const;
@@ -719,16 +822,16 @@ public:
         if( !ref.active ) return nullptr;
         if( ref.isidx )
         {
-            return ref.str < m_data.stringData.size() ? m_data.stringData[ref.str] : nullptr;
+            return ref.str < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(ref.str)):(m_externalStringSource?m_externalStringSource->StringAt(uint32_t(ref.str)):m_data.stringData[ref.str])) : nullptr;
         }
-        const auto it = m_data.strings.find( ref.str );
-        return it != m_data.strings.end() ? it->second : nullptr;
+        if(m_externalStringSource)return m_externalStringSource->PointerString(0,ref.str);
+        const auto it = m_data.strings.find( ref.str ); return it != m_data.strings.end() ? it->second : nullptr;
     }
     tracy_force_inline const char* TryGetString( const StringIdx& idx ) const
     {
         if( !idx.Active() ) return nullptr;
         const auto value = idx.Idx();
-        return value < m_data.stringData.size() ? m_data.stringData[value] : nullptr;
+        return value < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(value)):(m_externalStringSource?m_externalStringSource->StringAt(uint32_t(value)):m_data.stringData[value])) : nullptr;
     }
     const char* GetThreadName( uint64_t id ) const;
     bool IsThreadLocal( uint64_t id );
@@ -751,8 +854,8 @@ public:
 #endif
 
     tracy_force_inline const bool HasZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0; }
-    tracy_force_inline const bool HasValidZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0 && ev.extra < m_data.zoneExtra.size(); }
-    tracy_force_inline const ZoneExtra& GetZoneExtra( const ZoneEvent& ev ) const { return m_data.zoneExtra[ev.extra]; }
+    tracy_force_inline const bool HasValidZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0 && ev.extra <= GetZoneExtraCount(); }
+    tracy_force_inline const ZoneExtra& GetZoneExtra( const ZoneEvent& ev ) const { if(m_offlineStorage)throw std::runtime_error("offline_zone_extra_requires_value_access");return m_data.zoneExtra[ev.extra]; }
 
     std::vector<int16_t> GetMatchingSourceLocation( const char* query, bool ignoreCase ) const;
 
@@ -794,6 +897,7 @@ public:
     bool IsBackgroundDone() const { return m_backgroundDone.load( std::memory_order_acquire ); }
     bool IsOnDemand() const { return m_onDemand; }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
+    void JoinOfflineReplay();
     void Disconnect();
     void MarkProtocolDisconnect() { m_disconnect.store( true, std::memory_order_release ); }
     void RequestProtocolDrain( bool disconnectClient = true );
@@ -814,6 +918,8 @@ public:
     const JnGpuCatalogResolveStats& GetJnGpuCatalogResolveStats() const { return m_jnGpuCatalogResolveStats; }
 
     void Write( FileWrite& f, bool fiDict );
+    void FinalizeOfflineCatalog(){if(m_offlineStorage)FinalizeJnGpuCatalogForSave();}
+    void FinalizeOfflineStrings();
     int GetTraceVersion() const { return m_traceVersion; }
     int64_t GetLegacyQueueDelay() const { return m_legacyQueueDelay; }
     uint8_t GetHandshakeStatus() const { return m_handshake.load( std::memory_order_relaxed ); }
@@ -846,6 +952,9 @@ public:
     void CacheSourceFiles();
 
     StringLocation StoreString(const char* str, size_t sz);
+    uint32_t StoreCallstackFrames(const CallstackFrameId*,uint16_t,bool);
+    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():(m_externalStringSource?m_externalStringSource->StringCount():(m_externalStrings?m_externalStringCount:m_data.stringData.size())); }
+    uint64_t PersistedStringToken(const char*) const;
 
     std::vector<uint32_t>& GetPendingThreadHints() { return m_pendingThreadHints; }
     void ClearPendingThreadHints() { m_pendingThreadHints.clear(); }
@@ -870,6 +979,8 @@ private:
     bool RecordProtocolDrainControl();
     void NotifyProtocolClose( ProtocolCloseReason reason );
     void FinishProtocol( ProtocolCloseReason reason );
+    void RunWorkerThread(bool network);
+    void OfflineThreadFailure(bool network,const char* reason) noexcept;
 
     tracy_force_inline bool DispatchProcess( const QueueItem& ev, const char*& ptr );
     tracy_force_inline bool Process( const QueueItem& ev );
@@ -1022,6 +1133,9 @@ private:
     void InvalidateJnGpuCatalog( uint64_t generation, uint8_t state );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
+    tracy_force_inline GpuEvent* AllocGpuEvent();
+    void SyncOfflineGpuZone( GpuEvent* );
+    void ReleaseOfflineGpuZone( GpuEvent* );
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
     tracy_force_inline void ProcessZoneBeginAllocSrcLocImpl( ZoneEvent* zone, const QueueZoneBeginLean& ev );
     tracy_force_inline void ProcessGpuZoneBeginImpl( GpuEvent* zone, const QueueGpuZoneBegin& ev, bool serial );
@@ -1159,6 +1273,12 @@ private:
 
     uint32_t GetSingleStringIdx();
     uint32_t GetSecondStringIdx();
+    void ValidateStringIndex(const StringIdx& value) const {
+        if(value.Active()&&value.Idx()>=StringTableCount())throw LoadFailure("string index references missing string");
+    }
+    void ValidateStringReference(const StringRef& value) const {
+        if(value.active&&value.isidx&&value.str>=StringTableCount())throw LoadFailure("string reference exceeds string table");
+    }
     const ContextSwitch* const GetContextSwitchDataImpl( uint64_t thread );
 
     void CacheSource( const StringRef& str, const StringIdx& image = StringIdx() );
@@ -1177,7 +1297,9 @@ private:
     void UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint16_t framesCount, uint32_t count, const VarArray<CallstackFrameId>& cs );
     void CanonicalizeSampleStatistics();
     tracy_force_inline void GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<CallstackFrameId>& cs );
+    tracy_force_inline void GetStackWithInlines( Vector<InlineStackData>& ret, const CallstackFrameId* cs, size_t count );
     tracy_force_inline int AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone>* vec, uint64_t t );
+    tracy_force_inline int AddGhostZone( const CallstackFrameId* cs, size_t count, Vector<GhostZone>* vec, uint64_t t );
 #endif
 
     tracy_force_inline int64_t ReadTimeline( FileRead& f, ZoneEvent* zone, int64_t refTime, int32_t& childIdx );
@@ -1196,6 +1318,29 @@ private:
     tracy_force_inline ZoneExtra& GetZoneExtraMutable( const ZoneEvent& ev ) { return m_data.zoneExtra[ev.extra]; }
     tracy_force_inline ZoneExtra& AllocZoneExtra( ZoneEvent& ev );
     tracy_force_inline ZoneExtra& RequestZoneExtra( ZoneEvent& ev );
+    ZoneExtra ReadZoneExtraValue(const ZoneEvent& ev) const {
+        ZoneExtra value;if(m_offlineStorage)m_offlineStorage->ReadZoneExtra(ev.extra,&value);else value=m_data.zoneExtra[ev.extra];return value;
+    }
+    template<class F> void UpdateZoneExtra(ZoneEvent& ev,F update) {
+        if(!m_offlineStorage){update(RequestZoneExtra(ev));return;}
+        ZoneExtra value{};
+        if(ev.extra)m_offlineStorage->ReadZoneExtra(ev.extra,&value);
+        update(value);
+        if(ev.extra)m_offlineStorage->PutZoneExtra(ev.extra,&value);
+        else ev.extra=m_offlineStorage->AppendZoneExtra(&value);
+        const auto zone=m_offlineCpuZoneIds.find(&ev);
+        if(zone!=m_offlineCpuZoneIds.end()){
+            OfflineCpuZone row;m_offlineStorage->ReadCpuZone(zone->second,row);row.extra=ev.extra;m_offlineStorage->PutCpuZone(zone->second,row);
+        }
+    }
+    template<class F> void UpdateOfflineCpuZoneExtra(uint64_t id,F update) {
+        OfflineCpuZone row;m_offlineStorage->ReadCpuZone(id,row);ZoneExtra value{};
+        if(row.extra)m_offlineStorage->ReadZoneExtra(row.extra,&value);
+        update(value);
+        if(row.extra)m_offlineStorage->PutZoneExtra(row.extra,&value);else row.extra=m_offlineStorage->AppendZoneExtra(&value);
+        m_offlineStorage->PutCpuZone(id,row);
+    }
+
 
     int64_t GetZoneEndImpl( const ZoneEvent& ev );
     int64_t GetZoneEndImpl( const GpuEvent& ev );
@@ -1208,6 +1353,8 @@ private:
     void SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent );
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
+    void WriteOfflineCpuTimeline( BufferedFileWrite&, uint64_t, int64_t&, uint64_t );
+    void WriteOfflineGpuTimeline( FileWrite&, uint64_t, int64_t&, int64_t&, uint32_t );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
     template<typename Adapter, typename V>
     void WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime );
@@ -1220,6 +1367,23 @@ private:
 
     Socket m_sock;
     WorkerOfflineTransport* m_offlineTransport = nullptr;
+    WorkerOfflineStorage* m_offlineStorage = nullptr;
+    bool m_offlineCatalogFinalized=false;
+    template<class T> void AppendOfflineRecord(OfflineAppendDomain domain,const T& row,std::vector<T>& memory){
+        if(m_offlineStorage)m_offlineStorage->AppendRecord(domain,&row,sizeof(T));else memory.push_back(row);
+    }
+    template<class T> uint64_t CatalogSize(OfflineCatalogDomain domain,const std::vector<T>& memory)const{return m_offlineStorage?m_offlineStorage->CatalogCount(domain):memory.size();}
+    template<class T> T CatalogValue(OfflineCatalogDomain domain,uint64_t id,const std::vector<T>& memory)const{T row;if(m_offlineStorage)m_offlineStorage->ReadCatalog(domain,id,&row,sizeof(row));else row=memory.at(size_t(id));return row;}
+    template<class T> uint64_t AppendCatalogValue(OfflineCatalogDomain domain,const T& row,std::vector<T>& memory){if(m_offlineStorage)return m_offlineStorage->AppendCatalog(domain,&row,sizeof(row));const auto id=memory.size();memory.push_back(row);return id;}
+    template<class T> void PutCatalogValue(OfflineCatalogDomain domain,uint64_t id,const T& row,std::vector<T>& memory){if(m_offlineStorage)m_offlineStorage->PutCatalog(domain,id,&row,sizeof(row));else memory.at(size_t(id))=row;}
+    template<class T,class F> void ForCatalogRows(OfflineCatalogDomain domain,std::vector<T>& memory,uint64_t first,uint64_t count,F&& action,bool update=false){
+        const auto size=CatalogSize(domain,memory);if(first>size||count>size-first)throw std::runtime_error("catalog_record_range");
+        for(uint64_t i=first;i<first+count;++i){if(m_offlineStorage){T row=CatalogValue(domain,i,memory);const T before=row;action(row);if(update&&std::memcmp(&row,&before,sizeof(row)))PutCatalogValue(domain,i,row,memory);}else action(memory[size_t(i)]);}
+    }
+    template<class T> uint64_t AppendCatalogPayload(OfflineCatalogDomain,const uint8_t*,uint32_t,std::vector<T>&);
+    JnGpuCatalogStringData CatalogStringValue(uint64_t)const;
+
+
     std::string m_addr;
     uint16_t m_port;
     ProtocolObserver* m_protocolObserver = nullptr;
@@ -1307,10 +1471,21 @@ private:
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogLiveResources;
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogDescriptorHeaps;
     uint64_t m_jnGpuCatalogNextDescriptorHeapId = 1;
+    bool m_offlinePassTimesPrepared = false;
     unordered_flat_map<uint32_t, uint32_t> m_jnCallsiteCallstacks;
     unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
+    unordered_flat_map<uint32_t, std::vector<uint64_t>> m_jnPendingOfflineCpuCallsites;
+    unordered_flat_map<uint64_t, uint64_t> m_offlineCpuThreadRoots;
+    unordered_flat_map<ZoneEvent*, uint64_t> m_offlineCpuZoneIds;
     unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
+    unordered_flat_map<uint32_t, std::vector<uint64_t>> m_jnPendingOfflineGpuCallsites;
+    unordered_flat_map<GpuCtxData*, unordered_flat_map<uint64_t, uint64_t>> m_offlineGpuThreadRoots;
+    unordered_flat_map<GpuEvent*, uint64_t> m_offlineGpuZoneIds;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
+    uint64_t m_offlineWriteCpuDone = 0, m_offlineWriteCpuTotal = 0;
+    uint64_t m_offlineWriteGpuDone = 0, m_offlineWriteGpuTotal = 0;
+    uint64_t m_offlineWriteCpuThread = 0;
+    uint32_t m_offlineWriteGpuContext = 0;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;
     unordered_flat_map<uint64_t, int16_t> m_sourceLocationShrink;
@@ -1364,7 +1539,13 @@ private:
     static LoadProgress s_loadProgress;
     int64_t m_loadTime;
     SerializedZoneSink* m_serializedZoneSink = nullptr;
+    SerializedStringSource* m_externalStringSource = nullptr;
+    SerializedCallstackSource* m_externalCallstackSource = nullptr;
     uint64_t m_serializedCpuZoneIndex = 0;
+    uint64_t m_externalStringCount = 0;
+    bool m_externalStrings = false;
+    uint64_t m_externalCallstackCount = 0;
+    bool m_externalCallstacks = false;
     uint64_t m_serializedGpuZoneIndex = 0;
 
     Failure m_failure = Failure::None;
@@ -1410,6 +1591,7 @@ private:
 
 #ifdef TRACY_NO_STATISTICS
     Vector<ZoneEvent*> m_zoneEventPool;
+    Vector<GpuEvent*> m_gpuEventPool;
 #endif
 
     Vector<Parameter> m_params;

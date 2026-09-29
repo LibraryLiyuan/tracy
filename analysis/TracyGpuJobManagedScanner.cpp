@@ -1,11 +1,14 @@
 #include "TracyGpuJobManagedScanner.hpp"
 #include "TracyAnalysisDictionary.hpp"
+#include "TracyAnalysisExternalSort.hpp"
+#include "TracyAnalysisIoPath.hpp"
 
 #include "TracyHash.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <set>
@@ -233,9 +236,51 @@ bool IsSingleValuedRelation( uint8_t relation )
         relation == uint8_t( JnRelationKind::ContinuesAs );
 }
 
+class RelationAmbiguityScratchCleanup
+{
+public:
+    RelationAmbiguityScratchCleanup( std::filesystem::path output,
+        std::filesystem::path scratch, std::shared_ptr<AnalysisDiskBudget> disk )
+        : m_output( std::move( output ) )
+        , m_scratch( std::move( scratch ) )
+        , m_disk( std::move( disk ) )
+    {}
+    ~RelationAmbiguityScratchCleanup()
+    {
+        if( m_cleaned ) return;
+        std::error_code error;
+        AnalysisDiskRemove( m_output, m_disk, error );
+        std::string ignored;
+        CleanupAnalysisExternalSortFiles( m_scratch, "gpu-relation-ambiguity", ignored, m_disk );
+        error.clear();
+        AnalysisDiskRemove( m_scratch, m_disk, error );
+    }
+    RelationAmbiguityScratchCleanup( const RelationAmbiguityScratchCleanup& ) = delete;
+    RelationAmbiguityScratchCleanup& operator=( const RelationAmbiguityScratchCleanup& ) = delete;
+    void Cleanup()
+    {
+        std::error_code error;
+        AnalysisDiskRemove( m_output, m_disk, error );
+        if( error ) throw std::runtime_error( "gpu_relation_ambiguity_cleanup:" + error.message() );
+        std::string cleanupError;
+        if( !CleanupAnalysisExternalSortFiles( m_scratch, "gpu-relation-ambiguity", cleanupError, m_disk ) )
+            throw std::runtime_error( "gpu_relation_ambiguity_cleanup:" + cleanupError );
+        error.clear();
+        AnalysisDiskRemove( m_scratch, m_disk, error );
+        if( error ) throw std::runtime_error( "gpu_relation_ambiguity_cleanup:" + error.message() );
+        m_cleaned = true;
+    }
+private:
+    std::filesystem::path m_output;
+    std::filesystem::path m_scratch;
+    std::shared_ptr<AnalysisDiskBudget> m_disk;
+    bool m_cleaned = false;
+};
+
 template<typename T, typename Callback>
 void ReadBatches( const BoundedTraceScanner& scanner, BoundedScanDomain domain,
-    size_t batchSize, size_t& maximumBatch, const std::function<bool()>& cancelled, Callback&& callback )
+    size_t batchSize, size_t& maximumBatch, const std::function<bool()>& cancelled, Callback&& callback,
+    const std::function<void( uint64_t )>& progress = {} )
 {
     BoundedScanRequest request;
     request.domain = domain;
@@ -252,6 +297,7 @@ void ReadBatches( const BoundedTraceScanner& scanner, BoundedScanDomain domain,
             CheckCancelled( cancelled );
             callback( value );
         }
+        if( progress ) progress( batch.cursor.ordinal );
         CheckCancelled( cancelled );
         if( batch.cursor.complete ) break;
         request.cursor = batch.cursor;
@@ -275,10 +321,19 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
     if( !options.includeExactGpuSignatures && !options.includeLogicalGpuSignatures )
         throw BoundedScanError( "gpu_scan_signature_mode_empty" );
     GpuJobManagedScanResult result;
+    result.gpuFrameEvidenceEvaluated = options.includeGpuFrameEvidence;
     result.outputWorkspace = AnalysisWorkspaceReservation( options.workspace );
     AnalysisWorkspaceReservation metadataWorkspace( options.workspace );
     AnalysisWorkspaceReservation managedWorkspace( options.workspace );
-    BoundedTraceScanner scanner( m_source );
+    BoundedTraceScanner scanner( m_source, false, !options.includeJobDetails );
+    const auto traceCounts = m_source.GetTraceInfoMetadata().counts;
+    const auto reportProgress = [&]( std::string_view stage, uint64_t total ) {
+        if( !options.progress ) return std::function<void( uint64_t )>{};
+        options.progress( stage, 0, total );
+        return std::function<void( uint64_t )>( [&, stage, total]( uint64_t completed ) {
+            options.progress( stage, completed, total );
+        } );
+    };
 
     auto report = [&]( std::string code, std::string message, const std::string& ref ) {
         result.qualityComplete = false;
@@ -300,19 +355,22 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
     };
 
     std::vector<FrameBoundary> frames;
-    ReadBatches<FrameDto>( scanner, BoundedScanDomain::Frame,
-        m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& frame ) {
-        if( frame.complete && frame.endNs && *frame.endNs > frame.beginNs )
-        {
-            metadataWorkspace.Add( 512 + 8ull * ( frame.ref.size() + frame.frameSetRef.size() ) );
-            frames.push_back( { frame.ref, frame.frameSetRef, frame.beginNs, *frame.endNs } );
-        }
-    } );
-    std::sort( frames.begin(), frames.end(), [&]( const auto& left, const auto& right ) {
-        checkCancelled();
-        return std::tie( left.frameSetRef, left.beginNs, left.endNs, left.ref ) <
-            std::tie( right.frameSetRef, right.beginNs, right.endNs, right.ref );
-    } );
+    if( options.includeGpuFrameEvidence )
+    {
+        ReadBatches<FrameDto>( scanner, BoundedScanDomain::Frame,
+            m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& frame ) {
+            if( frame.complete && frame.endNs && *frame.endNs > frame.beginNs )
+            {
+                metadataWorkspace.Add( 512 + 8ull * ( frame.ref.size() + frame.frameSetRef.size() ) );
+                frames.push_back( { frame.ref, frame.frameSetRef, frame.beginNs, *frame.endNs } );
+            }
+        }, reportProgress( "gpu_frame_evidence_frames", traceCounts.frames ) );
+        std::sort( frames.begin(), frames.end(), [&]( const auto& left, const auto& right ) {
+            checkCancelled();
+            return std::tie( left.frameSetRef, left.beginNs, left.endNs, left.ref ) <
+                std::tie( right.frameSetRef, right.beginNs, right.endNs, right.ref );
+        } );
+    }
     std::map<std::string, std::vector<const FrameBoundary*>> framesBySet;
     for( const auto& frame : frames ) { checkCancelled(); framesBySet[frame.frameSetRef].push_back( &frame ); }
 
@@ -324,53 +382,102 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         checkCancelled();
         metadataWorkspace.Add( 1024 + 8ull * ( context.ref.size() + context.name.size() +
             context.typeName.size() + ( context.customName ? context.customName->size() : 0 ) ) );
-        contextIndexes[context.ref] = uint32_t( context.index );
+        if( options.includeGpuFrameEvidence ) contextIndexes[context.ref] = uint32_t( context.index );
         contextClasses[context.ref] = QueueClass( context );
-        contextCalibrated[context.ref] = context.calibrated;
+        if( options.includeGpuFrameEvidence ) contextCalibrated[context.ref] = context.calibrated;
     }
 
     std::vector<QueryEntity> entitiesByQuery;
-    ReadBatches<GfxEntityDto>( scanner, BoundedScanDomain::GfxEntity,
+    if( options.includeGpuFrameEvidence ) ReadBatches<GfxEntityDto>( scanner, BoundedScanDomain::GfxEntity,
         m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& entity ) {
-        if( entity.gpuQueryId == 0 ) return;
-        metadataWorkspace.Add( 128 );
-        entitiesByQuery.push_back( { { entity.gpuContext, uint16_t( entity.gpuQueryId ) }, entity.entityId } );
-    } );
+            if( entity.gpuQueryId == 0 ) return;
+            metadataWorkspace.Add( 128 );
+            entitiesByQuery.push_back( { { entity.gpuContext, uint16_t( entity.gpuQueryId ) }, entity.entityId } );
+        }, reportProgress( "gpu_frame_evidence_entities", traceCounts.gfxEntities ) );
     const auto cancellableLess = [&]( const auto& a, const auto& b ) { checkCancelled(); return a < b; };
     std::sort( entitiesByQuery.begin(), entitiesByQuery.end(), cancellableLess );
 
     std::vector<EntityFrame> framesByEntity;
-    ReadBatches<GfxLinkDto>( scanner, BoundedScanDomain::GfxLink,
+    if( options.includeGpuFrameEvidence ) ReadBatches<GfxLinkDto>( scanner, BoundedScanDomain::GfxLink,
         m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& link ) {
         if( link.relation == uint8_t( JnGfxRelation::BelongsToFrame ) )
         {
             metadataWorkspace.Add( 128 );
             framesByEntity.push_back( { link.sourceId, link.targetId } );
         }
-    } );
+    }, reportProgress( "gpu_frame_evidence_links", traceCounts.gfxLinks ) );
     std::vector<RelationTarget> singleValueTargets;
-    ReadBatches<RelationDto>( scanner, BoundedScanDomain::Relation,
-        m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& relation ) {
-        AnalysisWorkspaceReservation currentRelation( options.workspace, 512 + 4ull * relation.ref.size() );
-        if( relation.sourceKind == uint8_t( JnEntityKind::GpuPass ) &&
+    std::vector<RelationKey> ambiguousRelationKeys;
+    const auto acceptRelationFrame = [&]( const RelationDto& relation ) {
+        if( options.includeGpuFrameEvidence && relation.sourceKind == uint8_t( JnEntityKind::GpuPass ) &&
             relation.targetKind == uint8_t( JnEntityKind::Frame ) )
         {
             metadataWorkspace.Add( 128 );
             framesByEntity.push_back( { relation.sourceId, relation.targetId } );
         }
-        if( IsSingleValuedRelation( relation.relation ) )
+    };
+    if( !options.temporaryRoot.empty() )
+    {
+        std::filesystem::create_directories( AnalysisIoPath( options.temporaryRoot ) );
+        const auto sorted = options.temporaryRoot / "relation-single-values.sorted";
+        const auto scratch = options.temporaryRoot / "relation-single-values.scratch";
+        std::filesystem::create_directories( AnalysisIoPath( scratch ) );
+        RelationAmbiguityScratchCleanup cleanup( sorted, scratch, options.disk );
+        const auto count = m_source.GetTraceInfoMetadata().counts.relations;
         {
-            metadataWorkspace.Add( 256 ); // Includes the later ambiguity-key vector.
-            singleValueTargets.push_back( { relation.sourceId, relation.targetId,
-                relation.relationNamespace, relation.relation } );
+            AnalysisKeyMetadataRunCollector collector( sorted, scratch, "gpu-relation-ambiguity",
+                ChooseAnalysisExternalSortBufferRecords( count, sizeof( AnalysisKeyMetadataRecord ), options.workspace ),
+                options.disk, options.workspace, options.cancelled );
+            ReadBatches<RelationDto>( scanner, BoundedScanDomain::Relation,
+                m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& relation ) {
+                acceptRelationFrame( relation );
+                if( IsSingleValuedRelation( relation.relation ) ) collector.Emit( {
+                    relation.sourceId,
+                    ( uint64_t( relation.relationNamespace ) << 8 ) | relation.relation,
+                    relation.targetId, 0, 0, {} } );
+            }, reportProgress( "gpu_relation_ambiguity_sort", traceCounts.relations ) );
+            std::string error;
+            if( !collector.Finish( error ) ) throw std::runtime_error( "gpu_relation_ambiguity_sort:" + error );
         }
-    } );
+        {
+            std::ifstream input( AnalysisIoPath( sorted ), std::ios::binary );
+            AnalysisKeyMetadataRecord row, previous;
+            bool havePrevious = false, ambiguous = false;
+            const auto finish = [&] {
+                if( !havePrevious || !ambiguous ) return;
+                metadataWorkspace.Add( sizeof( RelationKey ) * 2 );
+                ambiguousRelationKeys.push_back( { previous.keyHigh,
+                    uint8_t( previous.keyLow >> 8 ), uint8_t( previous.keyLow ) } );
+            };
+            while( input.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) )
+            {
+                checkCancelled();
+                const bool same = havePrevious && row.keyHigh == previous.keyHigh && row.keyLow == previous.keyLow;
+                if( !same ) { finish(); ambiguous = false; }
+                else if( row.metadata != previous.metadata ) ambiguous = true;
+                previous = row; havePrevious = true;
+            }
+            if( !input.eof() ) throw std::runtime_error( "gpu_relation_ambiguity_read" );
+            finish();
+        }
+        cleanup.Cleanup();
+    }
+    else ReadBatches<RelationDto>( scanner, BoundedScanDomain::Relation,
+        m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& relation ) {
+            AnalysisWorkspaceReservation currentRelation( options.workspace, 512 + 4ull * relation.ref.size() );
+            acceptRelationFrame( relation );
+            if( IsSingleValuedRelation( relation.relation ) )
+            {
+                metadataWorkspace.Add( 256 ); // Includes the later ambiguity-key vector.
+                singleValueTargets.push_back( { relation.sourceId, relation.targetId,
+                    relation.relationNamespace, relation.relation } );
+            }
+        }, reportProgress( "gpu_relation_ambiguity_memory", traceCounts.relations ) );
     std::sort( framesByEntity.begin(), framesByEntity.end(), cancellableLess );
     framesByEntity.erase( std::unique( framesByEntity.begin(), framesByEntity.end(), [&]( const auto& a, const auto& b ) {
         checkCancelled(); return a == b;
     } ), framesByEntity.end() );
     std::sort( singleValueTargets.begin(), singleValueTargets.end(), cancellableLess );
-    std::vector<RelationKey> ambiguousRelationKeys;
     for( size_t first = 0; first < singleValueTargets.size(); )
     {
         checkCancelled();
@@ -496,7 +603,7 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
             report( "gpu_child_frame_relation_ambiguous", "Child passes map to multiple frame identities.", zone.ref );
         }
 
-        if( !fact.frameId )
+        if( !fact.frameId && options.includeGpuFrameEvidence )
         {
             AnalysisWorkspaceReservation overlapWorkspace( options.workspace );
             std::vector<std::string> overlaps;
@@ -650,14 +757,14 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         if( !parentResolved ) report( "missing_gpu_parent", "GPU parent zone is unavailable on the same queue stack.", zone.ref );
 
         const auto contextIt = contextIndexes.find( zone.contextRef );
-        if( contextIt != contextIndexes.end() && zone.queryIdAvailability.available )
+        if( options.includeGpuFrameEvidence && contextIt != contextIndexes.end() && zone.queryIdAvailability.available )
         {
             const GpuLookupKey key { contextIt->second, zone.queryId };
             auto found = std::lower_bound( entitiesByQuery.begin(), entitiesByQuery.end(), QueryEntity { key, 0 } );
             while( found != entitiesByQuery.end() && found->key == key )
             { checkCancelled(); addEntityFrames( found->entity, active ); ++found; }
         }
-        if( const auto id = m_source.ParseEntityRef( zone.ref, "gpu-zone" ) )
+        if( options.includeGpuFrameEvidence ) if( const auto id = m_source.ParseEntityRef( zone.ref, "gpu-zone" ) )
             addEntityFrames( *id, active );
 
         if( zone.parentRef && parentResolved )
@@ -692,10 +799,24 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         }
         state.ReserveNext();
         stack.emplace_back( std::move( active ) );
-    } );
+    }, reportProgress( "gpu_zone_scan", traceCounts.gpuZones ) );
     for( auto& [context, state] : stacks ) while( !state.zones.empty() ) closeTop( state.zones );
 
     std::vector<uint64_t> handleGenerations;
+    AnalysisWorkspaceReservation handleWorkspace( options.workspace );
+    const auto reserveHandles = [&]( size_t count ) {
+        if( count <= handleGenerations.capacity() ) return;
+        if( count > handleGenerations.max_size() || count > SIZE_MAX / sizeof( uint64_t ) )
+            throw std::runtime_error( "gpu_job_handle_generation_capacity" );
+        handleWorkspace.Resize( uint64_t( count ) * sizeof( uint64_t ) );
+        handleGenerations.reserve( count );
+        handleWorkspace.Resize( uint64_t( handleGenerations.capacity() ) * sizeof( uint64_t ) );
+    };
+    if( traceCounts.jobs )
+    {
+        if( traceCounts.jobs > SIZE_MAX ) throw std::runtime_error( "gpu_job_handle_generation_capacity" );
+        reserveHandles( size_t( traceCounts.jobs ) );
+    }
     ReadBatches<JobDto>( scanner, BoundedScanDomain::Job,
         m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& job ) {
         AnalysisWorkspaceReservation currentJob( options.workspace, 2048 + 8ull *
@@ -721,25 +842,26 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         fact.waitSpinYieldNs = job.waitSpinYieldNs;
         fact.waitSleepNs = job.waitSleepNs;
         fact.originFrameId = job.originFrameId;
-        fact.stageCount = uint32_t( job.stages.size() );
+        fact.stageCount = options.includeJobDetails ? uint32_t( job.stages.size() ) : 0;
         fact.scheduleCallsiteId = job.scheduleCallsiteId;
         fact.scheduleCallstack = job.scheduleCallstack;
         fact.stackProvenance = job.scheduleStackProvenance;
         fact.scheduleStackAvailable = job.scheduleCallsiteId != 0 || job.scheduleCallstack != 0;
         fact.stackUnavailableReason = fact.scheduleStackAvailable ? std::string {} :
             job.scheduleStackUnavailableReason.value_or( "job_schedule_stack_unavailable" );
-        fact.hasWaiter = job.waitNs > 0 || job.waitEndCount > 0 || !job.waitCallstacks.empty() ||
+        fact.hasWaiter = job.waitNs > 0 || job.waitEndCount > 0 ||
+            ( options.includeJobDetails && ( !job.waitCallstacks.empty() ||
             std::any_of( job.stages.begin(), job.stages.end(), [&]( const auto& stage ) {
                 checkCancelled();
                 return stage.stage == uint8_t( JnJobStage::WaitBegin ) || stage.stage == uint8_t( JnJobStage::WaitEnd );
-            } );
+            } ) ) );
         fact.hasContinuation = job.continuationCount > 0 ||
-            std::any_of( job.stages.begin(), job.stages.end(), [&]( const auto& stage ) {
+            ( options.includeJobDetails && std::any_of( job.stages.begin(), job.stages.end(), [&]( const auto& stage ) {
                 checkCancelled();
                 return stage.stage == uint8_t( JnJobStage::Continuation );
-            } );
+            } ) );
         fact.exact = !job.incomplete && !job.orphan && !job.truncated;
-        for( const auto& dependency : job.dependencies )
+        if( options.includeJobDetails ) for( const auto& dependency : job.dependencies )
         {
             checkCancelled();
             if( dependency.prerequisiteJobId != 0 ) fact.dependencyJobIds.emplace_back( dependency.prerequisiteJobId );
@@ -751,7 +873,13 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
             fact.exact = false;
             report( "job_completion_before_schedule", "Job completion precedes schedule time.", job.ref );
         }
-        metadataWorkspace.Add( 32 );
+        if( handleGenerations.size() == handleGenerations.capacity() )
+        {
+            const auto capacity = handleGenerations.capacity();
+            const auto next = capacity == 0 ? size_t( 1024 ) :
+                capacity > handleGenerations.max_size() / 2 ? handleGenerations.max_size() : capacity * 2;
+            reserveHandles( next );
+        }
         handleGenerations.push_back( ( uint64_t( fact.handleSlot ) << 32 ) | fact.handleGeneration );
         ++result.jobCount;
         if( options.jobSink && !options.jobSink( fact ) )
@@ -761,7 +889,7 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
             result.outputWorkspace.Add( currentJob.Bytes() );
             result.jobs.emplace_back( std::move( fact ) );
         }
-    } );
+    }, reportProgress( "gpu_job_scan", traceCounts.jobs ) );
     std::sort( handleGenerations.begin(), handleGenerations.end(), cancellableLess );
     for( size_t first = 0; first < handleGenerations.size(); )
     {
@@ -778,15 +906,15 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         if( distinct > 1 ) ++result.handleReuseCount;
         first = last;
     }
-    handleGenerations.clear();
-    handleGenerations.shrink_to_fit();
+    std::vector<uint64_t>().swap( handleGenerations );
+    handleWorkspace.Resize( 0 );
 
     std::unordered_map<uint32_t, ScriptFrameDto> frameDefinitions;
     ReadBatches<ScriptFrameDto>( scanner, BoundedScanDomain::ScriptFrame,
         m_batchSize, result.maximumBatchObserved, options.cancelled, [&]( const auto& frame ) {
             managedWorkspace.Add( 1024 + 8ull * ( frame.ref.size() + frame.function.size() + frame.file.size() + frame.threadRef.size() ) );
             frameDefinitions[frame.frameId] = frame;
-        } );
+        }, reportProgress( "managed_script_frames", 0 ) );
     std::map<uint64_t, ScriptStackBuild> stackBuilds;
     std::map<uint64_t, ManagedZoneFact> zoneBuilds;
     ReadBatches<ScriptStackEventDto>( scanner, BoundedScanDomain::ScriptStack,
@@ -818,7 +946,7 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
             else report( "script_zone_end_without_begin", "Script ZoneEnd has no matching ZoneBegin.", event.ref );
             break;
         }
-    } );
+    }, reportProgress( "managed_script_stacks", 0 ) );
 
     std::unordered_map<uint64_t, size_t> managedStackIndex;
     uint64_t retainedManagedBytes = 0;
@@ -914,7 +1042,7 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
             result.outputWorkspace.Add( currentRelation.Bytes() );
             result.relations.emplace_back( std::move( fact ) );
         }
-    } );
+    }, reportProgress( "relation_quality_scan", traceCounts.relations ) );
     checkCancelled();
     return result;
 }

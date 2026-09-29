@@ -53,6 +53,24 @@ Require ($traceSource.Contains('ScanGpuMemoryUsesByResource')) `
     'TraceSource does not expose the bounded reverse ResourceSet sidecar.'
 Require ($queryIndex.Contains('ScanGpuMemoryUsesByResource')) `
     'Indexed Query does not provide bounded reverse ResourceSet lookup.'
+Require ($service -match 'boundedResourceMethod[\s\S]{0,1024}gpu\.resource\.references') `
+    'GPU resource references are not routed through the bounded Catalog backend.'
+Require ($service.Contains('GetQueryCatalogResourceRanges') -and $service.Contains('GetQueryCatalogResourceUses')) `
+    'GPU resource references do not use both bounded RangeSet and resolved ResourceSet indices.'
+Require ($service -match 'boundedResourceMethod[\s\S]{0,512}gpu\.resource\.explain') `
+    'GPU resource explain is not routed through the bounded Catalog backend.'
+Require ($service.Contains('GetQueryCatalogResourceLogicals') -and
+    $service.Contains('ResolveQueryCatalogLogical') -and
+    $service.Contains('GetQueryCatalogResourceRelations')) `
+    'GPU resource explain does not use bounded logical and relation indices.'
+$allocationScan = [regex]::Match($queryIndex, 'ScanGpuMemoryAllocations[\s\S]*?BuildIndexedGpuMemoryAttribution').Value
+Require ($allocationScan.Contains('m_gpuReferenceIndex.UsesByResource')) `
+    'GPU allocation paging does not reuse the bounded reverse ResourceSet sidecar.'
+Require (-not $allocationScan.Contains('EnsureGpuResourcePassRefs')) `
+    'GPU allocation paging still materializes the complete resource-to-pass map.'
+$passScan = [regex]::Match($queryIndex, 'ScanGpuMemoryPasses[\s\S]*?ScanGpuMemoryUsesByResource').Value
+Require ($passScan.Contains('m_gpuReferenceIndex.UsesByPass')) `
+    'Directed GPU pass use paging still scans the complete GPU Reference Use table.'
 Require ($service -match 'gpu\.resource\.raytracing_chain[\s\S]{0,4096}"has_more"') `
     'RTAS relation results are not paginated.'
 Require (($service | Select-String -Pattern 'resolvedPhysicalAllocationId' -AllMatches).Matches.Count -ge 3) `
@@ -65,6 +83,8 @@ Require ($service -match 'validation\.run[\s\S]{0,8192}gpuCatalogControls[\s\S]{
     'validation.run checks Batch sequences without including Catalog control records from the shared sequence space.'
 Require ($service -match 'gpu\.pass\.vg_evidence[\s\S]{0,4096}"page"[\s\S]{0,512}"has_more"') `
     'Detailed GPU evidence query is not paginated.'
+Require ($service -match 'boundedPassResourceMethod[\s\S]{0,1024}GetQueryGpuPassResourceSummary') `
+    'GPU pass resource queries do not use the bounded aggregate backend.'
 Require ($tracyWorker.Contains('entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass )')) `
     'RangeSet lifetime resolution does not use the authoritative explicit GPU pass time.'
 Require ($tracyWorker.Contains('link.relation == uint8_t( JnGfxRelation::RangeEvidenceComplete )')) `

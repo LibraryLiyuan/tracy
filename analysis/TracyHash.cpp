@@ -136,7 +136,41 @@ private:
 
 struct Sha256Builder::Impl
 {
+#ifdef _WIN32
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::vector<uint8_t> object;
+
+    Impl()
+    {
+        struct Provider
+        {
+            BCRYPT_ALG_HANDLE algorithm = nullptr;
+            DWORD objectBytes = 0;
+            Provider()
+            {
+                DWORD resultBytes = 0;
+                if( BCryptOpenAlgorithmProvider( &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0 ) != 0 )
+                    throw std::runtime_error( "unable to open SHA-256 provider" );
+                if( BCryptGetProperty( algorithm, BCRYPT_OBJECT_LENGTH,
+                        reinterpret_cast<PUCHAR>( &objectBytes ), sizeof( objectBytes ),
+                        &resultBytes, 0 ) != 0 || objectBytes == 0 )
+                {
+                    BCryptCloseAlgorithmProvider( algorithm, 0 );
+                    algorithm = nullptr;
+                    throw std::runtime_error( "unable to query SHA-256 provider" );
+                }
+            }
+            ~Provider() { if( algorithm ) BCryptCloseAlgorithmProvider( algorithm, 0 ); }
+        };
+        static Provider provider;
+        object.resize( provider.objectBytes );
+        if( BCryptCreateHash( provider.algorithm, &hash, object.data(), DWORD( object.size() ), nullptr, 0, 0 ) != 0 )
+            throw std::runtime_error( "unable to create SHA-256 hash" );
+    }
+    ~Impl() { if( hash ) BCryptDestroyHash( hash ); }
+#else
     Sha256 value;
+#endif
     std::string finalHex;
 };
 
@@ -151,19 +185,46 @@ Sha256Builder& Sha256Builder::operator=( Sha256Builder&& ) noexcept = default;
 void Sha256Builder::Update( const void* data, size_t size )
 {
     if( !m_impl || !m_impl->finalHex.empty() ) throw std::runtime_error( "sha256_builder_already_finalized" );
+#ifdef _WIN32
+    auto bytes = static_cast<const uint8_t*>( data );
+    while( size != 0 )
+    {
+        const auto chunk = ULONG( std::min<size_t>( size, ULONG_MAX ) );
+        if( BCryptHashData( m_impl->hash, const_cast<PUCHAR>( bytes ), chunk, 0 ) != 0 )
+            throw std::runtime_error( "unable to update SHA-256 hash" );
+        bytes += chunk;
+        size -= chunk;
+    }
+#else
     if( size != 0 ) m_impl->value.Update( static_cast<const uint8_t*>( data ), size );
+#endif
 }
 
 std::string Sha256Builder::FinalHex()
 {
     if( !m_impl ) throw std::runtime_error( "sha256_builder_moved" );
     if( !m_impl->finalHex.empty() ) return m_impl->finalHex;
+#ifdef _WIN32
+    std::array<uint8_t, 32> digest {};
+    if( BCryptFinishHash( m_impl->hash, digest.data(), ULONG( digest.size() ), 0 ) != 0 )
+        throw std::runtime_error( "unable to finish SHA-256 hash" );
+#else
     const auto digest = m_impl->value.Final();
+#endif
     std::ostringstream output;
     output << std::hex << std::setfill( '0' );
     for( const auto byte : digest ) output << std::setw( 2 ) << unsigned( byte );
     m_impl->finalHex = output.str();
     return m_impl->finalHex;
+}
+
+const char* Sha256Backend() noexcept
+{
+#ifdef _WIN32
+    return "windows-cng";
+#else
+    return "portable";
+#endif
 }
 
 std::string Sha256File( const std::filesystem::path& path )

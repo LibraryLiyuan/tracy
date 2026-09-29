@@ -17,7 +17,7 @@ namespace tracy::analysis
 {
 
 inline constexpr uint32_t GpuAnalysisSchemaVersion = 1;
-inline constexpr uint32_t GpuAnalysisCacheSchemaVersion = 2;
+inline constexpr uint32_t GpuAnalysisCacheSchemaVersion = 3;
 
 enum class GpuAnalysisState : uint8_t
 {
@@ -147,6 +147,7 @@ struct GpuAllocationAnalysisRecord
     uint64_t createTime = 0;
     uint64_t destroyTime = 0;
     uint64_t lastUpdateTime = 0;
+    uint64_t resourceCount = 0;
     uint16_t primaryKind = 0;
     uint8_t memoryDomain = 0;
     uint8_t allocationKind = 0;
@@ -251,7 +252,7 @@ struct GpuAnalysisSnapshot
     std::unordered_map<uint64_t, size_t> allocationById;
     std::unordered_map<uint64_t, size_t> passById;
 
-    const GpuResourceAnalysisRecord* FindResource( uint64_t resourceId ) const;
+    const GpuResourceAnalysisRecord* FindGpuResource( uint64_t resourceId ) const;
     const GpuAllocationAnalysisRecord* FindAllocation( uint64_t allocationId ) const;
     const GpuPassWorkingSet* FindPass( uint64_t passId ) const;
 };

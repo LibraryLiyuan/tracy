@@ -2,6 +2,7 @@
 #define __TRACYSESSIONMANAGER_HPP__
 
 #include "TracyTraceSource.hpp"
+#include "TracyQueryResourceContext.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -73,7 +74,8 @@ public:
     using StateCallback = std::function<void( analysis::TraceSourceState )>;
     using SourceLoader = std::function<std::unique_ptr<analysis::TraceSource>( const std::filesystem::path&, StateCallback )>;
 
-    explicit SessionManager( std::vector<std::filesystem::path> allowRoots = {}, size_t maxSessions = 2, SourceLoader sourceLoader = {}, bool preferIndex = false );
+    explicit SessionManager( std::vector<std::filesystem::path> allowRoots = {}, size_t maxSessions = 2,
+        SourceLoader sourceLoader = {}, bool preferIndex = false, QueryResourceContextOptions resourceOptions = {} );
     ~SessionManager();
 
     SessionManager( const SessionManager& ) = delete;

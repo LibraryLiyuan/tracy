@@ -57,13 +57,13 @@ void DiskFiles(const std::filesystem::path& root)
         out.flush(); Require(std::filesystem::file_size(root/"frames")==0,"frame series reject before writing any oversized extent");
     }
     AnalysisCacheTableOptions options; options.blockBytes=1024; options.disk=disk;
-    disk->maximumBytes=98; // 24-byte index header + 24-byte row + 50-byte block.
+    disk->maximumBytes=114; // 24-byte index header + 24-byte row + 66-byte v2 raw block.
     {
         AnalysisCacheTableWriter writer(root/"manifest-denied",std::string(64,'a'),"disk",options);
         writer.Append("k","v");
         Reject([&]{writer.Commit();},"cache_disk_budget");
     }
-    Require(AnalysisDiskUsage::Bytes(root)==98 && usage->Current()==98,
+    Require(AnalysisDiskUsage::Bytes(root)==114 && usage->Current()==114,
         "manifest publication is charged before writing, retaining only actual partial data");
     Require(!std::filesystem::exists(root/"manifest-denied"/"manifest.json"),"disk-denied manifest cannot publish");
     disk->maximumBytes=1024*1024;
@@ -119,13 +119,16 @@ void ProcessMemoryGuard()
     AnalysisProcessMemorySample sample{true,128,256};
     options.sample=[&]{return sample;};
     AnalysisProcessMemoryGuard atLimit(options);
-    atLimit.Check(); // Equality is allowed; either metric exceeding it is not.
+    atLimit.Check(); // Equality is allowed for the enforced Private Bytes metric.
     sample.privateBytes=257;
     Reject([&]{atLimit.Check();},"process_memory_budget");
     sample={true,1,1};
     Reject([&]{atLimit.Check();},"process_memory_budget");
+    sample={true,257,1};
     AnalysisProcessMemoryGuard fresh(options); fresh.Check();
-    sample.residentBytes=257;
+    Require(fresh.Snapshot().peakResidentBytes==257,
+        "working set above the private-byte limit remains observable without rejecting mapped pages");
+    sample.privateBytes=257;
     Reject([&]{fresh.Check();},"process_memory_budget");
     sample={false,0,0};
     AnalysisProcessMemoryGuard unavailable(options);
@@ -236,9 +239,26 @@ void Components(const std::filesystem::path& root)
     Require(budget->Snapshot().currentBytes==0,"all component reservations released");
 }
 }
+template<class Disk> void TraceRelativeLimits()
+{
+    // A byte above the per-input final/peak quotas must not be admitted.
+    // The two fixtures represent independent analyses, not cumulative history.
+    if constexpr(requires { Disk::ForTrace(uint64_t(100)); })
+    {
+        const auto first=Disk::ForTrace(100),second=Disk::ForTrace(200);
+        Require(first.finalBytes==800 && first.peakBytes==1600,"trace quotas use one input's bytes");
+        Require(second.finalBytes==1600 && second.peakBytes==3200,"independent inputs have independent quotas");
+        first.CheckFinal(800);
+        Reject([&]{first.CheckFinal(801);},"final_disk_ratio");
+        Reject([&]{Disk::ForTrace(0);},"trace_size");
+        Reject([&]{Disk::ForTrace(UINT64_MAX/16+1);},"trace_size");
+    }
+    else throw std::runtime_error("trace-relative final/peak disk admission is missing");
+}
 int main()
 {
     try {
+        TraceRelativeLimits<AnalysisDiskBudget>();
         ProcessMemoryGuard(); ProcessMemoryCheckpoints(); Reservations(); ConcurrentReservations();
         const auto root=std::filesystem::temp_directory_path()/
             ("jn-workspace-budget-test-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));

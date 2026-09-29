@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <map>
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -97,7 +98,7 @@ public:
         contextSwitches = { mainRun, renderRun };
 
         GpuAllocationAnalysisRecord a;
-        a.allocationId = 100; a.sizeBytes = 100; a.residentBytes = 80; a.resources = { 1, 2 };
+        a.allocationId = 100; a.sizeBytes = 100; a.residentBytes = 80; a.resourceCount = 2;
         GpuAllocationAnalysisRecord b;
         b.allocationId = 200; b.sizeBytes = 200; b.residentBytes = 200; b.resources = { 3 };
         allocations = { a, b };
@@ -136,6 +137,18 @@ public:
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":0,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"0\",\"event_bytes\":\"0\"}}}",
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":1,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"10\",\"emitted\":\"8\",\"dropped\":\"1\",\"filtered\":\"1\",\"sampled_out\":\"0\",\"overflow\":\"1\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"1000\",\"event_bytes\":\"256\"}}}"
         };
+        if( telemetryHistoryCount )
+        {
+            info.appInfo.clear();
+            for(size_t i=0;i<telemetryHistoryCount;++i)
+            {
+                const auto sequence=telemetryHistoryCount-1-i;
+                info.appInfo.push_back("JNQ1|{\"snapshot_sequence\":"+std::to_string(sequence)+
+                    ",\"producer\":{\"id\":1,\"key\":\"test.producer\",\"source_mode\":\"test\","
+                    "\"requested\":true,\"supported\":true,\"effective\":true,\"counters\":{\"emitted\":"+
+                    std::to_string(sequence*2)+",\"cpu_time_ns\":"+std::to_string(sequence*10)+"}}}");
+            }
+        }
         if( wideMetadataAt == "info" ) info.captureName = std::string( 3 * 1024 * 1024, 'x' );
         return info;
     }
@@ -247,6 +260,7 @@ public:
     { ReadBoundary( "gpu_resource" ); return SliceValues( resources, offset, limit ); }
     std::vector<GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded( size_t offset, size_t limit ) const override
     { ReadBoundary( "gpu_allocation" ); return SliceValues( allocations, offset, limit ); }
+    bool GpuAllocationSummariesUniqueById() const override { return allocationSummariesUnique; }
     std::vector<GpuPassWorkingSet> ScanGpuCatalogPassesBounded( size_t offset, size_t limit ) const override
     { ReadBoundary( "gpu_pass" ); return SliceValues( passes, offset, limit ); }
     std::vector<GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded( size_t offset, size_t limit ) const override
@@ -289,6 +303,21 @@ private:
     std::vector<GpuAnalysisResourceSummary> resources;
 public:
     std::vector<GpuAllocationAnalysisRecord> allocations;
+    bool allocationSummariesUnique=false;
+    size_t telemetryHistoryCount=0;
+    void PopulateGpuLifetimes( size_t count )
+    {
+        allocationSummariesUnique=true;
+        auto allocation=allocations.front(); auto resource=resources.front();
+        allocations.clear(); resources.clear();
+        for(size_t i=0;i<count;++i)
+        {
+            allocation.allocationId=1000+i; allocation.createTime=10; allocation.destroyTime=20;
+            allocation.lastUpdateTime=10; allocation.parentAllocationId=0; allocation.sizeBytes=100;
+            resource.resourceId=1000+i; resource.allocationId=allocation.allocationId;
+            allocations.push_back(allocation); resources.push_back(resource);
+        }
+    }
 private:
     std::vector<GpuPassWorkingSet> passes;
     std::vector<GpuAnalysisRangeStoreEntry> ranges;
@@ -339,6 +368,110 @@ auto ScanCompact( Scanner& scanner, std::shared_ptr<AnalysisWorkspaceBudget> wor
 
 int main()
 {
+    {
+        MemoryIoSamplingSource source;source.telemetryHistoryCount=200;
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        try {
+            const auto result=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},workspace);
+            if(result.inputTelemetryRecordCount!=200 || result.telemetry.producers.size()!=1 ||
+                result.telemetry.totalEventCount!=398 || result.telemetry.totalCpuTimeNs!=1990 ||
+                !result.telemetry.producerQualityComplete)
+            {std::cerr<<"Telemetry summary changed ordered endpoint counters\n";return 1;}
+        }catch(const std::exception& e){
+            std::cerr<<"Telemetry workspace grew with historical snapshots: "<<e.what()<<'\n';return 1;
+        }
+    }
+    {
+        MemoryIoSamplingSource source; source.PopulateGpuLifetimes(2048);
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(1280*1024,1024*1024);
+        try {
+            const auto result=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},workspace);
+            if(result.inputGpuAllocationCount!=2048 || result.inputGpuResourceCount!=2048 ||
+                result.gpuMemory.physicalBytes!=204800)
+            { std::cerr<<"GPU lifetime release changed exact facts\n";return 1; }
+        }catch(const std::exception& e){
+            std::cerr<<"Finished allocation state overlapped resource scan: "<<e.what()<<'\n';return 1;
+        }
+    }
+    {
+        // Scale model of the R16 failure: CPU/GPU scan products remain owned
+        // while the complete, already unique Catalog allocation summaries are read.
+        MemoryIoSamplingSource source; source.PopulateGpuLifetimes(2048);
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        AnalysisWorkspaceReservation priorProducts(workspace,1050*1024);
+        size_t allocationPages=0;
+        source.readHook=[&](std::string_view domain){
+            if(domain=="gpu_allocation")allocationPages++;
+        };
+        std::string activeStage;
+        MemoryIoSamplingTelemetryScanner scanner(source,2,2,20,[&](const auto& progress){
+            if(!progress.complete)activeStage=progress.stage;
+        });
+        try {
+            const auto result=scanner.ScanSummary({},workspace);
+            if(result.inputGpuAllocationCount!=2048||result.gpuMemory.physicalBytes!=204800)
+            {std::cerr<<"R16 shared-residency fixture changed GPU facts\n";return 1;}
+        }catch(const std::exception& e){
+            std::cerr<<"R16 shared-residency repro stage="<<activeStage
+                <<" allocation_pages="<<allocationPages
+                <<" current="<<workspace->Snapshot().currentBytes
+                <<" peak="<<workspace->Snapshot().peakBytes
+                <<" error="<<e.what()<<'\n';
+            return 1;
+        }
+    }
+    {
+        MemoryIoSamplingSource source; source.PopulateGpuLifetimes(2048);
+        auto sortedWorkspace=std::make_shared<AnalysisWorkspaceBudget>(4*1024*1024,2*1024*1024);
+        const auto sorted=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},sortedWorkspace);
+        source.allocationSummariesUnique=false;
+        auto genericWorkspace=std::make_shared<AnalysisWorkspaceBudget>(4*1024*1024,2*1024*1024);
+        const auto generic=MemoryIoSamplingTelemetryScanner(source,2,2,20).ScanSummary({},genericWorkspace);
+        if(sorted.gpuMemory.allocationCount!=generic.gpuMemory.allocationCount||
+            sorted.gpuMemory.physicalBytes!=generic.gpuMemory.physicalBytes||
+            sorted.gpuMemory.physicalPeakTimeNs!=generic.gpuMemory.physicalPeakTimeNs||
+            sorted.gpuMemory.residentBytes!=generic.gpuMemory.residentBytes||
+            sorted.gpuMemory.sharedAllocationCount!=generic.gpuMemory.sharedAllocationCount||
+            sorted.gpuMemory.physicalPeakExact!=generic.gpuMemory.physicalPeakExact)
+        {std::cerr<<"Sorted Allocation fast path changed GPU summary semantics\n";return 1;}
+        MemoryIoSamplingSource unordered; unordered.PopulateGpuLifetimes(2);
+        std::swap(unordered.allocations[0],unordered.allocations[1]);
+        bool rejectedOrder=false;
+        try{(void)MemoryIoSamplingTelemetryScanner(unordered,2,2,20).ScanSummary({},
+            std::make_shared<AnalysisWorkspaceBudget>());}
+        catch(const std::exception& e){rejectedOrder=std::string_view(e.what())=="gpu_allocation_summary_order_contract";}
+        if(!rejectedOrder){std::cerr<<"Sorted Allocation source order promise was not checked\n";return 1;}
+        unordered.allocationSummariesUnique=false;
+        unordered.allocations.push_back(unordered.allocations.front());
+        const auto duplicate=MemoryIoSamplingTelemetryScanner(unordered,2,2,20).ScanSummary({},
+            std::make_shared<AnalysisWorkspaceBudget>());
+        if(duplicate.inputGpuAllocationCount!=3||duplicate.gpuMemory.allocationCount!=2)
+        {std::cerr<<"Generic Allocation source deduplication changed\n";return 1;}
+    }
+    {
+        MemoryIoSamplingSource source;
+        std::map<std::string, uint64_t> completed;
+        MemoryIoSamplingTelemetryScanner scanner( source, 2, 2, 20,
+            [&]( const auto& event ) {
+                if( event.complete ) completed[event.stage] = event.processed;
+                if( event.total && event.processed > *event.total )
+                    throw std::runtime_error( "system progress exceeded total" );
+            } );
+        const auto result = scanner.ScanSummary( {}, std::make_shared<AnalysisWorkspaceBudget>() );
+        for( const auto& [stage, count] : std::vector<std::pair<std::string,uint64_t>> {
+            { "memory_read", 6 }, { "gpu_allocation_read", 2 }, { "gpu_resource_read", 3 },
+            { "gpu_pass_read", 1 }, { "gpu_range_read", 1 }, { "io_request_read", 4 },
+            { "sample_read", 4 }, { "context_switch_read", 2 }, { "telemetry_read", 2 } } )
+            if( !completed.contains( stage ) || completed.at( stage ) != count )
+            { std::cerr << "System progress omitted completed facts for " << stage << '\n'; return 1; }
+        bool propagated = false;
+        try {
+            MemoryIoSamplingTelemetryScanner fail( source, 2, 2, 20,
+                []( const auto& ) { throw std::runtime_error( "progress_sink_failed" ); } );
+            (void)fail.Scan();
+        } catch( const std::runtime_error& error ) { propagated = std::string_view(error.what()) == "progress_sink_failed"; }
+        if( !propagated ) { std::cerr << "System progress callback failure was swallowed\n"; return 1; }
+    }
     bool cancellationTestsPassed = true;
     for( const auto* domain : { "pre_cancelled", "memory", "gpu_allocation", "gpu_resource",
         "gpu_pass", "gpu_range", "io", "sample", "callstack", "context_switch" } )
@@ -521,6 +654,7 @@ int main()
     assert( result.gpuMemory.residentBytes == 280 );
     assert( result.gpuMemory.logicalCapacityBytes == 220 );
     assert( result.gpuMemory.ownedPhysicalBytes == 300 );
+    assert( result.gpuMemory.sharedAllocationCount == 1 );
     assert( result.gpuMemory.aliasResourceCount == 1 );
     assert( result.gpuMemory.rangeEvidenceBytes == 64 );
     assert( result.gpuMemory.maximumDirectWorkingSetBytes == 100 );

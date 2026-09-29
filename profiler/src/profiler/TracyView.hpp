@@ -882,6 +882,8 @@ private:
 
     std::atomic<SaveThreadState> m_saveThreadState { SaveThreadState::Inert };
     std::thread m_saveThread;
+    bool m_saveFailed = false;
+    char m_saveError[512] {};
     std::atomic<size_t> m_srcFileBytes { 0 };
     std::atomic<size_t> m_dstFileBytes { 0 };
 

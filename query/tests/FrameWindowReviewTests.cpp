@@ -103,5 +103,86 @@ int main() {
         catch(const std::runtime_error& e) {stopped=std::string(e.what())=="cancelled";}
         if(!stopped) {std::cerr<<"window work must observe cancellation";return 5;}
     }
+    {
+        CandidatePolicyInput sparse;
+        sparse.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},
+            {"candidate_policy",{{"window_sizes",nlohmann::json::array()},
+                {"absolute_frame_cost_ms",1.0},{"local_min_cost_ms",0.2}}}};
+        PolicyFrameTimeline boundary;boundary.frameScope="Sparse";
+        boundary.frames={{0,10'000'000,{},{},true},{1,10'000'000,{},{},true},
+            {2,20'000'000,{},{},true},{4,10'000'000,{},{},true}};
+        sparse.frameTimelines.push_back(boundary);
+        PolicySignatureContext context;context.frameScope="Sparse";
+        context.signatureId="sparse";context.frameSeriesComplete=true;
+        sparse.readFrameSeries=[](const PolicySignatureContext&){return std::vector<PolicyFrameEvidence>{
+            {1,0,{},{},false},{2,30'000'000,{},{},true},
+            {3,800'000,{},{},true}};};
+        const auto state=Prepare(sparse,[](const auto&){});
+        size_t tops=0;
+        const auto signals=ScanContext(sparse,0,context,state,[&](const TopKey&,const TopItem&){++tops;});
+        if(tops!=1 || signals.size()!=1 || signals[0].representatives.size()!=3 ||
+            signals[0].representatives[0].frameIndex!=2 ||
+            signals[0].representatives[1].frameIndex!=2 ||
+            signals[0].representatives[2].frameIndex!=0 ||
+            signals[0].representatives[2].valueNs!=0 ||
+            !signals[0].representatives[2].exact) {
+            std::cerr<<"Sparse missing rows must remain known zero; unknown rows are excluded and earlier ties win\n";
+            return 6;
+        }
+    }
+    for(const auto [frameCount,unknownTail,expectWindow,expectedValid]:
+        {std::tuple<uint64_t,bool,bool,uint64_t>{4,false,true,4},
+         {5,false,false,5},{5,true,true,4}}) {
+        CandidatePolicyInput sparse;
+        sparse.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},
+            {"candidate_policy",{{"window_sizes",{frameCount}},
+                {"absolute_frame_cost_ms",1.0},{"local_min_cost_ms",0.2},
+                {"window_valid_ratio",0.8}}}};
+        PolicyFrameTimeline timeline;timeline.frameScope="Sparse.Median";
+        for(uint64_t i=0;i<frameCount;++i)timeline.frames.push_back({i,20'000'000,{},{},true});
+        sparse.frameTimelines.push_back(timeline);
+        PolicySignatureContext context;context.frameScope="Sparse.Median";
+        context.signatureId="median";context.frameSeriesComplete=true;
+        sparse.readFrameSeries=[unknownTail,frameCount](const PolicySignatureContext&){
+            std::vector<PolicyFrameEvidence> rows={{0,10'000'000,{},{},true},
+                {1,10'000'000,{},{},true}};
+            if(unknownTail)rows.push_back({frameCount-1,0,{},{},false});
+            return rows;
+        };
+        const auto state=Prepare(sparse,[](const auto&){});
+        const auto signals=ScanContext(sparse,0,context,state,[](const TopKey&,const TopItem&){});
+        const auto found=std::find_if(signals.begin(),signals.end(),[](const Signal& s){
+            return s.manifestation.starts_with("stable_slow:");});
+        if((found!=signals.end())!=expectWindow ||
+            (expectWindow && (found->evidence.at("valid_frames")!=expectedValid ||
+                found->evidence.at("event_median_ns")!="5000000"))) {
+            std::cerr<<"Sparse zero/unknown median boundary changed\n";
+            return 8;
+        }
+    }
+    {
+        CandidatePolicyInput sparse;
+        sparse.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},
+            {"candidate_policy",{{"window_sizes",{3}},{"absolute_frame_cost_ms",1.0},
+                {"local_min_cost_ms",0.2}}}};
+        PolicyFrameTimeline timeline;timeline.frameScope="Sparse.Window";
+        for(uint64_t i=0;i<5;++i)timeline.frames.push_back({i,20'000'000,{},{},true});
+        sparse.frameTimelines.push_back(timeline);
+        PolicySignatureContext context;context.frameScope="Sparse.Window";
+        context.signatureId="window";context.frameSeriesComplete=true;
+        sparse.readFrameSeries=[](const PolicySignatureContext&){return std::vector<PolicyFrameEvidence>{
+            {0,30'000'000,{},{},true},{2,30'000'000,{},{},true},{3,30'000'000,{},{},true}};};
+        const auto state=Prepare(sparse,[](const auto&){});
+        const auto signals=ScanContext(sparse,0,context,state,[](const TopKey&,const TopItem&){});
+        const auto found=std::find_if(signals.begin(),signals.end(),[](const Signal& s){
+            return s.manifestation.starts_with("stable_slow:");});
+        if(found==signals.end() || found->evidence.at("valid_frames")!=5 ||
+            found->evidence.at("event_median_ns")!="30000000" ||
+            found->representatives.size()<4 || found->representatives.back().frameIndex!=4 ||
+            found->representatives.back().valueNs!=0) {
+            std::cerr<<"Window boundaries and sparse known-zero values must survive range selection\n";
+            return 7;
+        }
+    }
     std::cout<<"Window cancellation, scaling and reference-equivalence tests passed\n";
 }

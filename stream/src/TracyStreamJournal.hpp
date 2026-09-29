@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -146,6 +147,7 @@ struct ScanOptions
 {
     uint64_t maxPayloadSize = DefaultMaxPayloadSize;
     size_t maxCollectedRecords = 256;
+    std::function<void()> check;
 };
 
 struct ScanResult

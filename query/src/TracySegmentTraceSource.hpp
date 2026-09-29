@@ -33,6 +33,9 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override;
     analysis::TraceReadView AcquireReadView() const override;
     analysis::TraceInfoDto GetTraceInfo() const override;
+    analysis::TraceInfoDto GetTraceInfoMetadata() const override;
+    analysis::AppInfoSummaryDto GetAppInfoSummary() const override;
+    analysis::AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const override;
     std::vector<analysis::ThreadDto> GetThreads() const override;
     std::vector<analysis::FrameSetDto> GetFrameSets() const override;
     std::vector<analysis::GpuContextDto> GetGpuContexts() const override;
@@ -50,6 +53,9 @@ public:
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
     uint32_t NativeBoundedScanVersion() const override;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    uint64_t GetCorrelatedFrameEventCount() const override;
+    std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override;
     std::vector<analysis::JobDto> GetJobs() const override;
     uint64_t GetJobCount() const override;
     std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const override;

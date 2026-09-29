@@ -1,10 +1,13 @@
 #include "TracyAnalysisCacheTable.hpp"
 #include "TracyAnalysisIoPath.hpp"
 #include "TracyHash.hpp"
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -26,12 +29,12 @@ namespace tracy::analysis
 namespace
 {
 using nlohmann::json;
-constexpr uint32_t Schema = 1;
+constexpr uint32_t Schema = 2;
 constexpr uint64_t MaxBlockBytes = 64 * 1024 * 1024;
 constexpr uint64_t MaxManifestBytes = 16 * 1024 * 1024;
 struct IndexHeader
 {
-    char magic[8] = {'J','N','A','C','I','D','X','1'};
+    char magic[8] = {'J','N','A','C','I','D','X','2'};
     uint32_t schema = Schema;
     uint32_t reserved = 0;
     uint64_t records = 0;
@@ -52,15 +55,34 @@ struct BlockHeader
     uint64_t records = 0;
     uint64_t bytes = 0;
 };
+struct BlockEncoding
+{
+    uint32_t version = 2, codec = 0;
+    uint64_t storedBytes = 0;
+};
+static_assert(sizeof(BlockEncoding)==16);
 struct BlockInfo
 {
     uint64_t ordinal = 0, first = 0, records = 0, bytes = 0;
     std::string sha256;
+    uint64_t storedBytes = 0;
+    uint32_t codec = 0;
 };
 static_assert(std::endian::native == std::endian::little);
 static_assert(sizeof(IndexHeader) == 24 && sizeof(IndexEntry) == 24 && sizeof(BlockHeader) == 40);
 
 [[noreturn]] void Fail(const char* reason) { throw std::runtime_error(std::string("analysis_cache_") + reason); }
+uint64_t ExactUnsigned(const json& value,const char* error)
+{
+    if(!value.is_number_unsigned() && !(value.is_number_integer() && value.get<int64_t>()>=0)) Fail(error);
+    return value.get<uint64_t>();
+}
+uint32_t ExactU32(const json& value,const char* error)
+{
+    const auto result=ExactUnsigned(value,error);
+    if(result>UINT32_MAX) Fail(error);
+    return uint32_t(result);
+}
 void CheckCancel(const AnalysisCacheTableOptions& options)
 {
     if(options.cancelled && options.cancelled()) Fail("cancelled");
@@ -88,13 +110,26 @@ std::string BlockName(uint64_t ordinal)
 }
 void CheckContained(const std::filesystem::path& root, const std::filesystem::path& path)
 {
-    const auto relative = std::filesystem::weakly_canonical(path).lexically_relative(std::filesystem::weakly_canonical(root));
+    std::error_code error;
+    const auto absoluteRoot = std::filesystem::weakly_canonical(AnalysisIoPath(root),error);
+    if(error) Fail("path_escape");
+    auto absolutePath = std::filesystem::weakly_canonical(AnalysisIoPath(path.parent_path()),error);
+    if(error) Fail("path_escape");
+    absolutePath /= path.filename();
+    const auto relative = absolutePath.lexically_relative(absoluteRoot);
     if(relative.empty() || relative.is_absolute()) Fail("path_escape");
     for(const auto& part : relative) if(part == "..") Fail("path_escape");
+#ifdef _WIN32
+    const auto attributes=GetFileAttributesW(AnalysisIoPath(path).c_str());
+    if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) Fail("path_escape");
+#else
+    const auto status=std::filesystem::symlink_status(path,error);
+    if(!error && std::filesystem::is_symlink(status)) Fail("path_escape");
+#endif
 }
 void DurableRename(const std::filesystem::path& temporary, const std::filesystem::path& target)
 {
-    if(std::filesystem::exists(target)) Fail("already_exists");
+    if(std::filesystem::exists(AnalysisIoPath(target))) Fail("already_exists");
 #ifdef _WIN32
     const auto source = AnalysisIoPath(temporary);
     const auto destination = AnalysisIoPath(target);
@@ -130,7 +165,7 @@ template<class T> T Read(std::istream& input)
 }
 std::string ReadText(const std::filesystem::path& path, uint64_t limit)
 {
-    const auto size = std::filesystem::file_size(path);
+    const auto size = std::filesystem::file_size(AnalysisIoPath(path));
     if(size > limit) Fail("manifest_budget");
     std::ifstream input(AnalysisIoPath(path), std::ios::binary);
     std::string value(size_t(size), '\0');
@@ -145,6 +180,32 @@ void WriteText(const std::filesystem::path& path, std::string_view value)
     if(!output) Fail("manifest_write_failed");
 }
 }
+
+namespace {
+std::string StorageExperiment()
+{
+#ifdef TRACY_CACHE_STORAGE_EXPERIMENTS
+    char value[32]{};
+#ifdef _WIN32
+    const auto size=GetEnvironmentVariableA("JNTRACY_CACHE_EXPERIMENT",value,sizeof(value));
+    if(size>=sizeof(value)) Fail("experiment_mode");
+#else
+    const auto* environment=std::getenv("JNTRACY_CACHE_EXPERIMENT");
+    if(environment) {
+        if(std::strlen(environment)>=sizeof(value)) Fail("experiment_mode");
+        std::strcpy(value,environment);
+    }
+#endif
+    const std::string mode=value;
+    if(!mode.empty() && mode!="cleanup" && mode!="compression" && mode!="combined") Fail("experiment_mode");
+    return mode;
+#else
+    return {};
+#endif
+}
+}
+bool AnalysisCacheCompressionDefault() { return StorageExperiment()!="cleanup"; }
+bool AnalysisCacheCleanupDefault() { return StorageExperiment()!="compression"; }
 
 struct AnalysisCacheTableWriter::Impl
 {
@@ -169,9 +230,9 @@ struct AnalysisCacheTableWriter::Impl
         // Block capacity, the maximum retained previous key, and stream/hash
         // overhead share the caller's workspace, before any buffer is grown.
         memory.Resize(options.blockBytes+128*1024);
-        std::filesystem::create_directories(root.parent_path());
-        if(!std::filesystem::create_directory(root)) Fail("already_exists");
-        std::filesystem::create_directory(root / "blocks");
+        std::filesystem::create_directories(AnalysisIoPath(root.parent_path()));
+        if(!std::filesystem::create_directory(AnalysisIoPath(root))) Fail("already_exists");
+        std::filesystem::create_directory(AnalysisIoPath(root / "blocks"));
         buffer.reserve(size_t(options.blockBytes));
         AnalysisDiskGrow(options.disk,sizeof(IndexHeader));
         index.open(AnalysisIoPath(root / "index.tmp"), std::ios::binary | std::ios::trunc);
@@ -197,18 +258,41 @@ struct AnalysisCacheTableWriter::Impl
         const auto target = root / "blocks" / BlockName(header.ordinal);
         const auto temporary = std::filesystem::path(target.native() + std::filesystem::path(".tmp").native());
         CheckContained(root, target);
-        AnalysisDiskGrow(options.disk,sizeof(header)+buffer.size());
+        header.magic[7]='2';
+        BlockEncoding encoding;
+        const char* stored=buffer.data();
+        size_t storedBytes=buffer.size();
+        // The raw block is already reserved. Charge output and an aligned static
+        // codec arena before allocation; codec code cannot allocate off-budget.
+        AnalysisWorkspaceReservation codecMemory(options.workspace);
+        std::vector<char> compressed;
+        std::vector<uint64_t> arena;
+        if(options.compressBlocks) {
+            const auto bound=ZSTD_compressBound(buffer.size());
+            const auto arenaBytes=ZSTD_estimateCCtxSize(1);
+            if(ZSTD_isError(bound) || ZSTD_isError(arenaBytes)) Fail("codec_budget");
+            codecMemory.Resize(bound+arenaBytes+8);
+            compressed.resize(bound); arena.resize((arenaBytes+7)/8);
+            auto* context=ZSTD_initStaticCCtx(arena.data(),arena.size()*8);
+            if(!context) Fail("codec_context");
+            const auto size=ZSTD_compressCCtx(context,compressed.data(),compressed.size(),buffer.data(),buffer.size(),1);
+            if(ZSTD_isError(size)) Fail("codec_compress");
+            if(size<buffer.size()) { encoding.codec=1; stored=compressed.data(); storedBytes=size; }
+        }
+        CheckCancel(options);
+        encoding.storedBytes=storedBytes;
+        AnalysisDiskGrow(options.disk,sizeof(header)+sizeof(encoding)+storedBytes);
         std::ofstream output(AnalysisIoPath(temporary), std::ios::binary | std::ios::trunc);
-        Write(output, header);
-        output.write(buffer.data(), std::streamsize(buffer.size())); output.flush();
+        Write(output, header); Write(output,encoding);
+        output.write(stored, std::streamsize(storedBytes)); output.flush();
         if(!output) Fail("block_write_failed");
         output.close();
         Sha256Builder hash;
-        hash.Update(&header, sizeof(header)); hash.Update(buffer.data(), buffer.size());
+        hash.Update(&header, sizeof(header)); hash.Update(&encoding,sizeof(encoding)); hash.Update(stored,storedBytes);
         const auto digest = hash.FinalHex();
         if(Sha256File(temporary) != digest) Fail("block_write_verification");
         DurableRename(temporary, target);
-        blocks.push_back({header.ordinal, header.first, header.records, header.bytes, digest});
+        blocks.push_back({header.ordinal, header.first, header.records, header.bytes, digest,storedBytes,encoding.codec});
         buffer.clear(); blockRecords = 0;
     }
 };
@@ -256,7 +340,7 @@ AnalysisCacheTableDescriptor AnalysisCacheTableWriter::Commit()
         if(!w.index) Fail("index_write_failed");
         w.index.close();
         const auto indexHash = Sha256File(w.root / "index.tmp");
-        const auto indexBytes = std::filesystem::file_size(w.root / "index.tmp");
+        const auto indexBytes = std::filesystem::file_size(AnalysisIoPath(w.root / "index.tmp"));
         if(w.records > (UINT64_MAX-sizeof(header))/sizeof(IndexEntry) ||
             indexBytes != sizeof(header)+w.records*sizeof(IndexEntry)) Fail("index_size");
         DurableRename(w.root / "index.tmp", w.root / "index.bin");
@@ -268,7 +352,7 @@ AnalysisCacheTableDescriptor AnalysisCacheTableWriter::Commit()
             {"index_sha256", indexHash}, {"blocks", json::array()} };
         for(const auto& block : w.blocks) body["blocks"].push_back({
             {"ordinal", block.ordinal}, {"first", block.first}, {"records", block.records},
-            {"bytes", block.bytes}, {"sha256", block.sha256} });
+            {"bytes", block.bytes}, {"sha256", block.sha256}, {"stored_bytes",block.storedBytes}, {"codec",block.codec} });
         const auto manifest = json({{"body", body}, {"sha256", Hash(body.dump())}}).dump();
         if(manifest.size() > w.options.manifestBytes) Fail("manifest_budget");
         w.Check();
@@ -290,6 +374,7 @@ struct AnalysisCacheTableReader::Impl
     std::vector<BlockInfo> blocks;
     std::ifstream index;
     std::vector<char> buffer;
+    uint32_t schema = 0;
     uint64_t loaded = UINT64_MAX;
     AnalysisCacheReadMetrics metrics;
     Impl(std::filesystem::path path, const std::string& identity, const std::string& kind, AnalysisCacheTableOptions config)
@@ -298,16 +383,17 @@ struct AnalysisCacheTableReader::Impl
     {
         ValidateOptions(options); CheckCancel(options);
         const auto manifestPath = root / "manifest.json";
-        if(!std::filesystem::exists(manifestPath)) Fail("not_complete");
+        if(!std::filesystem::exists(AnalysisIoPath(manifestPath))) Fail("not_complete");
         CheckContained(root, manifestPath);
-        const auto manifestBytes=std::filesystem::file_size(manifestPath);
+        const auto manifestBytes=std::filesystem::file_size(AnalysisIoPath(manifestPath));
         if(manifestBytes>options.manifestBytes) Fail("manifest_budget");
         metadataMemory.Resize(64*1024);
         AnalysisWorkspaceReservation parseMemory(options.workspace,64*1024+manifestBytes*16);
         const auto envelope = json::parse(ReadText(manifestPath, options.manifestBytes));
         const auto& body = envelope.at("body");
         if(Hash(body.dump()) != envelope.at("sha256").get<std::string>()) Fail("manifest_checksum");
-        if(body.at("schema").get<uint32_t>() != Schema) Fail("schema_mismatch");
+        schema=ExactU32(body.at("schema"),"schema_mismatch");
+        if(schema!=1 && schema!=Schema) Fail("schema_mismatch");
         if(body.at("identity").get<std::string>() != identity || !Digest(identity)) Fail("identity_mismatch");
         if(body.at("kind").get<std::string>() != kind) Fail("kind_mismatch");
         if(body.at("block_bytes").get<uint64_t>() > options.blockBytes) Fail("block_budget");
@@ -323,6 +409,10 @@ struct AnalysisCacheTableReader::Impl
             if(block.ordinal != blocks.size() || block.first != end || block.records == 0 ||
                 block.records > descriptor.records-end || block.bytes > options.blockBytes ||
                 block.records > block.bytes/9 || !Digest(block.sha256)) Fail("block_directory");
+            block.storedBytes=schema==1 ? block.bytes : ExactUnsigned(value.at("stored_bytes"),"block_encoding");
+            block.codec=schema==1 ? 0 : ExactU32(value.at("codec"),"block_encoding");
+            if(block.codec>1 || block.storedBytes==0 || block.storedBytes>block.bytes ||
+                (block.codec==0 && block.storedBytes!=block.bytes)) Fail("block_encoding");
             metadataMemory.Add(512);
             end += block.records; blocks.push_back(std::move(block));
         }
@@ -332,12 +422,12 @@ struct AnalysisCacheTableReader::Impl
         CheckContained(root, indexPath);
         if(descriptor.records > (UINT64_MAX-sizeof(IndexHeader))/sizeof(IndexEntry)) Fail("index_size");
         const auto expectedBytes = sizeof(IndexHeader)+descriptor.records*sizeof(IndexEntry);
-        if(body.at("index_bytes").get<uint64_t>() != expectedBytes || std::filesystem::file_size(indexPath) != expectedBytes) Fail("index_size");
+        if(body.at("index_bytes").get<uint64_t>() != expectedBytes || std::filesystem::file_size(AnalysisIoPath(indexPath)) != expectedBytes) Fail("index_size");
         if(Sha256File(indexPath) != body.at("index_sha256").get<std::string>()) Fail("index_checksum");
         index.open(AnalysisIoPath(indexPath), std::ios::binary);
         const auto header = Read<IndexHeader>(index);
-        const IndexHeader expected;
-        if(std::memcmp(header.magic, expected.magic, 8) || header.schema != Schema || header.reserved || header.records != descriptor.records) Fail("index_header");
+        IndexHeader expected; expected.magic[7]=char('0'+schema);
+        if(std::memcmp(header.magic, expected.magic, 8) || header.schema != schema || header.reserved || header.records != descriptor.records) Fail("index_header");
     }
     IndexEntry Position(uint64_t ordinal)
     {
@@ -358,27 +448,53 @@ struct AnalysisCacheTableReader::Impl
         const auto& block = blocks[size_t(blockOrdinal)];
         const auto path = root / "blocks" / BlockName(blockOrdinal);
         CheckContained(root, path);
-        if(!std::filesystem::exists(path)) Fail("block_missing");
-        if(std::filesystem::file_size(path) != sizeof(BlockHeader)+block.bytes) Fail("block_size");
+        if(!std::filesystem::exists(AnalysisIoPath(path))) Fail("block_missing");
+        const auto extensionBytes=schema==1 ? 0 : sizeof(BlockEncoding);
+        if(std::filesystem::file_size(AnalysisIoPath(path)) != sizeof(BlockHeader)+extensionBytes+block.storedBytes) Fail("block_size");
         std::ifstream input(AnalysisIoPath(path), std::ios::binary);
         const auto header = Read<BlockHeader>(input);
-        const BlockHeader expected;
+        BlockHeader expected; expected.magic[7]=char('0'+schema);
         if(std::memcmp(header.magic, expected.magic, 8) || header.ordinal != block.ordinal ||
             header.first != block.first || header.records != block.records || header.bytes != block.bytes) Fail("block_header");
-        // Reserve the configured block once on first use, rather than letting
-        // vector's geometric growth exceed the block budget on varied sizes.
+        BlockEncoding encoding;
+        if(schema==2) {
+            encoding=Read<BlockEncoding>(input);
+            if(encoding.version!=2 || encoding.codec!=block.codec || encoding.storedBytes!=block.storedBytes) Fail("block_encoding");
+        }
         if(buffer.capacity() < block.bytes) {
-            // Include one returned-record copy alongside the resident block.
-            // Multi-record responses additionally reserve their own budget.
             blockMemory.Resize(2*options.blockBytes);
             buffer.reserve(size_t(options.blockBytes));
         }
         buffer.resize(size_t(block.bytes));
-        input.read(buffer.data(), std::streamsize(buffer.size()));
+        AnalysisWorkspaceReservation codecMemory(options.workspace);
+        std::vector<char> compressed;
+        std::vector<uint64_t> arena;
+        char* stored=buffer.data();
+        if(block.codec==1) {
+            const auto arenaBytes=ZSTD_estimateDCtxSize();
+            if(ZSTD_isError(arenaBytes)) Fail("codec_budget");
+            codecMemory.Resize(block.storedBytes+arenaBytes+8);
+            compressed.resize(size_t(block.storedBytes)); arena.resize((arenaBytes+7)/8);
+            stored=compressed.data();
+        }
+        input.read(stored, std::streamsize(block.storedBytes));
         if(!input) Fail("block_truncated");
-        Sha256Builder hash; hash.Update(&header, sizeof(header)); hash.Update(buffer.data(), buffer.size());
+        Sha256Builder hash; hash.Update(&header, sizeof(header));
+        if(schema==2) hash.Update(&encoding,sizeof(encoding));
+        hash.Update(stored,size_t(block.storedBytes));
         if(hash.FinalHex() != block.sha256) Fail("block_checksum");
+        if(block.codec==1) {
+            if(ZSTD_getFrameContentSize(stored,size_t(block.storedBytes))!=block.bytes ||
+                ZSTD_findFrameCompressedSize(stored,size_t(block.storedBytes))!=block.storedBytes) Fail("codec_frame_size");
+            auto* context=ZSTD_initStaticDCtx(arena.data(),arena.size()*8);
+            if(!context) Fail("codec_context");
+            const auto size=ZSTD_decompressDCtx(context,buffer.data(),buffer.size(),stored,size_t(block.storedBytes));
+            if(ZSTD_isError(size) || size!=block.bytes) Fail("codec_decode");
+        }
+        CheckCancel(options);
         ++metrics.blocksLoaded; metrics.payloadBytesRead += block.bytes;
+        metrics.storedBytesRead += sizeof(header)+extensionBytes+block.storedBytes;
+        metrics.decodedBytes += block.bytes;
         metrics.peakBlockBytes = std::max<uint64_t>(metrics.peakBlockBytes, buffer.size());
         loaded = blockOrdinal;
     }
@@ -401,6 +517,28 @@ AnalysisCacheTableReader::~AnalysisCacheTableReader() = default;
 uint64_t AnalysisCacheTableReader::RecordCount() const { return m_impl->descriptor.records; }
 const AnalysisCacheTableDescriptor& AnalysisCacheTableReader::Descriptor() const { return m_impl->descriptor; }
 AnalysisCacheReadMetrics AnalysisCacheTableReader::Metrics() const { return m_impl->metrics; }
+void AnalysisCacheTableReader::ValidateAll()
+{
+    auto& s=*m_impl;
+    AnalysisWorkspaceReservation previousMemory(s.options.workspace,65536);
+    Sha256Builder hash; std::string previous; previous.reserve(65536);
+    uint64_t block=UINT64_MAX, nextOffset=0;
+    for(uint64_t i=0;i<RecordCount();++i) {
+        const auto position=s.Position(i);
+        if(position.block!=block) {
+            if(block!=UINT64_MAX && nextOffset!=s.blocks[size_t(block)].bytes) Fail("index_coverage");
+            block=position.block; nextOffset=0;
+        }
+        if(position.offset!=nextOffset) Fail("index_coverage");
+        const auto [key,payload]=s.View(i);
+        if(i && key<=previous) Fail("key_order");
+        hash.Update(&position.keyBytes,4); hash.Update(&position.payloadBytes,4);
+        hash.Update(key.data(),key.size()); hash.Update(payload.data(),payload.size());
+        previous.assign(key); nextOffset+=8+key.size()+payload.size();
+    }
+    if(block!=UINT64_MAX && nextOffset!=s.blocks[size_t(block)].bytes) Fail("index_coverage");
+    if(hash.FinalHex()!=s.descriptor.contentSha256) Fail("content_checksum");
+}
 AnalysisCacheRecord AnalysisCacheTableReader::GetAt(uint64_t ordinal)
 {
     const auto [key,payload] = m_impl->View(ordinal);

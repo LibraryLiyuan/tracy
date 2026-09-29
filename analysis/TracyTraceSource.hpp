@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -129,6 +130,9 @@ struct TraceInfoDto
     uint64_t executableTime = 0;
     uint64_t processId = 0;
     int traceVersion = 0;
+    std::string traceFormatName;
+    uint32_t traceFormatVersion = 0;
+    uint32_t stringIndexBits = 0;
     int64_t resolution = 0;
     int64_t firstTimeNs = 0;
     int64_t lastTimeNs = 0;
@@ -146,6 +150,21 @@ struct TraceInfoDto
     bool onDemand = false;
     std::optional<int64_t> legacyQueueDelayNs;
     FieldAvailabilityDto legacyQueueDelayAvailability;
+};
+
+struct AppInfoSummaryDto
+{
+    uint64_t recordCount = 0;
+    uint64_t totalBytes = 0;
+    uint64_t maximumRecordBytes = 0;
+};
+
+struct AppInfoPageDto
+{
+    std::vector<std::string> records;
+    AppInfoSummaryDto summary;
+    uint64_t offset = 0;
+    uint64_t oversizedRecordBytes = 0;
 };
 
 struct ThreadDto
@@ -401,6 +420,13 @@ struct CpuContextSwitchDto
     uint16_t rawThreadIndex = 0;
     std::string threadRef;
     bool complete = true;
+};
+
+struct SampleSummaryDto
+{
+    uint64_t ordinal = 0;
+    int64_t timeNs = 0;
+    uint32_t callstack = 0;
 };
 
 struct SampleDto
@@ -894,6 +920,58 @@ public:
     virtual std::vector<Capability> GetCapabilities() const = 0;
     virtual TraceReadView AcquireReadView() const = 0;
     virtual TraceInfoDto GetTraceInfo() const = 0;
+    // Internal phase-recovery binding, separate from the immutable Trace SHA.
+    // Indexed sources include their layout version and pinned generation.
+    virtual std::string GetScanStorageIdentity() const {return "worker-memory-v1";}
+    virtual TraceInfoDto GetTraceInfoMetadata() const
+    {
+        auto result = GetTraceInfo();
+        result.appInfo.clear();
+        return result;
+    }
+    virtual AppInfoSummaryDto GetAppInfoSummary() const
+    {
+        AppInfoSummaryDto result;
+        const auto info = GetTraceInfo();
+        result.recordCount = info.appInfo.size();
+        for( const auto& record : info.appInfo )
+        {
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.totalBytes += record.size();
+            result.maximumRecordBytes = std::max<uint64_t>( result.maximumRecordBytes, record.size() );
+        }
+        return result;
+    }
+    virtual AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const
+    {
+        AppInfoPageDto result;
+        result.offset = offset;
+        const auto info = GetTraceInfo();
+        result.summary.recordCount = info.appInfo.size();
+        for( const auto& record : info.appInfo )
+        {
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.summary.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.summary.totalBytes += record.size();
+            result.summary.maximumRecordBytes = std::max<uint64_t>(
+                result.summary.maximumRecordBytes, record.size() );
+        }
+        uint64_t selectedBytes = 0;
+        for( uint64_t ordinal = offset; ordinal < info.appInfo.size() && result.records.size() < limit; ordinal++ )
+        {
+            const auto bytes = uint64_t( info.appInfo[size_t( ordinal )].size() );
+            if( bytes > maximumBytes )
+            {
+                if( result.records.empty() ) result.oversizedRecordBytes = bytes;
+                break;
+            }
+            if( bytes > maximumBytes - selectedBytes ) break;
+            selectedBytes += bytes;
+            result.records.emplace_back( info.appInfo[size_t( ordinal )] );
+        }
+        return result;
+    }
     virtual std::vector<ThreadDto> GetThreads() const = 0;
     virtual std::vector<FrameSetDto> GetFrameSets() const = 0;
     virtual std::vector<GpuContextDto> GetGpuContexts() const = 0;
@@ -902,9 +980,36 @@ public:
     virtual std::vector<LockDto> GetLocks() const = 0;
 
     virtual std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const = 0;
+    // Native policy scans may request the same facts without optional dynamic
+    // text payloads. The default preserves compatibility for other sources.
+    virtual std::vector<CpuZoneDto> ScanCpuZonesForPolicy( const ScanRange& range ) const
+    {
+        auto zones = ScanCpuZones( range );
+        for( auto& zone : zones )
+        {
+            if( zone.extraName && !zone.function.empty() ) zone.name = zone.function;
+            zone.extraName.reset();
+            zone.extraText.reset();
+            zone.extraColor = 0;
+            zone.callstack = 0;
+            zone.callstackRef.reset();
+        }
+        return zones;
+    }
     virtual std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const = 0;
     virtual std::vector<FrameDto> ScanFrames( const ScanRange& range ) const = 0;
     virtual std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const = 0;
+    // Whole-domain ordinal projection for capacity/quality consumers. Full
+    // detail implementations remain a compatibility fallback for other sources.
+    virtual std::vector<MemoryEventDto> ScanMemoryEventsForSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const
+    {
+        if( check ) check();
+        ScanRange range; range.offset = offset; range.limit = limit;
+        auto result = ScanMemoryEvents( range );
+        if( check ) check();
+        return result;
+    }
     virtual std::vector<MessageDto> ScanMessages( const ScanRange& range ) const = 0;
     virtual std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const = 0;
 
@@ -914,6 +1019,18 @@ public:
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
     virtual uint64_t GetJobCount() const { return GetJobs().size(); }
+    virtual bool HasJobIdentityIndex() const { return false; }
+    virtual std::optional<std::string> FindJobRef( uint64_t jobId, const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        const auto jobs = GetJobs();
+        for( const auto& job : jobs )
+        {
+            if( check ) check();
+            if( job.jobId == jobId ) return job.ref;
+        }
+        return std::nullopt;
+    }
     virtual std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const
     {
         const auto values = GetJobs();
@@ -921,6 +1038,27 @@ public:
         const auto end = offset + std::min( limit, values.size() - offset );
         return { values.begin() + offset, values.begin() + end };
     }
+    virtual bool JobDerivedDataReady() const { return true; }
+    virtual bool HasJobScheduleIndex() const { return false; }
+    virtual std::vector<JobDto> ScanJobsBySchedule( size_t offset, size_t limit,
+        const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        auto values = GetJobs();
+        std::sort( values.begin(), values.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.scheduleNs != rhs.scheduleNs ? lhs.scheduleNs < rhs.scheduleNs : lhs.jobId < rhs.jobId;
+        } );
+        if( check ) check();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    // Native policy aggregation consumes lifecycle totals and identity, not
+    // the potentially much larger Stage/Dependency evidence collections.
+    // Indexed sources may provide a summary-only projection; the default
+    // preserves compatibility and exact values for other implementations.
+    virtual std::vector<JobDto> ScanJobsForPolicy( size_t offset, size_t limit ) const
+    { return ScanJobs( offset, limit ); }
     virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
     virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
     {
@@ -1066,6 +1204,14 @@ public:
         return result;
     }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
+    virtual uint64_t GetCorrelatedFrameEventCount() const { return GetCorrelatedFrameEvents().size(); }
+    virtual std::vector<CorrelatedFrameEventDto> ScanCorrelatedFrameEvents( size_t offset, size_t limit ) const
+    {
+        const auto values = GetCorrelatedFrameEvents();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
     virtual uint64_t GetRelationCount() const { return GetRelations().size(); }
     virtual std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const
@@ -1096,6 +1242,7 @@ public:
     // Immutable N27 Catalog snapshot. Pointer tokens are retained only for
     // validation and lifetime resolution and must never reach Query output.
     virtual std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const { return {}; }
+    virtual bool CatalogDerivedDataReady() const { return true; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }
@@ -1103,7 +1250,37 @@ public:
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
+    // Logical Main/Context ordinals, independent of time filtering. Callers
+    // apply predicates after advancing the physical cursor.
+    virtual std::vector<SampleDto> ScanSampleEventsRaw( const ScanRange& range ) const
+    {
+        auto all = range;
+        all.startNs = std::numeric_limits<int64_t>::min();
+        all.endNs = std::numeric_limits<int64_t>::max();
+        return ScanSampleEvents( all );
+    }
+    virtual std::vector<SampleSummaryDto> ScanSampleSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const
+    {
+        if( check ) check();
+        ScanRange range; range.offset=offset; range.limit=limit;
+        const auto rows=ScanSampleEventsRaw(range);
+        if( check ) check();
+        std::vector<SampleSummaryDto> result; result.reserve(rows.size());
+        for( size_t i=0; i<rows.size(); ++i ) result.push_back({offset+i,rows[i].timeNs,rows[i].callstack});
+        return result;
+    }
+    virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
+    // Cursor offsets are physical Ghost ordinals. Rows outside the requested
+    // time range may omit resolved strings; callers must filter time first.
+    virtual std::vector<GhostZoneDto> ScanGhostZonesRaw( const ScanRange& range ) const
+    {
+        auto all = range;
+        all.startNs = std::numeric_limits<int64_t>::min();
+        all.endNs = std::numeric_limits<int64_t>::max();
+        return ScanGhostZones( all );
+    }
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
     virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }
     virtual std::vector<LockEventDto> ScanLockEvents( const ScanRange& ) const { return {}; }

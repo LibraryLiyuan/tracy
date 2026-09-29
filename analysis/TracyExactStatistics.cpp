@@ -3,6 +3,14 @@
 #include "TracyHash.hpp"
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisDictionary.hpp"
+#include "TracyAnalysisCacheTable.hpp"
+#include "TracyAnalysisCacheKey.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <locale>
 #include <map>
@@ -86,6 +95,12 @@ struct MetricPoint
     int64_t value = 0;
 };
 
+struct StatisticsCancelled {};
+void CheckStatisticsCancelled(const std::function<bool()>& cancelled)
+{
+    if(cancelled && cancelled()) throw StatisticsCancelled{};
+}
+
 bool AddChecked( int64_t& target, int64_t value )
 {
     if( value < 0 || target < 0 || value > std::numeric_limits<int64_t>::max() - target )
@@ -129,25 +144,6 @@ void RemoveQuietly( const std::filesystem::path& path,const std::shared_ptr<Anal
 {
     std::error_code ignored;
     AnalysisDiskRemove(path,disk,ignored);
-}
-
-bool WritePairs( const std::filesystem::path& path, const std::vector<int64_t>& values,
-    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
-{
-    AnalysisDiskGrow(disk,uint64_t(values.size())*sizeof(AnalysisUInt64Pair));
-    std::ofstream output( path, std::ios::binary | std::ios::trunc );
-    if( !output ) { error = "exact_statistics_source_open_failed"; return false; }
-    uint64_t ordinal = 0;
-    for( const auto value : values )
-    {
-        if( value < 0 ) { error = "negative_duration_not_supported"; return false; }
-        const AnalysisUInt64Pair pair { uint64_t( value ), ordinal++ };
-        output.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
-        if( !output ) { error = "exact_statistics_source_write_failed"; return false; }
-    }
-    output.flush();
-    if( !output ) { error = "exact_statistics_source_flush_failed"; return false; }
-    return true;
 }
 
 class SortedPairs
@@ -367,22 +363,33 @@ std::string Sha256Text( const std::string& value )
 
 NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
     uint64_t completeFrames, const std::filesystem::path& root, const std::string& prefix,
-    uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk={} )
+    uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk={},
+    const std::function<bool()>& cancelled={} )
 {
     NeutralMetricAggregate result;
     std::vector<int64_t> values;
     values.reserve( points.size() );
-    for( const auto& point : points ) values.push_back( point.value );
+    for( const auto& point : points )
+    {
+        if((values.size()&4095)==0) CheckStatisticsCancelled(cancelled);
+        values.push_back( point.value );
+    }
     result.whenPresent = ComputeExactDistributionExternal( values, 0, root,
-        prefix + "-present", maximumBufferedValues,disk );
+        prefix + "-present", maximumBufferedValues,disk,cancelled );
+    if(result.whenPresent.unavailableReason=="cancelled") throw StatisticsCancelled{};
+    CheckStatisticsCancelled(cancelled);
     if( completeFrames < points.size() )
     {
         result.perCompleteFrame.exact = false;
         result.perCompleteFrame.unavailableReason = "complete_frame_denominator_smaller_than_present_frames";
         return result;
     }
-    result.perCompleteFrame = ComputeExactDistributionExternal( values,
-        completeFrames - points.size(), root, prefix + "-complete", maximumBufferedValues,disk );
+    // With no implicit zero frames the two populations are identical.
+    result.perCompleteFrame = completeFrames==points.size() ? result.whenPresent :
+        ComputeExactDistributionExternal( values, completeFrames - points.size(), root,
+            prefix + "-complete", maximumBufferedValues,disk,cancelled );
+    if(result.perCompleteFrame.unavailableReason=="cancelled") throw StatisticsCancelled{};
+    CheckStatisticsCancelled(cancelled);
     if( !result.perCompleteFrame.exact || !result.whenPresent.exact ) return result;
 
     const auto median = result.perCompleteFrame.median;
@@ -425,8 +432,10 @@ NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
         }
     };
 
+    uint64_t checkedPoints=0;
     for( const auto& point : points )
     {
+        if((checkedPoints++&4095)==0) CheckStatisticsCancelled(cancelled);
         if( double( point.value ) <= threshold ) continue;
         const AnomalyInstance anomaly { point.frame, point.value,
             double( point.value ) - median };
@@ -547,7 +556,7 @@ uint64_t UnixTimeNs()
 }
 
 ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& explicitValues,
-    uint64_t implicitZeros )
+    uint64_t implicitZeros, const std::function<bool()>& cancelled )
 {
     ExactDistribution result;
     if( explicitValues.size() > std::numeric_limits<uint64_t>::max() - implicitZeros )
@@ -566,6 +575,7 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     int64_t total = 0;
     for( const auto value : explicitValues )
     {
+        if((values.size()&4095)==0) CheckStatisticsCancelled(cancelled);
         if( value < 0 )
         {
             result.exact = false;
@@ -581,7 +591,12 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
         }
         values.emplace_back( uint64_t( value ) );
     }
-    std::sort( values.begin(), values.end() );
+    uint64_t comparisons=0;
+    const auto less=[&](uint64_t left,uint64_t right) {
+        if((comparisons++&4095)==0) CheckStatisticsCancelled(cancelled);
+        return left<right;
+    };
+    std::sort( values.begin(), values.end(),less );
 
     const auto reader = [&]( uint64_t index, uint64_t& value ) {
         if( index < implicitZeros )
@@ -613,6 +628,10 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     result.max = int64_t( maximum );
     result.p50 = result.median;
 
+    // Durations are non-negative: if their exact median is zero, the
+    // distribution of absolute deviations has the same zero median.
+    if(result.median==0) {result.mad=0;return result;}
+
     uint64_t medianLow = 0;
     uint64_t medianHigh = 0;
     if( !reader( ( result.count - 1 ) / 2, medianLow ) ||
@@ -627,10 +646,11 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     deviations.reserve( values.size() );
     for( const auto value : values )
     {
+        if((deviations.size()&4095)==0) CheckStatisticsCancelled(cancelled);
         const auto value2 = value * 2;
         deviations.emplace_back( value2 >= median2 ? value2 - median2 : median2 - value2 );
     }
-    std::sort( deviations.begin(), deviations.end() );
+    std::sort( deviations.begin(), deviations.end(),less );
     const auto insertion = uint64_t( std::lower_bound(
         deviations.begin(), deviations.end(), median2 ) - deviations.begin() );
     const auto deviationReader = [&]( uint64_t index, uint64_t& value ) {
@@ -677,11 +697,53 @@ const char* AnomalyPatternName( AnomalyPattern pattern )
 
 ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& explicitValues,
     uint64_t implicitZeros, const std::filesystem::path& temporaryRoot,
-    const std::string& rawPrefix, uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk )
+    const std::string& rawPrefix, uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::function<bool()>& cancelled )
+try
 {
+    CheckStatisticsCancelled(cancelled);
+    const auto cancelSort=[&]() { CheckStatisticsCancelled(cancelled); return false; };
+    // Wait/critical metrics commonly contain only zeros. More generally a
+    // constant explicit population plus implicit zeros has at most two values;
+    // exact weighted order statistics need neither sorting nor scratch files.
+    bool constant=!explicitValues.empty() && explicitValues.front()>=0;
+    for(size_t i=1;constant && i<explicitValues.size();++i) {
+        if((i&4095)==0) CheckStatisticsCancelled(cancelled);
+        constant=explicitValues[i]==explicitValues.front();
+    }
+    if(constant) {
+        ExactDistribution result;
+        if(explicitValues.size()>UINT64_MAX-implicitZeros) {
+            result.exact=false; result.unavailableReason="statistics_count_overflow"; return result;
+        }
+        const auto value=uint64_t(explicitValues.front());
+        result.count=uint64_t(explicitValues.size())+implicitZeros;
+        result.zeroCount=value==0?result.count:implicitZeros;
+        if(value!=0 && explicitValues.size()>uint64_t(INT64_MAX)/value) {
+            result.exact=false; result.unavailableReason="statistics_total_overflow"; return result;
+        }
+        result.total=int64_t(value*explicitValues.size());
+        result.min=implicitZeros?0:int64_t(value); result.max=int64_t(value);
+        result.mean=double(result.total)/double(result.count);
+        const auto reader=[&](uint64_t index,uint64_t& output) {output=index<implicitZeros?0:value;return index<result.count;};
+        ExactPercentile(result.count,0.50,reader,result.median); result.p50=result.median;
+        ExactPercentile(result.count,0.90,reader,result.p90);
+        ExactPercentile(result.count,0.95,reader,result.p95);
+        ExactPercentile(result.count,0.99,reader,result.p99);
+        uint64_t low=0,high=0; reader((result.count-1)/2,low);reader(result.count/2,high);
+        const auto median2=low+high;
+        const auto explicitDeviation=value*2>=median2?value*2-median2:median2-value*2;
+        const bool zeroFirst=median2<=explicitDeviation;
+        const auto firstCount=zeroFirst?implicitZeros:uint64_t(explicitValues.size());
+        const auto deviationReader=[&](uint64_t index,uint64_t& output) {
+            output=(index<firstCount)==zeroFirst?median2:explicitDeviation; return index<result.count;
+        };
+        double mad2=0; ExactPercentile(result.count,0.50,deviationReader,mad2);result.mad=mad2/2;
+        return result;
+    }
     if( maximumBufferedValues == 0 ) maximumBufferedValues = 1;
     if( explicitValues.size() <= maximumBufferedValues )
-        return ComputeExactDistributionBounded( explicitValues, implicitZeros );
+        return ComputeExactDistributionBounded( explicitValues, implicitZeros,cancelled );
 
     ExactDistribution result;
     if( explicitValues.size() > std::numeric_limits<uint64_t>::max() - implicitZeros )
@@ -712,9 +774,19 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     };
     cleanup();
 
+    // Readers declared below close before this guard runs, including on a
+    // resource rejection thrown while generating a sorted run.
+    struct CleanupGuard
+    {
+        std::function<void()> action;
+        ~CleanupGuard() { try { action(); } catch(...) {} }
+    } guard { cleanup };
+
     int64_t total = 0;
+    uint64_t validated=0;
     for( const auto value : explicitValues )
     {
+        if((validated++&4095)==0) CheckStatisticsCancelled(cancelled);
         if( value < 0 )
         {
             result.exact = false; result.unavailableReason = "negative_duration_not_supported";
@@ -731,9 +803,11 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     result.mean = double( total ) / double( result.count );
 
     std::string error;
-    if( !WritePairs( source, explicitValues, error,disk ) ||
-        !SortAnalysisUInt64Pairs( source, sorted, temporaryRoot, prefix + "-values",
-            explicitValues.size(), maximumBufferedValues, error,disk ) )
+    if( !SortAnalysisUInt64PairsGenerated( sorted, temporaryRoot, prefix + "-values",
+        maximumBufferedValues, [&](const auto& emit) {
+            for(uint64_t index=0;index<explicitValues.size();++index)
+                emit(AnalysisUInt64Pair{uint64_t(explicitValues[size_t(index)]),index});
+        }, error,disk,{},cancelSort ) )
     {
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
     }
@@ -760,6 +834,10 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     result.max = int64_t( maximum );
     result.p50 = result.median;
 
+    if(result.median==0) {
+        result.mad=0;accessor.Close();cleanup();return result;
+    }
+
     uint64_t medianLow = 0;
     uint64_t medianHigh = 0;
     if( !reader( ( result.count - 1 ) / 2, medianLow ) || !reader( result.count / 2, medianHigh ) )
@@ -768,30 +846,14 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
         result.exact = false; result.unavailableReason = "statistics_median_read_failed"; cleanup(); return result;
     }
     const uint64_t median2 = medianLow + medianHigh;
-    AnalysisDiskGrow(disk,uint64_t(explicitValues.size())*sizeof(AnalysisUInt64Pair));
-    std::ofstream deviations( deviationSource, std::ios::binary | std::ios::trunc );
-    if( !deviations )
-    {
-        accessor.Close();
-        result.exact = false; result.unavailableReason = "statistics_deviation_open_failed"; cleanup(); return result;
-    }
-    for( uint64_t index = 0; index < explicitValues.size(); ++index )
-    {
-        const uint64_t value2 = uint64_t( explicitValues[size_t( index )] ) * 2;
-        const AnalysisUInt64Pair pair {
-            value2 >= median2 ? value2 - median2 : median2 - value2, index
-        };
-        deviations.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
-        if( !deviations )
-        {
-            result.exact = false; result.unavailableReason = "statistics_deviation_write_failed";
-            deviations.close(); accessor.Close(); cleanup(); return result;
-        }
-    }
-    deviations.flush();
-    deviations.close();
-    if( !SortAnalysisUInt64Pairs( deviationSource, deviationSorted, temporaryRoot,
-        prefix + "-deviation", explicitValues.size(), maximumBufferedValues, error,disk ) )
+    if( !SortAnalysisUInt64PairsGenerated( deviationSorted, temporaryRoot,
+        prefix + "-deviation", maximumBufferedValues, [&](const auto& emit) {
+            for(uint64_t index=0;index<explicitValues.size();++index)
+            {
+                const uint64_t value2=uint64_t(explicitValues[size_t(index)])*2;
+                emit(AnalysisUInt64Pair{value2>=median2?value2-median2:median2-value2,index});
+            }
+        }, error,disk,{},cancelSort ) )
     {
         accessor.Close();
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
@@ -821,6 +883,10 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     cleanup();
     return result;
 }
+catch(const StatisticsCancelled&)
+{
+    ExactDistribution result; result.exact=false; result.unavailableReason="cancelled"; return result;
+}
 
 namespace
 {
@@ -837,6 +903,50 @@ struct PackedNeutralRun
 };
 
 static_assert( std::is_trivially_copyable_v<PackedNeutralRun> );
+static_assert( sizeof( PackedNeutralRun ) == 56 );
+
+constexpr uint32_t NeutralRunBlockRecords = ( 256 * 1024 ) / sizeof( PackedNeutralRun );
+constexpr uint32_t NeutralRunBlockBytes = NeutralRunBlockRecords * sizeof( PackedNeutralRun );
+
+struct NeutralRunHeader
+{
+    char magic[8] { 'J', 'N', 'N', 'R', 'U', 'N', '2', '\0' };
+    uint32_t version = 2;
+    uint32_t recordBytes = sizeof( PackedNeutralRun );
+    uint64_t recordCount = 0;
+    uint64_t checksum = 14695981039346656037ull;
+    uint64_t blockCount = 0;
+    uint64_t storedBytes = 0;
+    uint64_t blockRecordCapacity = NeutralRunBlockRecords;
+    uint64_t reserved = 0;
+};
+
+static_assert( std::is_trivially_copyable_v<NeutralRunHeader> );
+static_assert( sizeof( NeutralRunHeader ) == 64 );
+
+struct NeutralRunBlockHeader
+{
+    uint32_t recordCount = 0;
+    uint32_t flags = 0;
+    uint32_t storedBytes = 0;
+    uint32_t rawBytes = 0;
+    uint64_t checksum = 14695981039346656037ull;
+    uint64_t reserved = 0;
+};
+
+static_assert( std::is_trivially_copyable_v<NeutralRunBlockHeader> );
+static_assert( sizeof( NeutralRunBlockHeader ) == 32 );
+
+uint64_t NeutralRunChecksumUpdate( uint64_t checksum, const void* data, size_t size )
+{
+    const auto* bytes = static_cast<const uint8_t*>( data );
+    for( size_t index = 0; index < size; index++ )
+    {
+        checksum ^= bytes[index];
+        checksum *= 1099511628211ull;
+    }
+    return checksum;
+}
 
 void FinalizeRankingsAndAudit( NeutralStatisticsResult& result,
     const std::vector<NeutralDomainAuditInput>& audits,
@@ -943,7 +1053,7 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::shared_ptr<AnalysisWorkspaceBudget> workspace;
     std::shared_ptr<AnalysisDiskBudget> disk;
     AnalysisWorkspaceReservation registryBudget;
-    AnalysisWorkspaceReservation rawBudget, runBudget, denominatorBudget, auditBudget;
+    AnalysisWorkspaceReservation rawBudget, runBudget, denominatorBudget, auditBudget, pinnedBudget;
     AnalysisDictionary dictionary;
     std::filesystem::path root;
     uint64_t maximumBufferedValues = 1;
@@ -957,19 +1067,22 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::vector<PackedNeutralRun> buffer;
     std::unordered_map<BufferedKey, size_t, BufferedKeyHash> bufferIndexes;
     std::vector<std::filesystem::path> runs;
+    std::set<std::filesystem::path> pinnedRuns;
     std::map<SignatureKeyView, uint32_t, SignatureKeyLess> signatureIndexes;
     std::vector<SignatureKeyView> signatures;
     struct Denominator { SignatureKeyView key; uint64_t completeFrameCount; };
     std::vector<Denominator> denominators;
     std::vector<NeutralDomainAuditInput> audits;
     CompleteFrameFilter completeFrameFilter;
+    std::function<void( std::string_view, uint64_t, uint64_t )> progress;
     std::string error;
     bool finished = false;
+    bool restored = false;
 
     Impl( std::filesystem::path temporaryRoot, uint64_t values, size_t rawRuns,
         std::shared_ptr<AnalysisWorkspaceBudget> budget,std::shared_ptr<AnalysisDiskBudget> diskBudget )
         : workspace(std::move(budget)), disk(std::move(diskBudget)), registryBudget(workspace)
-        , rawBudget(workspace), runBudget(workspace), denominatorBudget(workspace), auditBudget(workspace)
+        , rawBudget(workspace), runBudget(workspace), denominatorBudget(workspace), auditBudget(workspace), pinnedBudget(workspace)
         , dictionary(workspace)
         , root( std::move( temporaryRoot ) )
         , maximumBufferedValues( std::max<uint64_t>( values, 1 ) )
@@ -1020,8 +1133,112 @@ struct NeutralStatisticsStreamBuilder::Impl
     }
     std::filesystem::path NextPath( std::string_view label )
     {
-        return root / ( std::string( label ) + "-" + std::to_string( fileOrdinal++ ) + ".work" );
+        // A restored phase can coexist with a cancelled later attempt. Never
+        // overwrite its files (or a checkpoint's still-referenced input).
+        for(;;) {
+            if(fileOrdinal==UINT64_MAX) throw std::runtime_error("neutral_run_path_overflow");
+            auto path=root/(std::string(label)+"-"+std::to_string(fileOrdinal++)+".work");
+            if(!std::filesystem::exists(path)) return path;
+        }
     }
+    void Pin(const std::filesystem::path& path)
+    {
+        if(pinnedRuns.contains(path)) return;
+        pinnedBudget.Add(1024+8ull*path.native().size()); pinnedRuns.emplace(path);
+    }
+    void RetireRun(const std::filesystem::path& path)
+    {
+        if(!pinnedRuns.contains(path)) RemoveQuietly(path,disk);
+    }
+    struct RunWriter
+    {
+        Impl& owner;
+        std::ofstream& output;
+        AnalysisWorkspaceReservation budget;
+        NeutralRunHeader header;
+        std::vector<PackedNeutralRun> block;
+        std::vector<char> compressed;
+        ZSTD_CCtx* context = nullptr;
+
+        RunWriter( Impl& value, std::ofstream& stream )
+            : owner( value ), output( stream ), budget( value.workspace,
+                65536 + NeutralRunBlockBytes + ZSTD_compressBound( NeutralRunBlockBytes ) +
+                ZSTD_estimateCCtxSize( 1 ) )
+        {
+            block.reserve( NeutralRunBlockRecords );
+            compressed.resize( ZSTD_compressBound( NeutralRunBlockBytes ) );
+            context = ZSTD_createCCtx();
+            if( context == nullptr ) owner.error = "neutral_run_compression_context_failed";
+        }
+
+        ~RunWriter()
+        {
+            if( context != nullptr ) ZSTD_freeCCtx( context );
+        }
+
+        bool Begin()
+        {
+            if( context == nullptr ) return false;
+            AnalysisDiskGrow( owner.disk, sizeof( header ) );
+            output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+            if( !output ) { owner.error = "neutral_run_header_write_failed"; return false; }
+            return true;
+        }
+
+        bool FlushBlock()
+        {
+            if( block.empty() ) return true;
+            const auto rawBytes = block.size() * sizeof( PackedNeutralRun );
+            const auto compressedBytes = ZSTD_compressCCtx( context, compressed.data(), compressed.size(),
+                block.data(), rawBytes, 1 );
+            if( ZSTD_isError( compressedBytes ) )
+            { owner.error = "neutral_run_compress_failed"; return false; }
+            const bool useCompressed = compressedBytes < rawBytes;
+            const auto payloadBytes = useCompressed ? compressedBytes : rawBytes;
+            if( payloadBytes > std::numeric_limits<uint32_t>::max() ||
+                rawBytes > std::numeric_limits<uint32_t>::max() ||
+                header.storedBytes > std::numeric_limits<uint64_t>::max() -
+                    sizeof( NeutralRunBlockHeader ) - payloadBytes )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            NeutralRunBlockHeader blockHeader;
+            blockHeader.recordCount = uint32_t( block.size() );
+            blockHeader.flags = useCompressed ? 1u : 0u;
+            blockHeader.storedBytes = uint32_t( payloadBytes );
+            blockHeader.rawBytes = uint32_t( rawBytes );
+            blockHeader.checksum = NeutralRunChecksumUpdate( blockHeader.checksum, block.data(), rawBytes );
+            AnalysisDiskGrow( owner.disk, sizeof( blockHeader ) + payloadBytes );
+            output.write( reinterpret_cast<const char*>( &blockHeader ), sizeof( blockHeader ) );
+            if( useCompressed ) output.write( compressed.data(), std::streamsize( payloadBytes ) );
+            else output.write( reinterpret_cast<const char*>( block.data() ), std::streamsize( payloadBytes ) );
+            if( !output ) { owner.error = "neutral_run_write_failed"; return false; }
+            if( header.blockCount == std::numeric_limits<uint64_t>::max() )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            header.blockCount++;
+            header.storedBytes += sizeof( blockHeader ) + payloadBytes;
+            block.clear();
+            return true;
+        }
+
+        bool Write( const PackedNeutralRun& value )
+        {
+            if( header.recordCount == std::numeric_limits<uint64_t>::max() )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            block.push_back( value );
+            header.recordCount++;
+            header.checksum = NeutralRunChecksumUpdate( header.checksum, &value, sizeof( value ) );
+            return block.size() < NeutralRunBlockRecords || FlushBlock();
+        }
+
+        bool Finish()
+        {
+            if( !FlushBlock() ) return false;
+            output.seekp( 0 );
+            output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+            output.flush();
+            if( !output ) { owner.error = "neutral_run_flush_failed"; return false; }
+            return true;
+        }
+    };
     bool WriteCompacted( std::vector<PackedNeutralRun>& values, const std::filesystem::path& path )
     {
         std::sort( values.begin(), values.end(), [&]( const auto& left, const auto& right ) {
@@ -1029,21 +1246,20 @@ struct NeutralStatisticsStreamBuilder::Impl
         } );
         std::ofstream output( path, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_run_open_failed"; return false; }
+        RunWriter writer( *this, output );
+        if( !writer.Begin() ) return false;
         std::optional<PackedNeutralRun> pending;
         for( const auto& value : values )
         {
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
+                if( pending && !writer.Write( *pending ) ) return false;
                 pending = value;
             }
-            if( !output ) { error = "neutral_run_write_failed"; return false; }
         }
-        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
-        output.flush();
-        if( !output ) { error = "neutral_run_flush_failed"; return false; }
-        return true;
+        if( pending && !writer.Write( *pending ) ) return false;
+        return writer.Finish();
     }
     bool Flush()
     {
@@ -1062,28 +1278,169 @@ struct NeutralStatisticsStreamBuilder::Impl
     struct Reader
     {
         std::ifstream input;
-        PackedNeutralRun value;
+        AnalysisWorkspaceReservation budget;
+        PackedNeutralRun value {};
+        NeutralRunHeader header {};
+        std::vector<PackedNeutralRun> block;
+        std::vector<char> stored;
+        ZSTD_DCtx* context = nullptr;
+        size_t blockIndex = 0;
+        uint64_t remaining = 0;
+        uint64_t blocksRemaining = 0;
+        uint64_t storedRemaining = 0;
+        uint64_t checksum = 14695981039346656037ull;
+        uint64_t signatureLimit = 0;
+        uint32_t previousSignature = 0;
+        uint64_t previousFrame = 0;
+        bool opened = false;
         bool valid = false;
-        explicit Reader( const std::filesystem::path& path ) : input( path, std::ios::binary ) { Advance(); }
+        bool havePrevious = false;
+        std::string error;
+
+        Reader( Reader&& other ) noexcept
+            : input( std::move( other.input ) ), budget( std::move( other.budget ) ),
+            value( other.value ), header( other.header ),
+            block( std::move( other.block ) ), stored( std::move( other.stored ) ),
+            context( std::exchange( other.context, nullptr ) ), blockIndex( other.blockIndex ),
+            remaining( other.remaining ), blocksRemaining( other.blocksRemaining ),
+            storedRemaining( other.storedRemaining ), checksum( other.checksum ),
+            signatureLimit( other.signatureLimit ), previousSignature( other.previousSignature ),
+            previousFrame( other.previousFrame ), opened( other.opened ), valid( other.valid ),
+            havePrevious( other.havePrevious ), error( std::move( other.error ) )
+        {}
+        Reader& operator=( Reader&& ) = delete;
+        Reader( const Reader& ) = delete;
+        Reader& operator=( const Reader& ) = delete;
+
+        explicit Reader( const std::filesystem::path& path, uint64_t signatures,
+            const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+            : input( path, std::ios::binary ), budget( workspace,
+                65536 + ZSTD_estimateDCtxSize() ), signatureLimit( signatures )
+        {
+            opened = input.is_open();
+            if( !opened ) return;
+            input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+            if( input.gcount() != sizeof( header ) ) { error = "neutral_run_header_truncated"; return; }
+            if( std::memcmp( header.magic, "JNNRUN2", 8 ) != 0 || header.version != 2 ||
+                header.recordBytes != sizeof( PackedNeutralRun ) ||
+                header.blockRecordCapacity != NeutralRunBlockRecords || header.reserved != 0 )
+            { error = "neutral_run_header_invalid"; return; }
+            const auto expectedBlocks = header.recordCount == 0 ? 0 :
+                1 + ( header.recordCount - 1 ) / NeutralRunBlockRecords;
+            if( header.blockCount != expectedBlocks ||
+                header.storedBytes > std::numeric_limits<uint64_t>::max() - sizeof( header ) )
+            { error = "neutral_run_header_invalid"; return; }
+            std::error_code sizeError;
+            const auto actualBytes = std::filesystem::file_size( path, sizeError );
+            if( sizeError ) { error = "neutral_run_size_failed"; return; }
+            const auto expectedBytes = sizeof( header ) + header.storedBytes;
+            if( actualBytes < expectedBytes ) { error = "neutral_run_truncated"; return; }
+            if( actualBytes > expectedBytes ) { error = "neutral_run_extra_data"; return; }
+            context = ZSTD_createDCtx();
+            if( context == nullptr ) { error = "neutral_run_decompression_context_failed"; return; }
+            remaining = header.recordCount;
+            blocksRemaining = header.blockCount;
+            storedRemaining = header.storedBytes;
+            Advance();
+        }
+
+        ~Reader()
+        {
+            if( context != nullptr ) ZSTD_freeDCtx( context );
+        }
+
+        bool LoadBlock()
+        {
+            block.clear();
+            blockIndex = 0;
+            if( blocksRemaining == 0 || storedRemaining < sizeof( NeutralRunBlockHeader ) )
+            { error = "neutral_run_truncated"; return false; }
+            NeutralRunBlockHeader blockHeader;
+            input.read( reinterpret_cast<char*>( &blockHeader ), sizeof( blockHeader ) );
+            if( input.gcount() != sizeof( blockHeader ) )
+            { error = "neutral_run_truncated"; return false; }
+            storedRemaining -= sizeof( blockHeader );
+            if( blockHeader.recordCount == 0 || blockHeader.recordCount > NeutralRunBlockRecords ||
+                blockHeader.rawBytes != blockHeader.recordCount * sizeof( PackedNeutralRun ) ||
+                blockHeader.storedBytes == 0 || blockHeader.storedBytes > storedRemaining ||
+                ( blockHeader.flags & ~1u ) != 0 || blockHeader.reserved != 0 ||
+                ( blockHeader.flags == 0 && blockHeader.storedBytes != blockHeader.rawBytes ) ||
+                ( blockHeader.flags == 1 && blockHeader.storedBytes >= blockHeader.rawBytes ) ||
+                blockHeader.recordCount > remaining )
+            { error = "neutral_run_block_header_invalid"; return false; }
+            budget.Resize( 65536 + ZSTD_estimateDCtxSize() +
+                blockHeader.rawBytes + blockHeader.storedBytes );
+            stored.resize( blockHeader.storedBytes );
+            input.read( stored.data(), std::streamsize( stored.size() ) );
+            if( input.gcount() != std::streamsize( stored.size() ) )
+            { error = "neutral_run_truncated"; return false; }
+            storedRemaining -= stored.size();
+            block.resize( blockHeader.recordCount );
+            if( blockHeader.flags == 0 ) std::memcpy( block.data(), stored.data(), stored.size() );
+            else
+            {
+                const auto decoded = ZSTD_decompressDCtx( context, block.data(), blockHeader.rawBytes,
+                    stored.data(), stored.size() );
+                if( ZSTD_isError( decoded ) || decoded != blockHeader.rawBytes )
+                { error = "neutral_run_checksum_mismatch"; return false; }
+            }
+            auto blockChecksum = uint64_t( 14695981039346656037ull );
+            blockChecksum = NeutralRunChecksumUpdate( blockChecksum, block.data(), blockHeader.rawBytes );
+            if( blockChecksum != blockHeader.checksum )
+            { error = "neutral_run_checksum_mismatch"; return false; }
+            --blocksRemaining;
+            return true;
+        }
+
         void Advance()
         {
-            input.read( reinterpret_cast<char*>( &value ), sizeof( value ) );
-            valid = input.gcount() == sizeof( value );
-            if( !valid && !input.eof() ) input.setstate( std::ios::failbit );
+            valid = false;
+            if( !error.empty() ) return;
+            if( remaining == 0 )
+            {
+                if( blocksRemaining != 0 || storedRemaining != 0 ) error = "neutral_run_block_count_mismatch";
+                else if( checksum != header.checksum ) error = "neutral_run_checksum_mismatch";
+                return;
+            }
+            if( blockIndex == block.size() && !LoadBlock() ) return;
+            value = block[blockIndex++];
+            remaining--;
+            checksum = NeutralRunChecksumUpdate( checksum, &value, sizeof( value ) );
+            if( value.signature >= signatureLimit || ( value.flags & ~3u ) != 0 )
+            { error = "neutral_run_record_invalid"; return; }
+            if( havePrevious && ( value.signature < previousSignature ||
+                ( value.signature == previousSignature && value.frame < previousFrame ) ) )
+            { error = "neutral_run_order_invalid"; return; }
+            previousSignature = value.signature;
+            previousFrame = value.frame;
+            havePrevious = true;
+            valid = true;
         }
     };
 
     bool MergeGroup( const std::vector<std::filesystem::path>& source,
-        const std::filesystem::path& outputPath, const std::function<bool()>& cancelled )
+        const std::filesystem::path& outputPath, std::string_view stage,
+        const std::function<bool()>& cancelled )
     {
+        const auto started=std::chrono::steady_clock::now();
         AnalysisWorkspaceReservation mergeBudget(workspace,65536+source.size()*16384ull);
         std::vector<Reader> readers;
         readers.reserve( source.size() );
         for( const auto& path : source )
         {
-            readers.emplace_back( path );
-            if( !readers.back().input ) { error = "neutral_run_read_open_failed"; return false; }
+            readers.emplace_back( path, signatures.size(), workspace );
+            if( !readers.back().opened ) { error = "neutral_run_read_open_failed"; return false; }
+            if( !readers.back().error.empty() ) { error = readers.back().error; return false; }
         }
+        uint64_t expected = 0;
+        for( const auto& reader : readers )
+        {
+            if( reader.header.recordCount > UINT64_MAX - expected )
+            { error = "neutral_run_size_overflow"; return false; }
+            expected += reader.header.recordCount;
+        }
+        auto reportedAt = std::chrono::steady_clock::now();
+        if( progress ) progress( stage, 0, expected );
         const auto later = [&]( size_t left, size_t right ) {
             return Less( readers[right].value, readers[left].value );
         };
@@ -1091,49 +1448,73 @@ struct NeutralStatisticsStreamBuilder::Impl
         for( size_t index = 0; index < readers.size(); ++index ) if( readers[index].valid ) queue.push( index );
         std::ofstream output( outputPath, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_merge_open_failed"; return false; }
+        RunWriter writer( *this, output );
+        if( !writer.Begin() ) return false;
         std::optional<PackedNeutralRun> pending;
         uint64_t processed = 0;
         while( !queue.empty() )
         {
-            if( ( ++processed & 0x3fff ) == 0 && cancelled && cancelled() )
-            { error = "cancelled"; return false; }
+            ++processed;
+            if( ( processed & 0x3fff ) == 0 )
+            {
+                if( cancelled && cancelled() ) { error = "cancelled"; return false; }
+                const auto now = std::chrono::steady_clock::now();
+                if( progress && now - reportedAt >= std::chrono::seconds( 5 ) )
+                { reportedAt = now; progress( stage, processed, expected ); }
+            }
             const auto index = queue.top(); queue.pop();
             const auto value = readers[index].value;
             readers[index].Advance();
-            if( !readers[index].valid && !readers[index].input.eof() )
-            { error = "neutral_merge_read_failed"; return false; }
+            if( !readers[index].error.empty() ) { error = readers[index].error; return false; }
             if( readers[index].valid ) queue.push( index );
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
+                if( pending && !writer.Write( *pending ) ) return false;
                 pending = value;
             }
-            if( !output ) { error = "neutral_merge_write_failed"; return false; }
         }
-        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
-        output.flush();
-        if( !output ) { error = "neutral_merge_flush_failed"; return false; }
+        if( pending && !writer.Write( *pending ) ) return false;
+        if( !writer.Finish() ) return false;
+        if( progress ) progress( stage, processed, expected );
+        std::cerr << "Query statistics-phase stage=merge duration_ms=" <<
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count()
+            << " group=" << stage << " records=" << processed << '\n';
         return true;
     }
 
     bool Consolidate( const std::function<bool()>& cancelled )
     {
-        constexpr size_t FanIn = 32;
+        size_t pass = 0;
         while( runs.size() > 1 )
         {
-            std::vector<std::filesystem::path> next;
-            for( size_t first = 0; first < runs.size(); first += FanIn )
+            // v2 readers have at most a 256 KiB decoded block, a stored block,
+            // decoder state and stream/queue overhead. Keep a conservative
+            // MiB per reader and two MiB for the writer; share the remaining
+            // budget with the live scan instead of assigning another quota.
+            size_t fanIn=128;
+            if(workspace)
             {
-                const auto last = std::min( first + FanIn, runs.size() );
+                const auto budget=workspace->Snapshot();
+                const auto remaining=budget.maximumBytes-budget.currentBytes;
+                const auto readers=remaining>2ull*1024*1024 ? (remaining-2ull*1024*1024)/(1024*1024) : 0;
+                fanIn=size_t(std::clamp<uint64_t>(readers,2,128));
+            }
+            std::vector<std::filesystem::path> next;
+            for( size_t first = 0; first < runs.size(); first += fanIn )
+            {
+                const auto last = std::min( first + fanIn, runs.size() );
                 std::vector<std::filesystem::path> group( runs.begin() + first, runs.begin() + last );
                 const auto output = NextPath( "neutral-merge" );
-                if( !MergeGroup( group, output, cancelled ) ) return false;
+                const auto stage = "neutral_statistics_merge_pass_" + std::to_string( pass ) +
+                    "_group_" + std::to_string( first / fanIn );
+                if( !MergeGroup( group, output, stage, cancelled ) ) return false;
                 next.push_back( output );
-                for( const auto& path : group ) RemoveQuietly( path,disk );
+                for( const auto& path : group ) RetireRun(path);
             }
             runs = std::move( next );
             runBudget.Resize(runs.size()*(1024+8ull*root.native().size()));
+            ++pass;
         }
         return true;
     }
@@ -1233,6 +1614,169 @@ void NeutralStatisticsStreamBuilder::AddDomainAudit( const NeutralDomainAuditInp
     }
 }
 
+namespace
+{
+bool CheckpointRunName(std::string_view name)
+{
+    size_t prefix=0;
+    if(name.starts_with("neutral-run-"))prefix=12;
+    else if(name.starts_with("neutral-merge-"))prefix=14;
+    else return false;
+    if(!name.ends_with(".work") || name.size()<=prefix+5)return false;
+    const auto digits=name.substr(prefix,name.size()-prefix-5);
+    return std::all_of(digits.begin(),digits.end(),[](char c){return c>='0' && c<='9';});
+}
+void CheckSnapshotPath(const std::filesystem::path& path)
+{
+    // Check every existing ancestor, including Windows junctions, before any
+    // file is opened. The generation owner supplies the trusted root.
+    for(auto part=std::filesystem::absolute(path).lexically_normal();!part.empty();) {
+        std::error_code ec; const auto status=std::filesystem::symlink_status(part,ec);
+        if(!ec && std::filesystem::is_symlink(status)) throw std::runtime_error("neutral_checkpoint_link");
+#ifdef _WIN32
+        const auto attributes=GetFileAttributesW(part.c_str());
+        if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("neutral_checkpoint_reparse_point");
+#endif
+        const auto parent=part.parent_path(); if(parent==part)break; part=parent;
+    }
+}
+}
+
+void NeutralStatisticsStreamBuilder::SaveCheckpoint(const std::filesystem::path& path,
+    const std::string& identity,const std::function<bool()>& cancelled)
+{
+    if(!m_impl || m_impl->finished || !m_impl->error.empty() || m_impl->completeFrameFilter)
+        throw std::runtime_error("neutral_checkpoint_builder_state");
+    if(path.parent_path().lexically_normal()!=m_impl->root.lexically_normal())
+        throw std::runtime_error("neutral_checkpoint_location");
+    CheckSnapshotPath(path);
+    const auto check=[&]{if(cancelled && cancelled())throw std::runtime_error("cancelled");};
+    check(); if(!m_impl->Flush())throw std::runtime_error(m_impl->error);
+    AnalysisCacheTableOptions options; options.workspace=m_impl->workspace;
+    options.disk=m_impl->disk; options.cancelled=cancelled;
+    AnalysisCacheTableWriter writer(path,identity,"neutral-statistics-checkpoint-v1",options);
+    uint64_t ordinal=0;
+    const auto append=[&](const nlohmann::json& row) {check();writer.Append(cache_key::Unsigned(ordinal++),row.dump());};
+    append({{"kind","header"},{"version",1},{"values",m_impl->maximumBufferedValues},
+        {"buffered_runs",m_impl->maximumBufferedRuns},{"input_runs",m_impl->inputRunCount},
+        {"maximum_observed",m_impl->maximumBufferedRunsObserved},{"merge_failures",m_impl->mergeFailures},
+        {"file_ordinal",m_impl->fileOrdinal},{"signatures",m_impl->signatures.size()},
+        {"denominators",m_impl->denominators.size()},{"audits",m_impl->audits.size()},{"runs",m_impl->runs.size()}});
+    for(const auto& key:m_impl->signatures) {
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(key.domain.size()+key.signature.size()+key.frameScope.size()));
+        append({{"kind","signature"},{"domain",key.domain},{"signature",key.signature},{"scope",key.frameScope}});
+    }
+    for(const auto& value:m_impl->denominators) {
+        const auto& key=value.key;
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(key.domain.size()+key.signature.size()+key.frameScope.size()));
+        append({{"kind","denominator"},{"domain",key.domain},{"signature",key.signature},{"scope",key.frameScope},{"count",value.completeFrameCount}});
+    }
+    for(const auto& a:m_impl->audits) {
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(a.domain.size()+a.status.size()+a.inputChecksum.size()+a.consumedChecksum.size()+a.unavailableReason.size()));
+        append({{"kind","audit"},{"domain",a.domain},{"present",a.present},{"status",a.status},
+            {"input",a.inputCount},{"consumed",a.consumedInputCount},{"output",a.outputCount},
+            {"input_hash",a.inputChecksum},{"consumed_hash",a.consumedChecksum},{"quality",a.qualityComplete},{"reason",a.unavailableReason}});
+    }
+    for(const auto& run:m_impl->runs) {
+        check();CheckSnapshotPath(run);m_impl->Pin(run);
+        append({{"kind","run"},{"name",run.filename().string()},
+            {"bytes",std::filesystem::file_size(run)},{"sha256",Sha256File(run)}});
+    }
+    check();writer.Commit();
+}
+
+void NeutralStatisticsStreamBuilder::RestoreCheckpoint(const std::filesystem::path& path,
+    const std::string& identity,const std::function<bool()>& cancelled)
+{
+    if(!m_impl || m_impl->finished || !m_impl->signatures.empty() || !m_impl->runs.empty() ||
+        !m_impl->denominators.empty() || !m_impl->audits.empty() || !m_impl->error.empty())
+        throw std::runtime_error("neutral_checkpoint_builder_state");
+    try {
+        if(path.parent_path().lexically_normal()!=m_impl->root.lexically_normal())throw std::runtime_error("neutral_checkpoint_location");
+        CheckSnapshotPath(path);
+        const auto check=[&]{if(cancelled && cancelled())throw std::runtime_error("cancelled");};
+        AnalysisCacheTableOptions options;options.workspace=m_impl->workspace;options.disk=m_impl->disk;options.cancelled=cancelled;
+        AnalysisCacheTableReader reader(path,identity,"neutral-statistics-checkpoint-v1",options);
+        uint64_t ordinal=0;
+        AnalysisWorkspaceReservation parseBudget(m_impl->workspace);
+        const auto read=[&](std::string_view kind) {
+            check();if(ordinal>=reader.RecordCount())throw std::runtime_error("neutral_checkpoint_truncated");
+            auto row=reader.GetAt(ordinal);
+            if(row.key!=cache_key::Unsigned(ordinal++))throw std::runtime_error("neutral_checkpoint_order");
+            parseBudget.Resize(65536+32ull*row.payload.size());
+            auto data=nlohmann::json::parse(row.payload);
+            if(data.at("kind").get<std::string>()!=kind)throw std::runtime_error("neutral_checkpoint_kind");
+            return data;
+        };
+        const auto header=read("header");
+        if(header.at("version")!=1 || header.at("values")!=m_impl->maximumBufferedValues ||
+            header.at("buffered_runs")!=m_impl->maximumBufferedRuns)throw std::runtime_error("neutral_checkpoint_configuration");
+        uint64_t expected=1;
+        for(const auto* field:{"signatures","denominators","audits","runs"}) {
+            if(!header.at(field).is_number_unsigned())throw std::runtime_error("neutral_checkpoint_count");
+            const auto count=header.at(field).get<uint64_t>();
+            if(count>reader.RecordCount()-std::min(expected,reader.RecordCount()))throw std::runtime_error("neutral_checkpoint_count");
+            expected+=count;
+        }
+        if(expected!=reader.RecordCount())throw std::runtime_error("neutral_checkpoint_count");
+        for(uint64_t i=0;i<header.at("signatures").get<uint64_t>();++i) {
+            const auto row=read("signature");
+            const auto token=RegisterSignature(row.at("domain").get<std::string>(),row.at("signature").get<std::string>(),row.at("scope").get<std::string>());
+            if(token!=i || token==InvalidSignatureToken)throw std::runtime_error("neutral_checkpoint_signature_order");
+        }
+        for(uint64_t i=0;i<header.at("denominators").get<uint64_t>();++i) {
+            const auto row=read("denominator");
+            AddDenominator({row.at("domain").get<std::string>(),row.at("signature").get<std::string>(),row.at("scope").get<std::string>(),row.at("count").get<uint64_t>()});
+        }
+        for(uint64_t i=0;i<header.at("audits").get<uint64_t>();++i) {
+            const auto a=read("audit");
+            AddDomainAudit({a.at("domain").get<std::string>(),a.at("present").get<bool>(),a.at("status").get<std::string>(),
+                a.at("input").get<uint64_t>(),a.at("consumed").get<uint64_t>(),a.at("output").get<uint64_t>(),
+                a.at("input_hash").get<std::string>(),a.at("consumed_hash").get<std::string>(),a.at("quality").get<bool>(),a.at("reason").get<std::string>()});
+        }
+        for(uint64_t i=0;i<header.at("runs").get<uint64_t>();++i) {
+            const auto row=read("run");const auto name=row.at("name").get<std::string>();
+            const std::filesystem::path filename(name);
+            if(filename.has_parent_path() || filename.filename()!=filename || !CheckpointRunName(name))throw std::runtime_error("neutral_checkpoint_run_path");
+            const auto run=m_impl->root/filename;CheckSnapshotPath(run);
+            if(!std::filesystem::is_regular_file(run) || std::filesystem::file_size(run)!=row.at("bytes").get<uint64_t>() ||
+                Sha256File(run)!=row.at("sha256").get<std::string>())throw std::runtime_error("neutral_checkpoint_run_identity");
+            Impl::Reader verify(run,m_impl->signatures.size(),m_impl->workspace);uint64_t checked=0;
+            while(verify.valid) {if((checked++&16383)==0)check();verify.Advance();}
+            if(!verify.opened || !verify.error.empty())throw std::runtime_error("neutral_checkpoint_run_invalid:"+verify.error);
+            if(m_impl->pinnedRuns.contains(run))throw std::runtime_error("neutral_checkpoint_duplicate_run");
+            m_impl->runBudget.Add(1024+8ull*run.native().size());m_impl->Pin(run);m_impl->runs.push_back(run);
+        }
+        m_impl->inputRunCount=header.at("input_runs").get<uint64_t>();
+        m_impl->maximumBufferedRunsObserved=header.at("maximum_observed").get<size_t>();
+        m_impl->mergeFailures=header.at("merge_failures").get<uint64_t>();
+        m_impl->fileOrdinal=header.at("file_ordinal").get<uint64_t>();
+        check();
+        m_impl->restored=true;
+    } catch(...) {m_impl->error="neutral_checkpoint_restore_failed";throw;}
+}
+
+uint64_t NeutralStatisticsStreamBuilder::CleanupUnreferencedRuns(const std::function<bool()>& cancelled)
+{
+    if(!m_impl || !m_impl->restored || m_impl->finished || !m_impl->error.empty())
+        throw std::runtime_error("neutral_checkpoint_cleanup_state");
+    uint64_t removed=0;
+    for(const auto& entry:std::filesystem::directory_iterator(m_impl->root)) {
+        if(cancelled && cancelled())throw std::runtime_error("cancelled");
+        const auto path=entry.path();
+        if(!CheckpointRunName(path.filename().string()) || m_impl->pinnedRuns.contains(path))continue;
+        CheckSnapshotPath(path);
+        if(!std::filesystem::is_regular_file(path))throw std::runtime_error("neutral_checkpoint_cleanup_type");
+        const auto before=std::filesystem::file_size(path);
+        std::cerr<<"Query phase-retire-run file="<<path.filename().string()<<" bytes="<<before<<'\n';
+        std::error_code ec;AnalysisDiskRemove(path,m_impl->disk,ec);
+        if(ec || std::filesystem::exists(path))throw std::runtime_error("neutral_checkpoint_cleanup_failed");
+        removed+=before;
+    }
+    return removed;
+}
+
 size_t NeutralStatisticsStreamBuilder::MaximumBufferedRunsObserved() const
 {
     return m_impl ? std::max( m_impl->maximumBufferedRunsObserved, m_impl->buffer.size() ) : 0;
@@ -1247,6 +1791,13 @@ void NeutralStatisticsStreamBuilder::SetCompleteFrameFilter(CompleteFrameFilter 
 {
     if(!m_impl || m_impl->finished) throw std::runtime_error("neutral_frame_filter_after_finish");
     m_impl->completeFrameFilter=std::move(filter);
+}
+
+void NeutralStatisticsStreamBuilder::SetProgress(
+    std::function<void( std::string_view, uint64_t, uint64_t )> progress )
+{
+    if( !m_impl || m_impl->finished ) throw std::runtime_error( "neutral_progress_after_finish" );
+    m_impl->progress = std::move( progress );
 }
 
 bool NeutralStatisticsStreamBuilder::FinishToSink( NeutralStatisticsStreamSummary& summary,
@@ -1274,6 +1825,7 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
 
 bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result, std::string& error,
     const NeutralSignatureFramesSink& signatureSink, const std::function<bool()>& cancelled, bool retainResults )
+try
 {
     result = {};
     result.qualityComplete = true;
@@ -1282,8 +1834,13 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
     if( !m_impl || m_impl->finished ) { error = "neutral_stream_builder_already_finished"; return false; }
     m_impl->finished = true;
     if( !m_impl->error.empty() ) { error = m_impl->error; return false; }
+    const auto consolidateStarted=std::chrono::steady_clock::now();
     if( !m_impl->Flush() || !m_impl->Consolidate( cancelled ) )
     { error = m_impl->error; return false; }
+    std::cerr << "Query statistics-phase stage=consolidate duration_ms=" <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-consolidateStarted).count()
+        << '\n';
+    const auto reduceStarted=std::chrono::steady_clock::now();
 
     std::map<SignatureKeyView, uint64_t, SignatureKeyLess> denominators;
     for( const auto& value : m_impl->denominators )
@@ -1306,6 +1863,9 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     std::map<std::string,uint64_t> streamedOutputs;
     size_t ordinal = 0;
+    auto reduceReportedAt = std::chrono::steady_clock::now();
+    if( m_impl->progress )
+        m_impl->progress( "neutral_statistics_reduce", 0, m_impl->signatures.size() );
     auto finishSignature = [&]( uint32_t signatureIndex,
         std::vector<NeutralMergedFrameValues>& frames ) {
         if( frames.empty() ) return;
@@ -1339,8 +1899,10 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             return !m_impl->completeFrameFilter || m_impl->completeFrameFilter(signature.domain,signature.frameScope,index);
         };
         uint64_t unknownCompleteFrames=0;
+        uint64_t checkedFrames=0;
         for( const auto& frame : frames )
         {
+            if((checkedFrames++&127)==0) CheckStatisticsCancelled(cancelled);
             aggregate.logical = aggregate.logical || frame.logical;
             const auto complete=completeFrame(frame.frameIndex);
             if(!complete) ++aggregate.outsideCompleteFrameCount;
@@ -1359,15 +1921,24 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         const auto buildMetric=[&](const std::vector<MetricPoint>& points,const char* suffix) {
             const auto prefix=itemPrefix+suffix;
             if(aggregate.outsideCompleteFrameCount==0)
-                return BuildMetric(points,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+                return BuildMetric(points,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk,cancelled);
             AnalysisWorkspaceReservation subsetBudget(m_impl->workspace,65536+64ull*points.size());
             std::vector<MetricPoint> eligible; eligible.reserve(points.size());
-            for(const auto& point:points) if(completeFrame(point.frame)) eligible.push_back(point);
-            auto metric=BuildMetric(eligible,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+            uint64_t checked=0;
+            for(const auto& point:points) {
+                if((checked++&127)==0) CheckStatisticsCancelled(cancelled);
+                if(completeFrame(point.frame)) eligible.push_back(point);
+            }
+            auto metric=BuildMetric(eligible,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk,cancelled);
             std::vector<int64_t> present; present.reserve(points.size());
-            for(const auto& point:points) present.push_back(point.value);
+            for(const auto& point:points) {
+                if((present.size()&4095)==0) CheckStatisticsCancelled(cancelled);
+                present.push_back(point.value);
+            }
             metric.whenPresent=ComputeExactDistributionExternal(present,0,m_impl->root,
-                prefix+"-all-present",m_impl->maximumBufferedValues,m_impl->disk);
+                prefix+"-all-present",m_impl->maximumBufferedValues,m_impl->disk,cancelled);
+            if(metric.whenPresent.unavailableReason=="cancelled") throw StatisticsCancelled{};
+            CheckStatisticsCancelled(cancelled);
             return metric;
         };
         aggregate.inclusive=buildMetric(inclusive,"-inclusive");
@@ -1404,6 +1975,13 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         if( signatureSink ) signatureSink( aggregate, frames );
         ++streamedOutputs[aggregate.domain];
         ++m_impl->outputSignatureCount;
+        const auto progressNow = std::chrono::steady_clock::now();
+        if( m_impl->progress && progressNow - reduceReportedAt >= std::chrono::seconds( 5 ) )
+        {
+            reduceReportedAt = progressNow;
+            m_impl->progress( "neutral_statistics_reduce", m_impl->outputSignatureCount,
+                m_impl->signatures.size() );
+        }
         if(retainResults)
         {
             result.signatures.push_back( std::move( aggregate ) );
@@ -1413,8 +1991,9 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     if( !m_impl->runs.empty() )
     {
-        Impl::Reader reader( m_impl->runs.front() );
-        if( !reader.input ) { error = "neutral_final_run_open_failed"; return false; }
+        Impl::Reader reader( m_impl->runs.front(), m_impl->signatures.size(), m_impl->workspace );
+        if( !reader.opened ) { error = "neutral_final_run_open_failed"; return false; }
+        if( !reader.error.empty() ) { error = reader.error; return false; }
         uint32_t currentSignature = 0;
         bool haveSignature = false;
         AnalysisWorkspaceReservation frameBudget(m_impl->workspace);
@@ -1426,7 +2005,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             { error = "cancelled"; return false; }
             const auto value = reader.value;
             reader.Advance();
-            if( !reader.valid && !reader.input.eof() ) { error = "neutral_final_run_read_failed"; return false; }
+            if( !reader.error.empty() ) { error = reader.error; return false; }
             if( haveSignature && value.signature != currentSignature )
             {
                 if(cancelled && cancelled()) { error = "cancelled"; return false; }
@@ -1450,9 +2029,14 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         if( haveSignature ) finishSignature( currentSignature, frames );
         if(cancelled && cancelled()) { error = "cancelled"; return false; }
         reader.input.close();
-        RemoveQuietly( m_impl->runs.front(),m_impl->disk );
+        m_impl->RetireRun(m_impl->runs.front());
         m_impl->runs.clear();
     }
+    if( m_impl->progress ) m_impl->progress( "neutral_statistics_reduce",
+        m_impl->outputSignatureCount, m_impl->signatures.size() );
+    std::cerr << "Query statistics-phase stage=reduce duration_ms=" <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-reduceStarted).count()
+        << " signatures=" << m_impl->outputSignatureCount << '\n';
 
     // Numeric external sorting follows first-observation registry order.
     // Restore the public, input-order-independent lexical order before
@@ -1466,6 +2050,10 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
     // per-domain count audit is returned here; it is a distinct public type.
     FinalizeRankingsAndAudit( result, m_impl->audits, retainResults ? nullptr : &streamedOutputs );
     return true;
+}
+catch(const StatisticsCancelled&)
+{
+    error="cancelled"; result.qualityComplete=false; return false;
 }
 
 NeutralStatisticsResult BuildNeutralStatistics( const NeutralStatisticsInput& input )

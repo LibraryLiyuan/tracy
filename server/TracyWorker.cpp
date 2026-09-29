@@ -40,6 +40,7 @@
 #include "TracySort.hpp"
 #include "TracyTaskDispatch.hpp"
 #include "TracyWorker.hpp"
+#include "TracyJnRecordReader.hpp"
 #include "tracy_pdqsort.h"
 
 namespace tracy
@@ -56,9 +57,8 @@ static bool SourceFileValid( const char* fn, uint64_t olderThan )
 }
 
 
-static const uint8_t FileHeader[8] { 't', 'r', 'a', 'c', 'y', Version::Major, Version::Minor, Version::Patch };
-enum { FileHeaderMagic = 5 };
-static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
+static const auto FileHeader = EncodeTraceHeader();
+static const int CurrentVersion = ExtendedTraceBaseLayout;
 static const int MinSupportedVersion = FileVersion( 0, 9, 0 );
 
 template<typename T>
@@ -80,33 +80,7 @@ template<typename T>
 static void ReadJnVector( FileRead& f, std::vector<T>& target, const char* domain,
     SerializedZoneSink* sink, SerializedZoneSink::JnDomain sinkDomain )
 {
-    uint64_t size;
-    f.Read( size );
-    if( size > JnTraceMaxRecordsPerDomain )
-    {
-        char message[128];
-        snprintf( message, sizeof( message ), "JN trace %s record count is invalid.", domain );
-        throw LoadFailure( message );
-    }
-    if( !sink || !sink->WantsJnRecords( sinkDomain, sizeof( T ) ) )
-    {
-        target.resize( size );
-        if( size != 0 ) f.Read( target.data(), size * sizeof( T ) );
-        return;
-    }
-
-    sink->JnRecordsBegin( sinkDomain, size, sizeof( T ) );
-    constexpr uint64_t RecordsPerBlock = 64 * 1024;
-    std::vector<T> block( size_t( std::min<uint64_t>( size, RecordsPerBlock ) ) );
-    uint64_t offset = 0;
-    while( offset < size )
-    {
-        const auto count = std::min<uint64_t>( RecordsPerBlock, size - offset );
-        f.Read( block.data(), count * sizeof( T ) );
-        sink->JnRecordsBlock( sinkDomain, offset, block.data(), count, sizeof( T ) );
-        offset += count;
-    }
-    sink->JnRecordsEnd( sinkDomain );
+    ReadJnRecordsToSink(f,target,domain,sink,sinkDomain);
 }
 
 template<typename T>
@@ -117,6 +91,15 @@ static void WriteJnVector( FileWrite& f, const std::vector<T>& source )
     if( size != 0 ) f.Write( source.data(), size * sizeof( T ) );
 }
 
+template<class T> static void WriteOfflineJnVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineAppendDomain domain)
+{
+    if(!storage){WriteJnVector(file,memory);return;}
+    if(OfflineAppendInfo(domain).width!=sizeof(T))throw std::runtime_error("offline_write_width");
+    const uint64_t count=storage->RecordCount(domain);file.Write(&count,sizeof(count));uint64_t seen=0;
+    storage->VisitRecords(domain,[&](const void* rows,uint64_t n){if(n>count-seen)throw std::runtime_error("offline_write_count");file.Write(rows,size_t(n)*sizeof(T));seen+=n;});
+    if(seen!=count)throw std::runtime_error("offline_write_count");
+}
+
 template<typename T>
 static uint64_t AppendJnCatalogRecords( std::vector<T>& target, const uint8_t* data, uint32_t count )
 {
@@ -125,29 +108,44 @@ static uint64_t AppendJnCatalogRecords( std::vector<T>& target, const uint8_t* d
     if( count != 0 ) memcpy( target.data() + first, data, size_t( count ) * sizeof( T ) );
     return first;
 }
+template<class T> uint64_t Worker::AppendCatalogPayload(OfflineCatalogDomain domain,const uint8_t* bytes,uint32_t count,std::vector<T>& memory)
+{
+    if(!m_offlineStorage){const auto first=AppendJnCatalogRecords(memory,bytes,count);if constexpr(requires(T row){row.time;})for(size_t i=size_t(first);i<memory.size();++i)memory[i].time=TscTime(memory[i].time);return first;}
+    const auto first=m_offlineStorage->CatalogCount(domain);for(uint32_t i=0;i<count;++i){T row;std::memcpy(&row,bytes+size_t(i)*sizeof(T),sizeof(T));if constexpr(requires(T value){value.time;})row.time=TscTime(row.time);m_offlineStorage->AppendCatalog(domain,&row,sizeof(row));}return first;
+}
+JnGpuCatalogStringData Worker::CatalogStringValue(uint64_t id)const
+{
+    if(!m_offlineStorage)return m_data.jnTrace.gpuCatalogStrings.at(size_t(id));
+    OfflineCatalogString row;m_offlineStorage->ReadCatalog(OfflineCatalogDomain::CatalogString,id,&row,sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("catalog_string_length");
+    return {row.generation,row.header,std::string(reinterpret_cast<const char*>(row.bytes.data()),row.header.byteLength)};
+}
 
-static void ReadJnGpuCatalogStrings( FileRead& f, std::vector<JnGpuCatalogStringData>& target )
+static void ReadJnGpuCatalogStrings( FileRead& f, std::vector<JnGpuCatalogStringData>& target,SerializedZoneSink* sink=nullptr )
 {
     uint64_t size;
     f.Read( size );
-    if( size > JnTraceMaxRecordsPerDomain ) throw LoadFailure( "JN trace GPU Catalog string count is invalid." );
+    const bool external=sink&&sink->WantsCatalogStrings();
+    if( size > JnTraceMaxRecordsPerDomain && (!external||!sink->AllowsLargeCatalogStrings(size)) ) throw LoadFailure( "JN trace GPU Catalog string count is invalid." );
     target.clear();
-    target.reserve( size_t( size ) );
+    if(!external)target.reserve( size_t( size ) );else sink->CatalogStringsBegin(size);
     for( uint64_t i = 0; i < size; ++i )
     {
+        if(external)sink->CheckRead();
         uint64_t generation;
         JnGpuCatalogStringRecordHeaderV1 header;
         f.Read( generation );
         f.Read( header );
         if( generation == 0 || header.stringId == 0 || header.byteLength > 256 )
             throw LoadFailure( "JN trace GPU Catalog string metadata is invalid." );
-        std::string value( header.byteLength, '\0' );
+        std::array<char,256> value{};
         if( header.byteLength != 0 ) f.Read( value.data(), header.byteLength );
         if( header.byteLength != 0 && header.originalLength == header.byteLength &&
-            JnGpuCatalogChecksum64( value.data(), value.size() ) != header.hash )
+            JnGpuCatalogChecksum64( value.data(), header.byteLength ) != header.hash )
             throw LoadFailure( "JN trace GPU Catalog string checksum is invalid." );
-        target.push_back( JnGpuCatalogStringData { generation, header, std::move( value ) } );
+        if(external)sink->CatalogStringRecord(i,generation,header,value.data());
+        else target.push_back( JnGpuCatalogStringData { generation, header, std::string(value.data(),header.byteLength) } );
     }
+    if(external)sink->CatalogStringsEnd();
 }
 
 static void WriteJnGpuCatalogStrings( FileWrite& f, const std::vector<JnGpuCatalogStringData>& source )
@@ -192,16 +190,14 @@ static bool ValidateJnGpuCatalogStoredData( const JnTraceData& data )
         {
             if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
                 batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) ) return false;
-            std::vector<uint8_t> bytes;
+            auto hash=JnGpuCatalogChecksum64(nullptr,0);
             for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
             {
                 const auto& value = data.gpuCatalogStrings[i];
-                const auto offset = bytes.size();
-                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
-                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
-                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+                hash=JnGpuCatalogChecksum64Update(hash,&value.header,sizeof(value.header));
+                hash=JnGpuCatalogChecksum64Update(hash,value.value.data(),value.value.size());
             }
-            checksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            checksum = hash;
             break;
         }
         default: return false;
@@ -370,7 +366,7 @@ static inline void UpdateLockCount( LockMap& lockmap, size_t pos )
     }
 }
 
-static tracy_force_inline void WriteTimeOffset( FileWrite& f, int64_t& refTime, int64_t time )
+template<class Writer>static tracy_force_inline void WriteTimeOffset( Writer& f, int64_t& refTime, int64_t time )
 {
     int64_t timeOffset = time - refTime;
     refTime += timeOffset;
@@ -420,8 +416,10 @@ LoadProgress Worker::s_loadProgress;
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
     uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions,
-    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport, bool collectOfflineEventStats )
+    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport, bool collectOfflineEventStats,
+    WorkerOfflineStorage* offlineStorage )
     : m_offlineTransport( offlineTransport )
+    , m_offlineStorage( mode == Mode::OfflineConvert ? offlineStorage : nullptr )
     , m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
@@ -467,8 +465,39 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     m_data.symbolSamplesReady = true;
 #endif
 
-    m_thread = std::thread( [this] { SetThreadName( "Tracy Worker" ); Exec(); } );
-    m_threadNet = std::thread( [this] { SetThreadName( "Tracy Network" ); Network(); } );
+    m_thread = std::thread( [this] { SetThreadName( "Tracy Worker" ); RunWorkerThread(false); } );
+    try { m_threadNet = std::thread( [this] { SetThreadName( "Tracy Network" ); RunWorkerThread(true); } ); }
+    catch(...) {
+        Shutdown();TransportClose();m_netWriteCv.notify_all();m_netReadCv.notify_all();
+        { std::lock_guard lock(m_networkStopLock);m_networkStopped=true; }m_networkStopCv.notify_all();
+        if(m_thread.joinable())m_thread.join();throw;
+    }
+}
+
+void Worker::RunWorkerThread(bool network)
+{
+    if(AllocationDiagnosticsEnabled())g_allocationRole=network?"network":"worker";
+    try { if(network)Network();else Exec(); }
+    catch(const std::exception& e) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,e.what()); }
+    catch(...) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,"conversion_worker_unknown_failure"); }
+}
+void Worker::OfflineThreadFailure(bool network,const char* reason) noexcept
+{
+    m_offlineStorage->Fail(reason);Shutdown();
+    try { TransportClose(); }catch(...){}
+    m_netWriteCv.notify_all();m_netReadCv.notify_all();
+    if(network) {
+        m_protocolTransportError=true;m_networkReading=false;
+        {std::lock_guard lock(m_networkStopLock);m_networkStopped=true;}m_networkStopCv.notify_all();
+    }else {
+        try { FinishProtocol(ProtocolCloseReason::TransportError); }catch(...){m_connected=false;}
+    }
+}
+void Worker::JoinOfflineReplay()
+{
+    if(m_mode!=Mode::OfflineConvert)throw std::runtime_error("join_requires_offline_worker");
+    Shutdown();TransportClose();m_netWriteCv.notify_all();m_netReadCv.notify_all();
+    if(m_threadNet.joinable())m_threadNet.join();if(m_thread.joinable())m_thread.join();
 }
 
 Worker::Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames )
@@ -556,8 +585,9 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
 
             if( !v.text.empty() )
             {
-                auto& extra = RequestZoneExtra( *zone );
+                UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
                 extra.text = StringIdx( StoreString( v.text.c_str(), v.text.size() ).idx );
+    });
             }
 
             if( m_threadCtx != v.tid )
@@ -722,7 +752,9 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     }
 }
 
-Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification, SerializedZoneSink* serializedZoneSink )
+Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification,
+    SerializedZoneSink* serializedZoneSink, SerializedStringSource* serializedStringSource,
+    SerializedCallstackSource* serializedCallstackSource )
     : m_hasData( true )
     , m_stream( nullptr )
     , m_buffer( nullptr )
@@ -730,33 +762,15 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     , m_memoryLimit( -1 )
     , m_allowStringModification( allowStringModification )
     , m_serializedZoneSink( serializedZoneSink )
+    , m_externalStringSource( serializedStringSource )
+    , m_externalCallstackSource( serializedCallstackSource )
 {
     auto loadStart = std::chrono::high_resolution_clock::now();
 
     int fileVer = 0;
 
-    uint8_t hdr[8];
-    f.Read( hdr, sizeof( hdr ) );
-    if( memcmp( FileHeader, hdr, FileHeaderMagic ) == 0 )
-    {
-        fileVer = FileVersion( hdr[FileHeaderMagic], hdr[FileHeaderMagic+1], hdr[FileHeaderMagic+2] );
-        if( fileVer > CurrentVersion )
-        {
-            throw UnsupportedVersion( fileVer );
-        }
-        if( fileVer < MinSupportedVersion )
-        {
-            throw LegacyVersion( fileVer );
-        }
-        if( fileVer < FileVersion( 0, 12, 3 ) )
-        {
-            f.Read( m_legacyQueueDelay );
-        }
-    }
-    else
-    {
-        throw LegacyVersion( FileVersion( 0, 2, 0 ) );
-    }
+    ReadExtendedTraceHeader(f);
+    fileVer = ExtendedTraceBaseLayout;
     m_traceVersion = fileVer;
 
     s_loadProgress.total.store( fileVer >= FileVersion( 0, 13, 2 ) ? 18 : 17, std::memory_order_relaxed );
@@ -908,69 +922,105 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     unordered_flat_map<uint64_t, const char*> pointerMap;
 
     f.Read( sz );
-    m_data.stringMap.reserve( sz );
-
-    if( !m_allowStringModification )
+    const bool manifestBoundStrings = sz == std::numeric_limits<uint64_t>::max();
+    if( manifestBoundStrings )
     {
-        m_data.stringData.reserve_exact( sz, m_slab );
+        if( !m_externalStringSource ) throw LoadFailure( "compact trace requires its manifest-bound external string dictionary" );
+        sz = 0;
     }
-
-    for( uint64_t i=0; i<sz; i++ )
+    if(sz>UINT32_MAX || sz>SIZE_MAX/sizeof(const char*))throw LoadFailure("string table count exceeds supported index range");
+    const bool captureExternalStrings = m_serializedZoneSink && m_serializedZoneSink->WantsGlobalStrings();
+    const bool suppliedExternalStrings = m_externalStringSource != nullptr;
+    const bool externalStrings = captureExternalStrings || suppliedExternalStrings;
+    m_externalStrings = externalStrings;
+    m_externalStringCount = suppliedExternalStrings ? m_externalStringSource->StringCount() : ( captureExternalStrings ? sz : 0 );
+    if( suppliedExternalStrings && ( !manifestBoundStrings || sz != 0 ) ) throw LoadFailure( "manifest-bound compact trace has an invalid external string marker" );
+    if( captureExternalStrings )
     {
-        uint64_t ptr, ssz;
-        f.Read2( ptr, ssz );
-        auto dst = m_slab.Alloc<char>( ssz+1 );
-        f.Read( dst, ssz );
-        dst[ssz] = '\0';
-        m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
-
-        if( m_allowStringModification )
+        m_serializedZoneSink->GlobalStringsBegin( sz );
+        std::array<char,64*1024> buffer;
+        for( uint64_t i=0; i<sz; i++ )
         {
-            m_data.stringData.push_back( dst );
+            m_serializedZoneSink->CheckRead();
+            uint64_t token,bytes;f.Read2(token,bytes);
+            if(bytes>UINT32_MAX)throw LoadFailure("string byte length overflow");
+            m_serializedZoneSink->GlobalStringBegin(i,token,bytes);
+            for(uint64_t offset=0;offset<bytes;){const auto take=std::min<uint64_t>(buffer.size(),bytes-offset);f.Read(buffer.data(),size_t(take));m_serializedZoneSink->GlobalStringBytes(i,offset,buffer.data(),take);offset+=take;}
+            m_serializedZoneSink->GlobalStringEnd(i);
         }
-        else
+        m_serializedZoneSink->GlobalStringsEnd();
+    }
+    else
+    {
+        m_data.stringMap.reserve( sz );
+        if( !m_allowStringModification ) m_data.stringData.reserve_exact( sz, m_slab );
+        for( uint64_t i=0; i<sz; i++ )
         {
-            m_data.stringData[i] = ( dst );
+            uint64_t ptr, ssz;f.Read2( ptr, ssz );
+            if(ssz>UINT32_MAX || ssz>=SIZE_MAX)throw LoadFailure("string byte length overflow");
+            auto dst = static_cast<char*>(m_slab.AllocBig( size_t(ssz)+1 ));f.Read( dst, ssz );dst[ssz] = '\0';
+            m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
+            if( m_allowStringModification )m_data.stringData.push_back( dst );else m_data.stringData[i] = dst;
+            pointerMap.emplace( ptr, dst );
         }
-
-        pointerMap.emplace( ptr, dst );
     }
 
     f.Read( sz );
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds string pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(0,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(0,i,id,ptr,0);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.strings.emplace( id, it->second );
         }
     }
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableEnd(0);
 
     f.Read( sz );
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds thread-name pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(1,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(1,i,id,ptr,0);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.threadNames.emplace( id, it->second );
         }
     }
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableEnd(1);
 
     f.Read( sz );
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds external-name pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(2,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr, ptr2;
         f.Read3( id, ptr, ptr2 );
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(2,i,id,ptr,ptr2);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         auto it2 = pointerMap.find( ptr2 );
         if( it != pointerMap.end() && it2 != pointerMap.end() )
         {
             m_data.externalNames.emplace( id, std::make_pair( it->second, it2->second ) );
         }
+    }
+    if(captureExternalStrings)
+    {
+        m_serializedZoneSink->GlobalPointerTableEnd(2);
+        m_externalStringSource=m_serializedZoneSink->GlobalStringSource();
+        if(!m_externalStringSource || m_externalStringSource->StringCount()!=m_externalStringCount)
+            throw LoadFailure("external global string source was not published after serialization");
     }
 
     m_data.localThreadCompress.Load( f );
@@ -990,6 +1040,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ptr );
         SourceLocation srcloc;
         f.Read( &srcloc, sizeof( SourceLocationBase ) );
+        ValidateStringReference(srcloc.name);ValidateStringReference(srcloc.function);ValidateStringReference(srcloc.file);
         srcloc.namehash = 0;
         m_data.sourceLocation.emplace( ptr, srcloc );
     }
@@ -1012,6 +1063,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     {
         auto srcloc = m_slab.Alloc<SourceLocation>();
         f.Read( srcloc, sizeof( SourceLocationBase ) );
+        ValidateStringReference(srcloc->name);ValidateStringReference(srcloc->function);ValidateStringReference(srcloc->file);
         srcloc->namehash = 0;
         m_data.sourceLocationPayload[i] = srcloc;
         m_data.sourceLocationPayloadMap.emplace( srcloc, int16_t( i ) );
@@ -1074,6 +1126,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint32_t id;
             uint64_t tsz;
             f.Read8( id, lockmap.customName, lockmap.srcloc, lockmap.type, lockmap.valid, lockmap.timeAnnounce, lockmap.timeTerminate, tsz );
+            ValidateStringIndex(lockmap.customName);
             lockmap.isContended = false;
             lockmap.threadMap.reserve( tsz );
             lockmap.threadList.reserve( tsz );
@@ -1153,6 +1206,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             auto msgdata = m_slab.Alloc<MessageData>();
             msgdata->time = ReadTimeOffset( f, refTime );
             f.Read3( msgdata->ref, msgdata->color, msgdata->callstack );
+            ValidateStringReference(msgdata->ref);
             m_data.messages[i] = msgdata;
             msgMap.emplace( ptr, msgdata );
         }
@@ -1163,11 +1217,29 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
 
     f.Read( sz );
-    assert( sz != 0 );
-    if( eventMask & EventType::CpuZones )
+    if(sz==0 || sz>uint64_t(UINT32_MAX)+1)throw LoadFailure("zone_extra_count");
+    if(m_serializedZoneSink && m_serializedZoneSink->WantsZoneExtras()) {
+        m_data.zoneExtra.reserve_exact(1,m_slab);
+        m_serializedZoneSink->ZoneExtrasBegin(sz);
+        m_serializedZoneSink->JnBufferBytes(4096*sizeof(ZoneExtra));
+        std::array<ZoneExtra,4096> rows;
+        for(uint64_t offset=0;offset<sz;) {
+            m_serializedZoneSink->CheckRead();
+            const auto n=std::min<uint64_t>(rows.size(),sz-offset);
+            f.Read(rows.data(),size_t(n)*sizeof(ZoneExtra));
+            for(uint64_t i=0;i<n;++i){ValidateStringIndex(rows[i].text);ValidateStringIndex(rows[i].name);}
+            if(offset==0)m_data.zoneExtra[0]=rows[0];
+            m_serializedZoneSink->ZoneExtrasRawBlock(offset,rows.data(),n);offset+=n;
+        }
+        m_serializedZoneSink->ZoneExtrasEnd();
+        m_serializedZoneSink->JnBufferBytes(0);
+    }
+    else if( eventMask & EventType::CpuZones )
     {
+        if(sz>UINT32_MAX)throw LoadFailure("zone_extra_memory_count");
         m_data.zoneExtra.reserve_exact( sz, m_slab );
         f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+        for(const auto& row:m_data.zoneExtra){ValidateStringIndex(row.text);ValidateStringIndex(row.name);}
     }
     else
     {
@@ -1177,6 +1249,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         {
             ZoneExtra value;
             f.Read( value );
+            ValidateStringIndex(value.text);ValidateStringIndex(value.name);
             if( index == 0 ) m_data.zoneExtra[0] = value;
             if( m_serializedZoneSink ) m_serializedZoneSink->ZoneExtraRecord( index, value.callstack.Val(), value.text.Active(), value.text.Active() ? value.text.Idx() : 0,
                 value.name.Active(), value.name.Active() ? value.name.Idx() : 0, value.color.Val() );
@@ -1196,6 +1269,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         memset( (char*)m_data.zoneChildren.data(), 0, sizeof( Vector<short_ptr<ZoneEvent>> ) * sz );
     }
     int32_t childIdx = 0;
+    const bool externalSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsSamples();
     f.Read( sz );
     m_data.threads.reserve_exact( sz, m_slab );
     for( uint64_t i=0; i<sz; i++ )
@@ -1241,7 +1315,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         uint64_t ssz;
         f.Read( ssz );
-        if( ssz != 0 )
+        if(externalSamples)
+        {
+            const bool retain = ( eventMask & EventType::Samples ) != 0;
+            if( retain ) td->ctxSwitchSamples.reserve_exact( ssz, m_slab );
+            m_serializedZoneSink->SamplesBegin(tid,1,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,1,j,refTime,callstack.Val());if(retain){td->ctxSwitchSamples[j].time.SetVal(refTime);td->ctxSwitchSamples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,1);
+        }
+        else if( ssz != 0 )
         {
             if( eventMask & EventType::Samples )
             {
@@ -1261,7 +1341,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             }
         }
         f.Read( ssz );
-        if( ssz != 0 )
+        if(externalSamples)
+        {
+            const bool retain = ( eventMask & EventType::Samples ) != 0;
+            if( retain ){m_data.samplesCnt+=ssz;td->samples.reserve_exact(ssz,m_slab);}
+            m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());if(retain){td->samples[j].time.SetVal(refTime);td->samples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,0);
+        }
+        else if( ssz != 0 )
         {
             if( eventMask & EventType::Samples )
             {
@@ -1305,6 +1391,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         auto ctx = m_slab.AllocInit<GpuCtxData>();
         uint8_t calibration;
         f.Read7( ctx->thread, calibration, ctx->count, ctx->period, ctx->type, ctx->name, ctx->overflow );
+        ValidateStringIndex(ctx->name);
         uint64_t notesz;
         if( fileVer >= FileVersion( 0, 12, 4 ) )
         {
@@ -1314,6 +1401,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 decltype( ctx->noteNames )::key_type key;
                 decltype( ctx->noteNames )::mapped_type value;
                 f.Read2( key, value );
+                ValidateStringIndex(value);
                 ctx->noteNames[key] = value;
             }
         }
@@ -1477,37 +1565,54 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::CallStacks, std::memory_order_relaxed );
     f.Read( sz );
-    m_data.callstackPayload.reserve_exact( sz+1, m_slab );
-    m_data.callstackPayload[0] = nullptr;
-    for( uint64_t i=0; i<sz; i++ )
+    const bool manifestBoundCallstacks=sz==std::numeric_limits<uint64_t>::max();
+    if(manifestBoundCallstacks){if(!m_externalCallstackSource)throw LoadFailure("compact trace requires its manifest-bound external callstack payloads");sz=0;}
+    const bool captureExternalCallstacks=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstacks();
+    const bool suppliedExternalCallstacks=m_externalCallstackSource!=nullptr;
+    const bool externalCallstacks=captureExternalCallstacks||suppliedExternalCallstacks;
+    m_externalCallstacks=externalCallstacks;m_externalCallstackCount=suppliedExternalCallstacks?m_externalCallstackSource->CallstackCount():(captureExternalCallstacks?sz:0);
+    if(suppliedExternalCallstacks&&(!manifestBoundCallstacks||sz!=0))throw LoadFailure("manifest-bound compact trace has an invalid external callstack marker");
+    if(captureExternalCallstacks)
     {
-        uint16_t csz;
-        f.Read( csz );
-
-        const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-
-        auto data = (CallstackFrameId*)mem;
-        f.Read( data, csz * sizeof( CallstackFrameId ) );
-
-        auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( csz, data );
-
-        m_data.callstackPayload[i+1] = arr;
+        if(m_data.callstackPayload.empty())m_data.callstackPayload.push_back(nullptr);else if(m_data.callstackPayload.size()!=1)throw LoadFailure("callstack sentinel state");
+        m_serializedZoneSink->CallstacksBegin(sz);std::array<CallstackFrameId,4096> frames;
+        for(uint64_t i=0;i<sz;++i){m_serializedZoneSink->CheckRead();uint16_t count;f.Read(count);if(!count)throw LoadFailure("empty callstack payload");const auto id=uint32_t(i+1);m_serializedZoneSink->CallstackBegin(id,count);for(uint32_t offset=0;offset<count;){const auto take=std::min<uint32_t>(uint32_t(frames.size()),count-offset);f.Read(frames.data(),size_t(take)*sizeof(CallstackFrameId));m_serializedZoneSink->CallstackFrames(id,offset,frames.data(),take);offset+=take;}m_serializedZoneSink->CallstackEnd(id);}m_serializedZoneSink->CallstacksEnd();
+        m_externalCallstackSource=m_serializedZoneSink->GlobalCallstackSource();if(!m_externalCallstackSource||m_externalCallstackSource->CallstackCount()!=m_externalCallstackCount)throw LoadFailure("external callstack source was not published after serialization");
+    }
+    else
+    {
+        m_data.callstackPayload.reserve_exact( sz+1, m_slab );m_data.callstackPayload[0] = nullptr;
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            uint16_t csz;f.Read( csz );
+            const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );auto mem = (char*)m_slab.AllocRaw( memsize );auto data = (CallstackFrameId*)mem;f.Read( data, csz * sizeof( CallstackFrameId ) );auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );new(arr) VarArray<CallstackFrameId>( csz, data );m_data.callstackPayload[i+1] = arr;
+        }
     }
 
     f.Read( sz );
-    m_data.callstackFrameMap.reserve( sz );
-    for( uint64_t i=0; i<sz; i++ )
+    const bool manifestBoundCallstackFrames=sz==std::numeric_limits<uint64_t>::max();
+    if(manifestBoundCallstackFrames){if(!m_externalCallstackSource)throw LoadFailure("compact trace requires its manifest-bound external callstack frame definitions");sz=0;}
+    const bool captureExternalCallstackFrames=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstackFrames();
+    if(m_externalCallstackSource&&!captureExternalCallstackFrames&&(!manifestBoundCallstackFrames||sz!=0))throw LoadFailure("manifest-bound compact trace has an invalid external callstack frame marker");
+    if(captureExternalCallstackFrames)
     {
-        CallstackFrameId id;
-        auto frameData = m_slab.Alloc<CallstackFrameData>();
-        f.Read3( id, frameData->size, frameData->imageName );
-
-        frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
-        f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
-
-        m_data.callstackFrameMap.emplace( id, frameData );
+        m_serializedZoneSink->CallstackFrameDefinitionsBegin(sz);std::array<CallstackFrame,1024> frames;
+        for(uint64_t i=0;i<sz;++i){m_serializedZoneSink->CheckRead();CallstackFrameId id;uint8_t count;StringIdx imageName;f.Read3(id,count,imageName);ValidateStringIndex(imageName);m_serializedZoneSink->CallstackFrameDefinitionBegin(i,id,count,imageName);for(uint32_t offset=0;offset<count;){const auto take=std::min<uint32_t>(uint32_t(frames.size()),count-offset);f.Read(frames.data(),size_t(take)*sizeof(CallstackFrame));for(uint32_t j=0;j<take;++j){ValidateStringIndex(frames[j].name);ValidateStringIndex(frames[j].file);}m_serializedZoneSink->CallstackFrameDefinitionRecords(i,offset,frames.data(),take);offset+=take;}m_serializedZoneSink->CallstackFrameDefinitionEnd(i);}m_serializedZoneSink->CallstackFrameDefinitionsEnd();if(!m_externalCallstackSource||m_externalCallstackSource->FrameCount()!=sz)throw LoadFailure("external callstack frame source was not published after serialization");
+    }
+    else if(!m_externalCallstackSource)
+    {
+        m_data.callstackFrameMap.reserve( sz );
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            CallstackFrameId id;
+            auto frameData = m_slab.Alloc<CallstackFrameData>();
+            f.Read3( id, frameData->size, frameData->imageName );
+            ValidateStringIndex(frameData->imageName);
+            frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
+            f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
+            for(uint32_t j=0;j<frameData->size;++j){ValidateStringIndex(frameData->data[j].name);ValidateStringIndex(frameData->data[j].file);}
+            m_data.callstackFrameMap.emplace( id, frameData );
+        }
     }
 
     f.Read( sz );
@@ -1814,6 +1919,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         uint8_t isInline;
         Int24 size;
         f.Read9( symAddr, name, file, line, imageName, callFile, callLine, isInline, size );
+        ValidateStringIndex(name);ValidateStringIndex(file);ValidateStringIndex(imageName);ValidateStringIndex(callFile);
         m_data.symbolMap.emplace( symAddr, SymbolData { { name, file, line }, imageName, callFile, callLine, isInline, size } );
         if( isInline )
         {
@@ -1950,8 +2056,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         auto& jn = m_data.jnTrace;
         jn.present = present != 0;
         jn.schemaVersion = schemaVersion;
-        ReadJnVector( f, jn.jobTypes, "job type" );
-        ReadJnVector( f, jn.jobSchedules, "job schedule" );
+        ReadJnVector( f, jn.jobTypes, "job type", m_serializedZoneSink, SerializedZoneSink::JnDomain::JobType );
+        ReadJnVector(f,jn.jobSchedules,"job schedule",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobSchedule);
         if( schemaVersion == 1 )
         {
 #pragma pack( push, 1 )
@@ -1971,27 +2077,36 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             jn.jobConfigs.reserve( oldConfigs.size() );
             for( const auto& value : oldConfigs )
                 jn.jobConfigs.push_back( { value.jobId, value.typeId, value.count, value.grainSize, value.unityFlowId, 0, value.kind, value.flags } );
+            if( m_serializedZoneSink && m_serializedZoneSink->WantsJnRecords( SerializedZoneSink::JnDomain::JobConfig, sizeof( JnJobConfigData ) ) )
+            {
+                m_serializedZoneSink->JnRecordsBegin( SerializedZoneSink::JnDomain::JobConfig, jn.jobConfigs.size(), sizeof( JnJobConfigData ) );
+                if( !jn.jobConfigs.empty() ) m_serializedZoneSink->JnRecordsBlock( SerializedZoneSink::JnDomain::JobConfig,
+                    0, jn.jobConfigs.data(), jn.jobConfigs.size(), sizeof( JnJobConfigData ) );
+                m_serializedZoneSink->JnRecordsEnd( SerializedZoneSink::JnDomain::JobConfig );
+                jn.jobConfigs.clear();
+                jn.jobConfigs.shrink_to_fit();
+            }
         }
         else
         {
-            ReadJnVector( f, jn.jobConfigs, "job config" );
+            ReadJnVector(f,jn.jobConfigs,"job config",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobConfig);
         }
-        ReadJnVector( f, jn.jobDependencies, "job dependency" );
-        ReadJnVector( f, jn.jobStages, "job stage" );
-        ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
+        ReadJnVector(f,jn.jobDependencies,"job dependency",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobDependency);
+        ReadJnVector( f, jn.jobStages, "job stage",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobStage );
+        ReadJnVector(f,jn.gfxDispatches,"gfx dispatch",m_serializedZoneSink,SerializedZoneSink::JnDomain::GfxDispatch);
         ReadJnVector( f, jn.gfxEntities, "gfx entity", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxEntity );
         ReadJnVector( f, jn.gfxLinks, "gfx link", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxLink );
-        if( schemaVersion >= 2 ) ReadJnVector( f, jn.frames, "frame correlation" );
+        if( schemaVersion >= 2 ) ReadJnVector(f,jn.frames,"frame correlation",m_serializedZoneSink,SerializedZoneSink::JnDomain::Frame);
         if( schemaVersion >= 3 )
         {
-            ReadJnVector( f, jn.ioRequests, "I/O request" );
-            ReadJnVector( f, jn.ioConfigs, "I/O config" );
-            ReadJnVector( f, jn.ioStages, "I/O stage" );
+            ReadJnVector(f,jn.ioRequests,"I/O request",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoRequest);
+            ReadJnVector(f,jn.ioConfigs,"I/O config",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoConfig);
+            ReadJnVector(f,jn.ioStages,"I/O stage",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoStage);
         }
         if( schemaVersion >= 4 )
         {
             ReadJnVector( f, jn.relations, "relation", m_serializedZoneSink, SerializedZoneSink::JnDomain::Relation );
-            ReadJnVector( f, jn.runtimeDomainStates, "runtime domain state" );
+            ReadJnVector(f,jn.runtimeDomainStates,"runtime domain state",m_serializedZoneSink,SerializedZoneSink::JnDomain::RuntimeDomainState);
         }
         if( schemaVersion >= 5 )
         {
@@ -2024,12 +2139,12 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         if( schemaVersion >= 6 )
         {
-            ReadJnVector( f, jn.scriptFrames, "script frame" );
-            ReadJnVector( f, jn.scriptStacks, "script stack" );
+            ReadJnVector(f,jn.scriptFrames,"script frame",m_serializedZoneSink,SerializedZoneSink::JnDomain::ScriptFrame);
+            ReadJnVector(f,jn.scriptStacks,"script stack",m_serializedZoneSink,SerializedZoneSink::JnDomain::ScriptStack);
         }
         if( schemaVersion >= 8 )
         {
-            ReadJnVector( f, jn.callsites, "callsite" );
+            ReadJnVector(f,jn.callsites,"callsite",m_serializedZoneSink,SerializedZoneSink::JnDomain::Callsite);
         }
         if( schemaVersion >= 12 )
         {
@@ -2037,26 +2152,28 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint8_t catalogValid;
             f.Read4( catalogPresent, catalogValid, jn.gpuCatalogSchemaVersion,
                 jn.gpuDetailedEvidenceSchemaVersion );
+            if(catalogPresent>1||catalogValid>1)throw LoadFailure("Invalid GPU Catalog presence or quality flag.");
             jn.gpuCatalogPresent = catalogPresent != 0;
             jn.gpuCatalogValid = catalogValid != 0;
             if( jn.gpuCatalogPresent &&
                 ( jn.gpuCatalogSchemaVersion != JnGpuCatalogSchemaVersion ||
                     jn.gpuDetailedEvidenceSchemaVersion != JnGpuDetailedEvidenceSchemaVersion ) )
                 throw LoadFailure( "Unsupported JN GPU Catalog or Detailed Evidence schema." );
-            ReadJnVector( f, jn.gpuCatalogControls, "GPU Catalog control" );
-            ReadJnVector( f, jn.gpuCatalogBatches, "GPU Catalog batch" );
-            ReadJnVector( f, jn.gpuCatalogGenerations, "GPU Catalog generation" );
-            ReadJnGpuCatalogStrings( f, jn.gpuCatalogStrings );
-            ReadJnVector( f, jn.gpuCatalogResources, "GPU Catalog resource" );
-            ReadJnVector( f, jn.gpuCatalogAllocations, "GPU Catalog allocation" );
-            ReadJnVector( f, jn.gpuCatalogViews, "GPU Catalog view" );
-            ReadJnVector( f, jn.gpuCatalogLogicals, "GPU Catalog logical resource" );
-            ReadJnVector( f, jn.gpuCatalogParts, "GPU Catalog part" );
-            ReadJnVector( f, jn.gpuCatalogRelations, "GPU Catalog relation" );
-            ReadJnVector( f, jn.gpuCatalogVg, "GPU Catalog virtual geometry" );
-            ReadJnVector( f, jn.gpuRangeSets, "GPU range set" );
-            ReadJnVector( f, jn.gpuDetailedEvidence, "GPU detailed evidence" );
-            if( jn.gpuCatalogPresent && !ValidateJnGpuCatalogStoredData( jn ) )
+            if(m_serializedZoneSink)m_serializedZoneSink->CatalogMetadata({catalogPresent,catalogValid,jn.gpuCatalogSchemaVersion,jn.gpuDetailedEvidenceSchemaVersion});
+            ReadJnVector(f,jn.gpuCatalogControls,"GPU Catalog control",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogControl);
+            ReadJnVector(f,jn.gpuCatalogBatches,"GPU Catalog batch",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogBatch);
+            ReadJnVector(f,jn.gpuCatalogGenerations,"GPU Catalog generation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogGeneration);
+            ReadJnGpuCatalogStrings(f,jn.gpuCatalogStrings,m_serializedZoneSink);
+            ReadJnVector(f,jn.gpuCatalogResources,"GPU Catalog resource",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogResource);
+            ReadJnVector(f,jn.gpuCatalogAllocations,"GPU Catalog allocation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogAllocation);
+            ReadJnVector(f,jn.gpuCatalogViews,"GPU Catalog view",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogView);
+            ReadJnVector(f,jn.gpuCatalogLogicals,"GPU Catalog logical",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogLogical);
+            ReadJnVector(f,jn.gpuCatalogParts,"GPU Catalog part",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogPart);
+            ReadJnVector(f,jn.gpuCatalogRelations,"GPU Catalog relation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogRelation);
+            ReadJnVector(f,jn.gpuCatalogVg,"GPU Catalog virtual geometry",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogVg);
+            ReadJnVector(f,jn.gpuRangeSets,"GPU range set",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogRangeSet);
+            ReadJnVector(f,jn.gpuDetailedEvidence,"GPU detailed evidence",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogDetailedEvidence);
+            if( jn.gpuCatalogPresent && !(m_serializedZoneSink&&m_serializedZoneSink->ValidatesCatalog()) && !ValidateJnGpuCatalogStoredData( jn ) )
             {
                 jn.gpuCatalogValid = false;
                 for( auto& generation : jn.gpuCatalogGenerations ) generation.valid = 0;
@@ -2167,7 +2284,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 m_data.gpuSourceLocationZonesReady = true;
             }
 
-            if( eventMask & EventType::Samples )
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
             {
                 jobs.emplace_back( std::thread( [this] {
                     unordered_flat_map<uint32_t, uint32_t> counts;
@@ -2240,7 +2357,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                     m_data.callstackSamplesReady = true;
                 } ) );
 
+            }
+
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
+            {
                 jobs.emplace_back( std::thread( [this] {
+                    try
+                    {
                     uint32_t gcnt = 0;
                     for( auto& t : m_data.threads )
                     {
@@ -2251,7 +2374,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                             {
                                 for( auto& sd : t->samples )
                                 {
-                                    gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, sd.time.Val() );
+                                    const auto callstack = sd.callstack.Val();
+                                    if( m_externalCallstackSource )
+                                    {
+                                        uint32_t count = 0;
+                                        const auto* frames = m_externalCallstackSource->Frames( callstack, count );
+                                        if( frames && count != 0 ) gcnt += AddGhostZone( frames, count, &t->ghostZones, sd.time.Val() );
+                                    }
+                                    else gcnt += AddGhostZone( GetCallstack( callstack ), &t->ghostZones, sd.time.Val() );
                                 }
                             }
                             else
@@ -2259,7 +2389,17 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                                 for( auto& sd : t->samples )
                                 {
                                     const auto st = sd.time.Val();
-                                    if( st != 0 ) gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, st );
+                                    if( st != 0 )
+                                    {
+                                        const auto callstack = sd.callstack.Val();
+                                        if( m_externalCallstackSource )
+                                        {
+                                            uint32_t count = 0;
+                                            const auto* frames = m_externalCallstackSource->Frames( callstack, count );
+                                            if( frames && count != 0 ) gcnt += AddGhostZone( frames, count, &t->ghostZones, st );
+                                        }
+                                        else gcnt += AddGhostZone( GetCallstack( callstack ), &t->ghostZones, st );
+                                    }
                                 }
                             }
                         }
@@ -2267,8 +2407,17 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                     std::lock_guard<std::mutex> lock( m_data.lock );
                     m_data.ghostZonesReady = true;
                     m_data.ghostCnt = gcnt;
+                    }
+                    catch( const std::exception& error )
+                    {
+                        fprintf( stderr, "ghost-zone reconstruction failed: %s\n", error.what() );
+                    }
                 } ) );
 
+            }
+
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
+            {
                 jobs.emplace_back( std::thread( [this] {
                     for( auto& t : m_data.threads )
                     {
@@ -2631,6 +2780,7 @@ std::pair<int, int> Worker::GetFrameRange( const FrameData& fd, int64_t from, in
 const CallstackFrameData* Worker::GetCallstackFrame( const CallstackFrameId& ptr ) const
 {
     assert( ptr.custom == 0 );
+    if(m_externalCallstackSource)return nullptr;
     auto it = m_data.callstackFrameMap.find( ptr );
     if( it == m_data.callstackFrameMap.end() )
     {
@@ -2794,6 +2944,11 @@ int64_t Worker::GetZoneEndImpl( const GpuEvent& ev )
 uint32_t Worker::FindStringIdx( const char* str ) const
 {
     if( !str ) return 0;
+    if( m_offlineStorage )
+    {
+        uint32_t id;
+        return m_offlineStorage->FindString( str, strlen( str ), id ) ? id : 0;
+    }
     charutil::StringKey key = { str, strlen( str ) };
     auto sit = m_data.stringMap.find( key );
     if( sit == m_data.stringMap.end() )
@@ -2808,6 +2963,11 @@ uint32_t Worker::FindStringIdx( const char* str ) const
 
 const char* Worker::GetString( uint64_t ptr ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto* value = m_externalStringSource->PointerString( 0, ptr );
+        return value ? value : "???";
+    }
     const auto it = m_data.strings.find( ptr );
     if( it == m_data.strings.end() || it->second == nullptr )
     {
@@ -2824,7 +2984,8 @@ const char* Worker::GetString( const StringRef& ref ) const
     if( ref.isidx )
     {
         assert( ref.active );
-        return m_data.stringData[ref.str];
+        return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( ref.str ) ) :
+            ( m_externalStringSource ? m_externalStringSource->StringAt( uint32_t( ref.str ) ) : m_data.stringData[ref.str] );
     }
     else
     {
@@ -2842,7 +3003,8 @@ const char* Worker::GetString( const StringRef& ref ) const
 const char* Worker::GetString( const StringIdx& idx ) const
 {
     assert( idx.Active() );
-    return m_data.stringData[idx.Idx()];
+    return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( idx.Idx() ) ) :
+        ( m_externalStringSource ? m_externalStringSource->StringAt( uint32_t( idx.Idx() ) ) : m_data.stringData[idx.Idx()] );
 }
 
 static const char* BadExternalThreadNames[] = {
@@ -2853,6 +3015,23 @@ static const char* BadExternalThreadNames[] = {
 
 const char* Worker::GetThreadName( uint64_t id ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto* local = m_externalStringSource->PointerString( 1, id );
+        const auto external = m_externalStringSource->ExternalName( id );
+        if( !local ) return external.second ? external.second : "???";
+        if( local[0] >= '0' && local[0] <= '9' && uint64_t( atoi( local ) ) == id && external.second )
+        {
+            const char** ptr = BadExternalThreadNames;
+            while( *ptr )
+            {
+                if( strcmp( *ptr, external.second ) == 0 ) return local;
+                ptr++;
+            }
+            return external.second;
+        }
+        return local;
+    }
     const auto it = m_data.threadNames.find( id );
     if( it == m_data.threadNames.end() )
     {
@@ -2922,6 +3101,11 @@ const SourceLocation& Worker::GetSourceLocation( int16_t srcloc ) const
 
 std::pair<const char*, const char*> Worker::GetExternalName( uint64_t id ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto result = m_externalStringSource->ExternalName( id );
+        return { result.first ? result.first : "???", result.second ? result.second : "???" };
+    }
     const auto it = m_data.externalNames.find( id );
     if( it == m_data.externalNames.end() )
     {
@@ -2953,9 +3137,9 @@ const char* Worker::GetZoneName( const ZoneEvent& ev ) const
 
 const char* Worker::GetZoneName( const ZoneEvent& ev, const SourceLocation& srcloc ) const
 {
-    if( HasZoneExtra( ev ) && GetZoneExtra( ev ).name.Active() )
+    if( HasZoneExtra( ev ) && ReadZoneExtraValue( ev ).name.Active() )
     {
-        return GetString( GetZoneExtra( ev ).name );
+        return GetString( ReadZoneExtraValue( ev ).name );
     }
     else if( srcloc.name.active )
     {
@@ -3450,6 +3634,7 @@ void Worker::Exec()
                 closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
             goto close;
         }
+        if(m_offlineStorage)m_offlineStorage->Check();
         if( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit )
         {
             if( m_mode == Mode::ProtocolOnly )
@@ -3487,6 +3672,7 @@ void Worker::Exec()
         {
             std::unique_lock<std::mutex> lock( m_netReadLock );
             m_netReadCv.wait( lock, [this] {
+                if(m_offlineStorage && m_shutdown.load())return true;
                 if( !m_netRead.empty() ) return true;
                 if( m_protocolReplayTerminate.load( std::memory_order_acquire ) ) return true;
                 const bool beginDrain = m_disconnect.load( std::memory_order_acquire ) &&
@@ -3500,6 +3686,7 @@ void Worker::Exec()
                 std::lock_guard writeLock( m_netWriteLock );
                 return m_netWriteCnt == 0 && !m_networkReading.load( std::memory_order_acquire );
             } );
+            if(m_offlineStorage && m_shutdown.load()) {lock.unlock();goto close;}
             bool beginDrain = false;
             bool finishDrain = false;
             if( m_netRead.empty() && m_protocolReplayTerminate.exchange( false, std::memory_order_acq_rel ) )
@@ -3599,7 +3786,10 @@ void Worker::Exec()
                 {
                     m_offlineEventCount++;
                     if( ( m_offlineEventCount & 4095 ) == 0 )
+                    {
                         m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
+                        if(m_offlineStorage)m_offlineStorage->Check();
+                    }
                 }
                 const bool processed = m_protocolDrainOnly.load( std::memory_order_acquire ) ?
                     DispatchProtocolDrain( *ev, ptr ) :
@@ -3818,7 +4008,8 @@ void Worker::HandleFailure( const char* ptr, const char* end )
         NetBuffer netbuf;
         {
             std::unique_lock<std::mutex> lock( m_netReadLock );
-            m_netReadCv.wait( lock, [this] { return !m_netRead.empty(); } );
+            m_netReadCv.wait( lock, [this] { return !m_netRead.empty() || (m_offlineStorage && m_shutdown.load()); } );
+            if(m_netRead.empty())return;
             netbuf = m_netRead.front();
             m_netRead.erase( m_netRead.begin() );
         }
@@ -4017,6 +4208,10 @@ void Worker::QueryCallstackFrame( uint64_t addr )
 
 bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
 {
+    if(AllocationDiagnosticsEnabled()){
+        g_allocationQueueType=int32_t(ev.hdr.type);g_allocationEventOrdinal=m_offlineEventCount;
+        g_allocationCompletedFrames=m_protocolFramesProcessed.load(std::memory_order_relaxed);
+    }
     OfflineEventStat* offlineStat = nullptr;
     bool sampleOfflineCost = false;
     std::chrono::steady_clock::time_point offlineSampleStart;
@@ -5206,7 +5401,24 @@ void Worker::NewZone( ZoneEvent* zone )
     td->count++;
     td->IncStackCount( zone->SrcLoc() );
     const auto ssz = td->stack.size();
-    if( ssz == 0 )
+    if( m_offlineStorage )
+    {
+        auto root = m_offlineCpuThreadRoots.find( td->id );
+        if( root == m_offlineCpuThreadRoots.end() ) root = m_offlineCpuThreadRoots.emplace( td->id, m_offlineStorage->CreateCpuThread() ).first;
+        uint64_t parent = root->second;
+        if( ssz != 0 )
+        {
+            ZoneEvent* parentZone = td->stack.data()[ssz-1];
+            const auto found = m_offlineCpuZoneIds.find( parentZone );
+            if( found == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_parent" );
+            parent = found->second;
+        }
+        const OfflineCpuZone row { zone->Start(), zone->End(), zone->SrcLoc(), zone->extra };
+        const auto id = m_offlineStorage->AppendCpuZone( parent, row );
+        m_offlineCpuZoneIds.emplace( zone, id );
+        td->stack.push_back( zone );
+    }
+    else if( ssz == 0 )
     {
         td->stack.push_back( zone );
         td->timeline.push_back( zone );
@@ -5640,25 +5852,31 @@ uint64_t Worker::GetCanonicalPointer( const CallstackFrameId& id ) const
     return ( id.idx & 0x3FFFFFFFFFFFFFFF ) | ( ( id.idx & 0x3000000000000000 ) << 2 );
 }
 
-void Worker::AddCallstackPayload( const char* _data, size_t _sz )
+uint32_t Worker::StoreCallstackFrames( const CallstackFrameId* frames, uint16_t size, bool queryFrames )
 {
-    assert( m_pendingCallstackId == 0 );
-
-    const auto sz = _sz / sizeof( uint64_t );
-    const auto memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
-    auto mem = (char*)m_slab.AllocRaw( memsize );
-
-    auto data = (CallstackFrameId*)mem;
-    auto dst = data;
-    auto src = (uint64_t*)_data;
-    for( size_t i=0; i<sz; i++ )
+    assert( frames && size );
+    if( m_offlineStorage )
     {
-        *dst++ = PackPointer( *src++ );
+        uint32_t id;
+        const auto* stored = m_offlineStorage->InternCallstack( reinterpret_cast<const uint64_t*>( frames ), size, id );
+        if( id == m_data.callstackPayload.size() )
+        {
+            auto* array = m_slab.Alloc<VarArray<CallstackFrameId>>();
+            new( array ) VarArray<CallstackFrameId>( size, reinterpret_cast<const CallstackFrameId*>( stored ) );
+            m_data.callstackPayload.push_back( array );
+            if( queryFrames ) for( const auto& frame : *array ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
+        }
+        else
+        {
+            if( id == 0 || id >= m_data.callstackPayload.size() || m_data.callstackPayload[id]->size() != size || std::memcmp( m_data.callstackPayload[id]->data(), stored, size * sizeof( CallstackFrameId ) ) != 0 ) throw std::runtime_error( "offline_callstack_id_mismatch" );
+        }
+        return id;
     }
-
-    auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
-    new(arr) VarArray<CallstackFrameId>( sz, data );
-
+    const auto memsize = sizeof( VarArray<CallstackFrameId> ) + size * sizeof( CallstackFrameId );
+    auto* mem = static_cast<char*>( m_slab.AllocRaw( memsize ) );
+    std::memcpy( mem, frames, size * sizeof( CallstackFrameId ) );
+    auto* arr = reinterpret_cast<VarArray<CallstackFrameId>*>( mem + size * sizeof( CallstackFrameId ) );
+    new( arr ) VarArray<CallstackFrameId>( size, reinterpret_cast<CallstackFrameId*>( mem ) );
     uint32_t idx;
     auto it = m_data.callstackMap.find( arr );
     if( it == m_data.callstackMap.end() )
@@ -5667,10 +5885,7 @@ void Worker::AddCallstackPayload( const char* _data, size_t _sz )
         m_data.callstackMap.emplace( arr, idx );
         m_data.callstackPayload.push_back( arr );
 
-        for( auto& frame : *arr )
-        {
-            QueryCallstackFrame( GetCanonicalPointer( frame ) );
-        }
+        if( queryFrames ) for( const auto& frame : *arr ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
     }
     else
     {
@@ -5678,7 +5893,18 @@ void Worker::AddCallstackPayload( const char* _data, size_t _sz )
         m_slab.Unalloc( memsize );
     }
 
-    m_pendingCallstackId = idx;
+    return idx;
+}
+
+void Worker::AddCallstackPayload( const char* _data, size_t _sz )
+{
+    assert( m_pendingCallstackId == 0 );
+    if( !_data || _sz == 0 || _sz % sizeof( uint64_t ) != 0 || _sz / sizeof( uint64_t ) > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+    const auto size = uint16_t( _sz / sizeof( uint64_t ) );
+    std::vector<CallstackFrameId> frames( size );
+    const auto* source = reinterpret_cast<const uint64_t*>( _data );
+    for( uint16_t i = 0; i < size; ++i ) frames[i] = PackPointer( source[i] );
+    m_pendingCallstackId = StoreCallstackFrames( frames.data(), size, true );
 }
 
 void Worker::AddCallstackSampleDictionary( uint32_t stackId, const char* data, size_t sz )
@@ -5700,6 +5926,10 @@ void Worker::AddCallstackSampleDictionary( uint32_t stackId, const char* data, s
 
 void Worker::AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* data, size_t sz )
 {
+    if(m_offlineStorage) {
+        if(!m_offlineStorage->DefineResourceSet(resourceSetId,data,sz))MarkProtocolDisconnect();
+        return;
+    }
     if( resourceSetId == 0 || data == nullptr || sz == 0 ||
         sz % sizeof( JnGpuReferenceSetEntry ) != 0 ||
         sz / sizeof( JnGpuReferenceSetEntry ) > 0xFFFF ||
@@ -5777,52 +6007,23 @@ void Worker::AddCallstackAllocPayload( const char* data )
         stack[i] = id;
     }
 
-    VarArray<CallstackFrameId>* arr;
-    size_t memsize;
+    std::vector<CallstackFrameId> combined;
     if( m_pendingCallstackId != 0 )
     {
         const auto nativeCs = m_data.callstackPayload[m_pendingCallstackId];
         const auto nsz = nativeCs->size();
         const auto tsz = sz + nsz;
-
-        memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-        memcpy( mem, stack, sizeof( CallstackFrameId ) * sz );
-        memcpy( mem + sizeof( CallstackFrameId ) * sz, nativeCs->data(), sizeof( CallstackFrameId ) * nsz );
-
-        arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
+        if( tsz > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+        combined.reserve( tsz );
+        combined.insert( combined.end(), stack, stack + sz );
+        combined.insert( combined.end(), nativeCs->begin(), nativeCs->end() );
     }
     else
     {
-        memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-        memcpy( mem, stack, sizeof( CallstackFrameId ) * sz );
-
-        arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( sz, (CallstackFrameId*)mem );
+        combined.assign( stack, stack + sz );
     }
-
-    uint32_t idx;
-    auto it = m_data.callstackMap.find( arr );
-    if( it == m_data.callstackMap.end() )
-    {
-        idx = m_data.callstackPayload.size();
-        m_data.callstackMap.emplace( arr, idx );
-        m_data.callstackPayload.push_back( arr );
-
-        for( auto& frame : *arr )
-        {
-            QueryCallstackFrame( GetCanonicalPointer( frame ) );
-        }
-    }
-    else
-    {
-        idx = it->second;
-        m_slab.Unalloc( memsize );
-    }
-
-    m_pendingCallstackId = idx;
+    if( combined.empty() ) throw std::runtime_error( "callstack_payload_size" );
+    m_pendingCallstackId = StoreCallstackFrames( combined.data(), uint16_t( combined.size() ), true );
 }
 
 uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
@@ -5832,30 +6033,13 @@ uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
 
     const auto sz1 = cs1.size();
     const auto sz2 = cs2.size();
-    const auto tsz = sz1 + sz2;
-
-    size_t memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
-    auto mem = (char*)m_slab.AllocRaw( memsize );
-    memcpy( mem, cs1.data(), sizeof( CallstackFrameId ) * sz1 );
-    memcpy( mem + sizeof( CallstackFrameId ) * sz1, cs2.data(), sizeof( CallstackFrameId ) * sz2 );
-
-    VarArray<CallstackFrameId>* arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
-    new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
-
-    uint32_t idx;
-    auto it = m_data.callstackMap.find( arr );
-    if( it == m_data.callstackMap.end() )
-    {
-        idx = m_data.callstackPayload.size();
-        m_data.callstackMap.emplace( arr, idx );
-        m_data.callstackPayload.push_back( arr );
-    }
-    else
-    {
-        idx = it->second;
-        m_slab.Unalloc( memsize );
-    }
-    return idx;
+    const auto total = uint32_t( sz1 ) + uint32_t( sz2 );
+    if( total == 0 || total > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+    std::vector<CallstackFrameId> frames;
+    frames.reserve( total );
+    frames.insert( frames.end(), cs1.begin(), cs1.end() );
+    frames.insert( frames.end(), cs2.begin(), cs2.end() );
+    return StoreCallstackFrames( frames.data(), uint16_t( frames.size() ), false );
 }
 
 void Worker::InsertPlot( PlotData* plot, int64_t time, double val )
@@ -6010,19 +6194,40 @@ void Worker::HandlePostponedSamples()
 
 void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<CallstackFrameId>& cs )
 {
+    GetStackWithInlines( ret, cs.empty() ? nullptr : cs.data(), cs.size() );
+}
+
+void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const CallstackFrameId* cs, size_t count )
+{
     ret.clear();
-    int idx = cs.size() - 1;
+    if( !cs || count == 0 ) return;
+    int idx = int( count ) - 1;
     do
     {
         auto& entry = cs[idx];
-        const auto frame = GetCallstackFrame( entry );
-        if( frame )
+        SerializedCallstackSource::FrameView externalFrame;
+        const CallstackFrame* frameData = nullptr;
+        uint8_t frameCount = 0;
+        if( m_externalCallstackSource )
         {
-            uint8_t i = frame->size;
+            if( m_externalCallstackSource->Frame( entry, externalFrame ) )
+            {
+                frameData = externalFrame.frames;
+                frameCount = externalFrame.count;
+            }
+        }
+        else if( const auto* frame = GetCallstackFrame( entry ) )
+        {
+            frameData = frame->data;
+            frameCount = frame->size;
+        }
+        if( frameData && frameCount != 0 )
+        {
+            uint8_t i = frameCount;
             do
             {
                 i--;
-                ret.push_back( InlineStackData { frame->data[i].symAddr, entry, i } );
+                ret.push_back( InlineStackData { frameData[i].symAddr, entry, i } );
             }
             while( i != 0 );
         }
@@ -6036,7 +6241,12 @@ void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<C
 
 int Worker::AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone>* vec, uint64_t t )
 {
-    GetStackWithInlines( m_inlineStack, cs );
+    return AddGhostZone( cs.empty() ? nullptr : cs.data(), cs.size(), vec, t );
+}
+
+int Worker::AddGhostZone( const CallstackFrameId* cs, size_t count, Vector<GhostZone>* vec, uint64_t t )
+{
+    GetStackWithInlines( m_inlineStack, cs, count );
 
     if( !vec->empty() && vec->back().end.Val() > (int64_t)t )
     {
@@ -6058,9 +6268,24 @@ int Worker::AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone
     {
         auto& back = vec->back();
         const auto& backKey = m_data.ghostFrames[back.frame.Val()];
-        const auto backFrame = GetCallstackFrame( backKey.frame );
-        if( !backFrame ) break;
-        const auto& inlineFrame = backFrame->data[backKey.inlineFrame];
+        SerializedCallstackSource::FrameView externalFrame;
+        const CallstackFrame* frameData = nullptr;
+        uint8_t frameCount = 0;
+        if( m_externalCallstackSource )
+        {
+            if( m_externalCallstackSource->Frame( backKey.frame, externalFrame ) )
+            {
+                frameData = externalFrame.frames;
+                frameCount = externalFrame.count;
+            }
+        }
+        else if( const auto* backFrame = GetCallstackFrame( backKey.frame ) )
+        {
+            frameData = backFrame->data;
+            frameCount = backFrame->size;
+        }
+        if( !frameData || backKey.inlineFrame >= frameCount ) break;
+        const auto& inlineFrame = frameData[backKey.inlineFrame];
         if( inlineFrame.symAddr != m_inlineStack[idx].symAddr ) break;
         if( back.end.Val() != refBackTime ) break;
         back.end.SetVal( t + m_samplingPeriod );
@@ -6155,12 +6380,20 @@ uint32_t Worker::GetSecondStringIdx()
 
 StringLocation Worker::StoreString( const char* str, size_t sz )
 {
+    if( m_offlineStorage )
+    {
+        uint32_t id;
+        const auto* value = m_offlineStorage->InternString( str, sz, id );
+        return { value, id };
+    }
     StringLocation ret;
     charutil::StringKey key = { str, sz };
     auto sit = m_data.stringMap.find( key );
     if( sit == m_data.stringMap.end() )
     {
-        auto ptr = m_slab.Alloc<char>( sz+1 );
+        if(m_data.stringData.size()>0xFFFFFFFEull)throw std::out_of_range("string_table_32bit_overflow");
+        if(sz==SIZE_MAX)throw std::out_of_range("string_size_overflow");
+        auto ptr = static_cast<char*>(m_slab.AllocBig(sz+1));
         memcpy( ptr, str, sz );
         ptr[sz] = '\0';
         ret.ptr = ptr;
@@ -6606,7 +6839,7 @@ void Worker::ProcessJnJobSchedule( const QueueJnJobSchedule& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobSchedules.push_back( JnJobScheduleData { time, ev.jobId, ev.packedHandle, m_threadCtx, ev.dependencyCount, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobSchedule, JnJobScheduleData { time, ev.jobId, ev.packedHandle, m_threadCtx, ev.dependencyCount, ev.kind, ev.flags }, data.jobSchedules);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6615,7 +6848,7 @@ void Worker::ProcessJnJobConfig( const QueueJnJobConfig& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobConfigs.push_back( JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.originFrameSequence, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobConfig, JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.originFrameSequence, ev.kind, ev.flags }, data.jobConfigs);
 }
 
 void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
@@ -6623,7 +6856,7 @@ void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobDependencies.push_back( JnJobDependencyData { ev.jobId, ev.prerequisiteJobId, ev.prerequisiteHandle, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobDependency, JnJobDependencyData { ev.jobId, ev.prerequisiteJobId, ev.prerequisiteHandle, ev.flags }, data.jobDependencies);
 }
 
 void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
@@ -6642,7 +6875,8 @@ void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
         thread = ev.arg0;
         m_serialNextCallstack = 0;
     }
-    data.jobStages.push_back( JnJobStageData { time, ev.jobId, thread, spanId, ev.arg0, ev.arg1, ev.stage, ev.flags } );
+    const JnJobStageData row { time, ev.jobId, thread, spanId, ev.arg0, ev.arg1, ev.stage, ev.flags };
+    if(m_offlineStorage)m_offlineStorage->AppendJobStage(row);else data.jobStages.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6652,7 +6886,7 @@ void Worker::ProcessJnGfxDispatch( const QueueJnGfxDispatch& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxDispatches.push_back( JnGfxDispatchData { time, ev.dispatchId, ev.frameIndex, m_threadCtx, ev.expectedJobs, ev.threadingMode, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxDispatch, JnGfxDispatchData { time, ev.dispatchId, ev.frameIndex, m_threadCtx, ev.expectedJobs, ev.threadingMode, ev.flags }, data.gfxDispatches);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6662,7 +6896,7 @@ void Worker::ProcessJnGfxEntity( const QueueJnGfxEntity& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxEntities.push_back( JnGfxEntityData { time, ev.entityId, ev.parentId, m_threadCtx, ev.gpuQueryId, ev.gpuContext, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxEntity, JnGfxEntityData { time, ev.entityId, ev.parentId, m_threadCtx, ev.gpuQueryId, ev.gpuContext, ev.kind, ev.flags }, data.gfxEntities);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6672,7 +6906,7 @@ void Worker::ProcessJnGfxLink( const QueueJnGfxLink& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxLinks.push_back( JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxLink, JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags }, data.gfxLinks);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6682,7 +6916,7 @@ void Worker::ProcessJnFrame( const QueueJnFrame& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.frames.push_back( JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::Frame, JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags }, data.frames);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6692,7 +6926,7 @@ void Worker::ProcessJnIoRequest( const QueueJnIoRequest& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.ioRequests.push_back( JnIoRequestData { time, ev.requestId, ev.resourceId, m_threadCtx, ev.operation, ev.source, ev.priority, ev.subsystem, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoRequest, JnIoRequestData { time, ev.requestId, ev.resourceId, m_threadCtx, ev.operation, ev.source, ev.priority, ev.subsystem, ev.flags }, data.ioRequests);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6701,7 +6935,7 @@ void Worker::ProcessJnIoConfig( const QueueJnIoConfig& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.ioConfigs.push_back( JnIoConfigData { ev.requestId, ev.parentId, ev.requestedBytes, ev.originFrameSequence, ev.parentKind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoConfig, JnIoConfigData { ev.requestId, ev.parentId, ev.requestedBytes, ev.originFrameSequence, ev.parentKind, ev.flags }, data.ioConfigs);
 }
 
 void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
@@ -6719,7 +6953,7 @@ void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
         thread = ev.detail;
         m_serialNextCallstack = 0;
     }
-    data.ioStages.push_back( JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoStage, JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags }, data.ioStages);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6729,8 +6963,9 @@ void Worker::ProcessJnRelation( const QueueJnRelation& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.relations.push_back( JnRelationData { time, ev.sourceId, ev.targetId, m_threadCtx,
-        ev.sourceKind, ev.targetKind, ev.relationNamespace, ev.relation, ev.flags } );
+    const JnRelationData row { time, ev.sourceId, ev.targetId, m_threadCtx,
+        ev.sourceKind, ev.targetKind, ev.relationNamespace, ev.relation, ev.flags };
+    if(m_offlineStorage)m_offlineStorage->AppendRelation(row);else data.relations.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6740,8 +6975,8 @@ void Worker::ProcessJnRuntimeDomainState( const QueueJnRuntimeDomainState& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.runtimeDomainStates.push_back( JnRuntimeDomainStateData { time, ev.generation, ev.requestedFrame,
-        m_threadCtx, ev.domain, ev.requestedMode, ev.effectiveMode, ev.reason, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::RuntimeDomainState, JnRuntimeDomainStateData { time, ev.generation, ev.requestedFrame,
+        m_threadCtx, ev.domain, ev.requestedMode, ev.effectiveMode, ev.reason, ev.flags }, data.runtimeDomainStates);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6751,8 +6986,8 @@ void Worker::ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gpuReferencePasses.push_back( JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
-        m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GpuReferencePass, JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
+        m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags }, data.gpuReferencePasses);
     if( ev.passId != 0 ) m_jnGpuReferencePassTimes[ev.passId] = time;
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
@@ -6763,13 +6998,21 @@ void Worker::ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gpuReferenceUses.push_back( JnGpuReferenceUseData { time, ev.passId, ev.resourceId,
-        m_threadCtx, ev.usageMask, 0, ev.flags, 1 } );
+    const JnGpuReferenceUseData row { time, ev.passId, ev.resourceId,m_threadCtx, ev.usageMask, 0, ev.flags, 1 };
+    if(m_offlineStorage)m_offlineStorage->AppendReferenceUse(row);else data.gpuReferenceUses.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
 void Worker::ProcessJnGpuReferenceSetUse( const QueueJnGpuReferenceSetUse& ev )
 {
+    if(m_offlineStorage) {
+        const auto pass=m_jnGpuReferencePassTimes.find(ev.passId);
+        if(ev.encoding!=2 || pass==m_jnGpuReferencePassTimes.end() ||
+            !m_offlineStorage->AppendReferenceSet(ev.resourceSetId,ev.entryCount,pass->second,ev.passId,m_threadCtx,ev.flags,ev.encoding)) {
+            MarkProtocolDisconnect();return;
+        }
+        m_data.jnTrace.present=true;m_data.jnTrace.schemaVersion=JnTraceSchemaVersion;return;
+    }
     const auto found = m_jnGpuResourceSets.find( ev.resourceSetId );
     const auto passTime = m_jnGpuReferencePassTimes.find( ev.passId );
     if( ev.encoding != 2 || found == m_jnGpuResourceSets.end() || passTime == m_jnGpuReferencePassTimes.end() ||
@@ -6825,8 +7068,8 @@ void Worker::ProcessJnScriptFrame( const QueueJnScriptFrame& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.scriptFrames.push_back( JnScriptFrameData { ev.function, ev.file, m_threadCtx,
-        ev.frameId, ev.line, ev.runtime, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::ScriptFrame, JnScriptFrameData { ev.function, ev.file, m_threadCtx,
+        ev.frameId, ev.line, ev.runtime, ev.flags }, data.scriptFrames);
 }
 
 void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
@@ -6836,8 +7079,8 @@ void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.scriptStacks.push_back( JnScriptStackData { time, ev.primaryId, ev.secondaryId, m_threadCtx,
-        ev.value, ev.runtime, ev.flags, ev.kind } );
+    AppendOfflineRecord(OfflineAppendDomain::ScriptStack, JnScriptStackData { time, ev.primaryId, ev.secondaryId, m_threadCtx,
+        ev.value, ev.runtime, ev.flags, ev.kind }, data.scriptStacks);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6860,8 +7103,8 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.callsites.push_back( JnCallsiteData { uint64_t( ev.thread ), ev.callsiteId, callstack,
-        sourceLocation, ev.domain, ev.provenance, ev.flags, ev.unavailableReason } );
+    AppendOfflineRecord(OfflineAppendDomain::Callsite, JnCallsiteData { uint64_t( ev.thread ), ev.callsiteId, callstack,
+        sourceLocation, ev.domain, ev.provenance, ev.flags, ev.unavailableReason }, data.callsites);
     m_jnCallsiteCallstacks[ev.callsiteId] = callstack;
 
     const auto cpuPending = m_jnPendingCpuCallsites.find( ev.callsiteId );
@@ -6871,11 +7114,24 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
         {
             for( auto* zone : cpuPending->second )
             {
-                auto& extra = RequestZoneExtra( *zone );
+                UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
                 extra.callstack.SetVal( callstack );
+    });
             }
         }
         m_jnPendingCpuCallsites.erase( cpuPending );
+    }
+    const auto offlineCpuPending = m_jnPendingOfflineCpuCallsites.find( ev.callsiteId );
+    if( offlineCpuPending != m_jnPendingOfflineCpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( const auto zone : offlineCpuPending->second )
+            {
+                UpdateOfflineCpuZoneExtra( zone, [&]( ZoneExtra& extra ) { extra.callstack.SetVal( callstack ); } );
+            }
+        }
+        m_jnPendingOfflineCpuCallsites.erase( offlineCpuPending );
     }
 
     const auto gpuPending = m_jnPendingGpuCallsites.find( ev.callsiteId );
@@ -6886,6 +7142,21 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
             for( auto* zone : gpuPending->second ) zone->callstack.SetVal( callstack );
         }
         m_jnPendingGpuCallsites.erase( gpuPending );
+    }
+    const auto offlineGpuPending = m_jnPendingOfflineGpuCallsites.find( ev.callsiteId );
+    if( offlineGpuPending != m_jnPendingOfflineGpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( const auto zone : offlineGpuPending->second )
+            {
+                OfflineGpuZone row;
+                m_offlineStorage->ReadGpuZone( zone, row );
+                row.callstack = callstack;
+                m_offlineStorage->PutGpuZone( zone, row );
+            }
+        }
+        m_jnPendingOfflineGpuCallsites.erase( offlineGpuPending );
     }
 }
 
@@ -6903,11 +7174,12 @@ void Worker::InvalidateJnGpuCatalog( uint64_t generation, uint8_t state )
     const auto runtime = m_jnGpuCatalogRuntime.find( generation );
     if( runtime != m_jnGpuCatalogRuntime.end() ) runtime->second.valid = false;
     if( runtime != m_jnGpuCatalogRuntime.end() &&
-        runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
     {
-        auto& value = data.gpuCatalogGenerations[runtime->second.dataIndex];
+        auto value = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
         value.valid = 0;
         value.state = state;
+        PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,value,data.gpuCatalogGenerations);
     }
 }
 
@@ -6943,17 +7215,17 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
             data.present = true;
             data.schemaVersion = JnTraceSchemaVersion;
             data.gpuCatalogPresent = true;
-            if( data.gpuCatalogGenerations.empty() ) data.gpuCatalogValid = true;
+            if( CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations)==0 ) data.gpuCatalogValid = true;
             data.gpuCatalogValid = data.gpuCatalogValid && value.valid;
             data.gpuCatalogSchemaVersion = JnGpuCatalogSchemaVersion;
             data.gpuDetailedEvidenceSchemaVersion = JnGpuDetailedEvidenceSchemaVersion;
             const auto time = TscTime( ev.time );
-            runtime->second.dataIndex = data.gpuCatalogGenerations.size();
-            data.gpuCatalogGenerations.push_back( JnGpuCatalogGenerationData {
+            runtime->second.dataIndex = CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);
+            AppendCatalogValue(OfflineCatalogDomain::CatalogGeneration, JnGpuCatalogGenerationData {
                 ev.generation, ev.value, 0, time, 0, ev.sequence, 0, 0, 0, 0,
-                ev.state, ev.flags, 1, 0, uint8_t( value.valid ? 1 : 0 ) } );
-            data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
-                ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
+                ev.state, ev.flags, 1, 0, uint8_t( value.valid ? 1 : 0 ) },data.gpuCatalogGenerations);
+            AppendCatalogValue(OfflineCatalogDomain::CatalogControl, JnGpuCatalogControlData { time, ev.generation,
+                ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags },data.gpuCatalogControls);
             if( m_data.lastTime < time ) m_data.lastTime = time;
         }
         return true;
@@ -6979,11 +7251,11 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
     {
         auto& data = m_data.jnTrace;
         const auto time = TscTime( ev.time );
-        data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
-            ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
-        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        AppendCatalogValue(OfflineCatalogDomain::CatalogControl, JnGpuCatalogControlData { time, ev.generation,
+            ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags },data.gpuCatalogControls);
+        if( runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
         {
-            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            auto generation = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
             generation.lastSequence = ev.sequence;
             generation.state = ev.state;
             generation.flags |= ev.flags;
@@ -7000,6 +7272,7 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
                     generation.unresolvedCount = resolved.totalUnresolved;
                 }
             }
+            PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,generation,data.gpuCatalogGenerations);
         }
         data.gpuCatalogValid = data.gpuCatalogValid && runtime->second.valid;
         if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -7113,53 +7386,37 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
         switch( JnGpuCatalogBatchKind( ev.kind ) )
         {
         case JnGpuCatalogBatchKind::Resource:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogResources, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogResources.size(); ++i )
-                data.gpuCatalogResources[i].time = TscTime( data.gpuCatalogResources[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogResource,records,ev.recordCount,data.gpuCatalogResources);
             break;
         case JnGpuCatalogBatchKind::Allocation:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogAllocations, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogAllocations.size(); ++i )
-                data.gpuCatalogAllocations[i].time = TscTime( data.gpuCatalogAllocations[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogAllocation,records,ev.recordCount,data.gpuCatalogAllocations);
             break;
         case JnGpuCatalogBatchKind::View:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogViews, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogViews.size(); ++i )
-                data.gpuCatalogViews[i].time = TscTime( data.gpuCatalogViews[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogView,records,ev.recordCount,data.gpuCatalogViews);
             break;
         case JnGpuCatalogBatchKind::Logical:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogLogicals, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogLogicals.size(); ++i )
-                data.gpuCatalogLogicals[i].time = TscTime( data.gpuCatalogLogicals[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogLogical,records,ev.recordCount,data.gpuCatalogLogicals);
             break;
         case JnGpuCatalogBatchKind::Part:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogParts, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogParts.size(); ++i )
-                data.gpuCatalogParts[i].time = TscTime( data.gpuCatalogParts[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogPart,records,ev.recordCount,data.gpuCatalogParts);
             break;
         case JnGpuCatalogBatchKind::Relation:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogRelations, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogRelations.size(); ++i )
-                data.gpuCatalogRelations[i].time = TscTime( data.gpuCatalogRelations[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogRelation,records,ev.recordCount,data.gpuCatalogRelations);
             break;
         case JnGpuCatalogBatchKind::VirtualGeometry:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogVg, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogVg.size(); ++i )
-                data.gpuCatalogVg[i].time = TscTime( data.gpuCatalogVg[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogVg,records,ev.recordCount,data.gpuCatalogVg);
             break;
         case JnGpuCatalogBatchKind::RangeSet:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuRangeSets, records, ev.recordCount );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogRangeSet,records,ev.recordCount,data.gpuRangeSets);
             break;
         case JnGpuCatalogBatchKind::DetailedEvidence:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuDetailedEvidence, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuDetailedEvidence.size(); ++i )
-                data.gpuDetailedEvidence[i].time = TscTime( data.gpuDetailedEvidence[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogDetailedEvidence,records,ev.recordCount,data.gpuDetailedEvidence);
             break;
         case JnGpuCatalogBatchKind::String:
         {
-            firstRecordIndex = data.gpuCatalogStrings.size();
+            firstRecordIndex = CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings);
             std::vector<JnGpuCatalogStringData> parsed;
-            parsed.reserve( ev.recordCount );
+            if(!m_offlineStorage)parsed.reserve( ev.recordCount );
             const auto* cursor = records;
             const auto* end = records + recordPayloadBytes;
             for( uint32_t i = 0; i < ev.recordCount; ++i )
@@ -7179,7 +7436,7 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
                     error = "GPU Catalog string batch has an invalid id, length, or hash.";
                     return false;
                 }
-                parsed.push_back( JnGpuCatalogStringData { ev.generation, header,
+                if(!m_offlineStorage)parsed.push_back( JnGpuCatalogStringData { ev.generation, header,
                     std::string( reinterpret_cast<const char*>( cursor ), header.byteLength ) } );
                 cursor += header.byteLength;
             }
@@ -7188,22 +7445,26 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
                 error = "GPU Catalog string batch has trailing bytes.";
                 return false;
             }
-            data.gpuCatalogStrings.insert( data.gpuCatalogStrings.end(),
+            if(m_offlineStorage){
+                cursor=records;
+                for(uint32_t i=0;i<ev.recordCount;++i){OfflineCatalogString row;row.generation=ev.generation;std::memcpy(&row.header,cursor,sizeof(row.header));cursor+=sizeof(row.header);std::memcpy(row.bytes.data(),cursor,row.header.byteLength);cursor+=row.header.byteLength;m_offlineStorage->AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+            }else data.gpuCatalogStrings.insert( data.gpuCatalogStrings.end(),
                 std::make_move_iterator( parsed.begin() ), std::make_move_iterator( parsed.end() ) );
             break;
         }
         }
 
-        data.gpuCatalogBatches.push_back( JnGpuCatalogBatchData { ev.generation, envelope.checksum, 0,
+        AppendCatalogValue(OfflineCatalogDomain::CatalogBatch, JnGpuCatalogBatchData { ev.generation, envelope.checksum, 0,
             firstRecordIndex, ev.sequence, ev.recordCount, envelope.payloadBytes,
-            ev.kind, ev.encoding, ev.flags, 1 } );
-        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+            ev.kind, ev.encoding, ev.flags, 1 },data.gpuCatalogBatches);
+        if( runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
         {
-            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            auto generation = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
             generation.lastSequence = ev.sequence;
             ++generation.batchCount;
             generation.recordCount += ev.recordCount;
             generation.payloadBytes += envelope.payloadBytes;
+            PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,generation,data.gpuCatalogGenerations);
         }
     }
 
@@ -7251,30 +7512,33 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     };
     unordered_flat_map<uint64_t, std::vector<ResourceInterval>> intervals;
     unordered_flat_map<uint64_t, size_t> openIntervals;
+    struct IntervalScope {WorkerOfflineStorage* storage;~IntervalScope(){if(storage)storage->EndResourceIntervals();}} intervalScope{m_offlineStorage};
+    if(m_offlineStorage)m_offlineStorage->BeginResourceIntervals();
     auto& data = m_data.jnTrace;
-    stats.fullResolveInputUnits += uint64_t( data.gpuCatalogBatches.size() ) * 7 +
-        data.gpuCatalogResources.size() + data.gpuCatalogViews.size() +
-        data.gpuCatalogLogicals.size() + data.gpuCatalogVg.size() +
-        data.gpuRangeSets.size() + data.gpuCatalogRelations.size() +
-        data.gpuDetailedEvidence.size() + data.gpuReferencePasses.size() +
-        data.gfxEntities.size() + data.gfxLinks.size();
-
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
-        for( const auto& batch : data.gpuCatalogBatches )
+        if(m_offlineStorage&&m_offlineStorage->VisitCatalogDirectoryBatches(generation,uint8_t(kind),[&](uint64_t index){
+            ++stats.batchRowsExamined;++stats.fullResolveInputUnits;const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);m_offlineStorage->Check();
+            if(batch.generation!=generation||batch.kind!=uint8_t(kind))throw std::runtime_error("catalog_batch_directory_mismatch");if(batch.valid!=0){++stats.batchRowsMatched;stats.catalogRowsProcessed+=batch.recordCount;stats.fullResolveInputUnits+=batch.recordCount;fn(size_t(batch.firstRecordIndex),size_t(batch.recordCount));}
+        }))return;
+        for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);++index)
         {
+            ++stats.batchRowsExamined;++stats.fullResolveInputUnits;const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
+            if(m_offlineStorage)m_offlineStorage->Check();
             if( batch.generation != generation || batch.kind != uint8_t( kind ) || batch.valid == 0 ) continue;
+            ++stats.batchRowsMatched;stats.catalogRowsProcessed+=batch.recordCount;stats.fullResolveInputUnits+=batch.recordCount;
             fn( size_t( batch.firstRecordIndex ), size_t( batch.recordCount ) );
         }
     };
 
+    const auto reportResolveProgress=[&](const char* phase,uint64_t completed,uint64_t total,uint64_t& published,bool force=false){if(m_offlineStorage&&(force||completed-published>=65536)){published=completed;m_offlineStorage->ReportFinalizeProgress(phase,completed,total,"rows");}};
+    const auto resourceTotal=CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);uint64_t resourceDone=0,resourcePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_resources",0,resourceTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Resource, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogResources.size() || count > data.gpuCatalogResources.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            const auto& record = data.gpuCatalogResources[i];
-            if( record.pointerToken == 0 || record.resourceId == 0 ) continue;
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources,first,count,[&](const auto& record){
+            if(m_offlineStorage){m_offlineStorage->AddResourceInterval(record);return;}
+            if( record.pointerToken == 0 || record.resourceId == 0 ) return;
             const auto operation = JnGpuCatalogRecordOperation( record.operation );
             const auto key = record.pointerToken;
             if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
@@ -7302,11 +7566,13 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     std::numeric_limits<int64_t>::max() } );
                 openIntervals[key] = values.size() - 1;
             }
-        }
+        });resourceDone+=count;reportResolveProgress("catalog_resolve_resources",resourceDone,resourceTotal,resourcePublished);
     } );
+    reportResolveProgress("catalog_resolve_resources",resourceDone,resourceTotal,resourcePublished,true);
 
     auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
     {
+        if(m_offlineStorage)return m_offlineStorage->ResolveResource(pointerToken,time);
         if( pointerToken == 0 ) return 0;
         const auto found = intervals.find( pointerToken );
         if( found == intervals.end() ) return 0;
@@ -7321,6 +7587,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     };
 
     unordered_flat_map<uint64_t, int64_t> passTimes;
+    if(m_offlineStorage)m_offlineStorage->SealResourceIntervals();
+    if(!m_offlineStorage){
     for( const auto& pass : data.gpuReferencePasses )
         if( pass.passId != 0 ) passTimes[pass.passId] = pass.time;
     // N27 RangeSet records are keyed by the authoritative explicit GPU pass
@@ -7344,14 +7612,14 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
             passTimes[link.sourceId] = link.time;
     }
 
+    }
     uint64_t unresolved = 0;
     uint64_t coreUnresolved = 0;
+    const auto viewTotal=CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews);uint64_t viewDone=0,viewPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_views",0,viewTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogViews.size() || count > data.gpuCatalogViews.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogViews[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7359,14 +7627,14 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);viewDone+=count;reportResolveProgress("catalog_resolve_views",viewDone,viewTotal,viewPublished);
     } );
+    reportResolveProgress("catalog_resolve_views",viewDone,viewTotal,viewPublished,true);
+    const auto logicalTotal=CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals);uint64_t logicalDone=0,logicalPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_logicals",0,logicalTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Logical, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogLogicals.size() || count > data.gpuCatalogLogicals.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogLogicals[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7374,14 +7642,14 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);logicalDone+=count;reportResolveProgress("catalog_resolve_logicals",logicalDone,logicalTotal,logicalPublished);
     } );
+    reportResolveProgress("catalog_resolve_logicals",logicalDone,logicalTotal,logicalPublished,true);
+    const auto vgTotal=CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg);uint64_t vgDone=0,vgPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_virtual_geometry",0,vgTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::VirtualGeometry, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogVg.size() || count > data.gpuCatalogVg.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogVg[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7389,32 +7657,34 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);vgDone+=count;reportResolveProgress("catalog_resolve_virtual_geometry",vgDone,vgTotal,vgPublished);
     } );
+    reportResolveProgress("catalog_resolve_virtual_geometry",vgDone,vgTotal,vgPublished,true);
+    const auto rangeTotal=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);uint64_t rangeDone=0,rangePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_range_sets",0,rangeTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::RangeSet, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuRangeSets.size() || count > data.gpuRangeSets.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuRangeSets[i];
-            auto time = std::numeric_limits<int64_t>::min();
-            const auto pass = passTimes.find( record.passInstanceId );
-            if( pass != passTimes.end() ) time = pass->second;
-            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, time );
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets,first,count,[&](auto& record){
+            if( record.resourceId == 0 && record.pointerToken != 0 ){
+                auto time = std::numeric_limits<int64_t>::min();
+                if(m_offlineStorage){if(!m_offlinePassTimesPrepared){m_offlineStorage->PreparePassTimes();m_offlinePassTimesPrepared=true;m_offlineStorage->ReportFinalizeProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,"rows");}const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
+                else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
+                record.resourceId = resolve( record.pointerToken, time );
+            }
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
                 ++unresolved;
                 record.exactness = uint8_t( JnGpuCatalogExactness::Unknown );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);rangeDone+=count;reportResolveProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,rangePublished);
     } );
+    reportResolveProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,rangePublished,true);
+    const auto relationTotal=CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations);uint64_t relationDone=0,relationPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_relations",0,relationTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Relation, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogRelations.size() || count > data.gpuCatalogRelations.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogRelations[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations,first,count,[&](auto& record){
             if( ( record.flags & 1 ) != 0 )
             {
                 const auto resolved = resolve( record.sourceId, record.time );
@@ -7447,14 +7717,14 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     record.flags &= ~uint8_t( 2 );
                 }
             }
-        }
+        },true);relationDone+=count;reportResolveProgress("catalog_resolve_relations",relationDone,relationTotal,relationPublished);
     } );
+    reportResolveProgress("catalog_resolve_relations",relationDone,relationTotal,relationPublished,true);
+    const auto evidenceTotal=CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence);uint64_t evidenceDone=0,evidencePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_detailed_evidence",0,evidenceTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::DetailedEvidence, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuDetailedEvidence.size() || count > data.gpuDetailedEvidence.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuDetailedEvidence[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence,first,count,[&](auto& record){
             if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer ) ) != 0 )
             {
                 const auto resolved = resolve( record.sourceId, record.time );
@@ -7477,6 +7747,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
             }
             auto anonymizeDescriptor = [&]( uint64_t token )
             {
+                if(m_offlineStorage)return m_offlineStorage->AnonymizeDescriptor(token);
                 const auto found = m_jnGpuCatalogDescriptorHeaps.find( token );
                 if( found != m_jnGpuCatalogDescriptorHeaps.end() ) return found->second;
                 const auto id = 0xD000000000000000ull | m_jnGpuCatalogNextDescriptorHeapId++;
@@ -7493,8 +7764,9 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.targetId = anonymizeDescriptor( record.targetId );
                 record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer );
             }
-        }
+        },true);evidenceDone+=count;reportResolveProgress("catalog_resolve_detailed_evidence",evidenceDone,evidenceTotal,evidencePublished);
     } );
+    reportResolveProgress("catalog_resolve_detailed_evidence",evidenceDone,evidenceTotal,evidencePublished,true);
 
     stats.fullResolveNanoseconds += uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - resolveStart ).count() );
@@ -7506,9 +7778,20 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
 void Worker::FinalizeJnGpuCatalogForSave()
 {
     auto& data = m_data.jnTrace;
-    if( !data.gpuCatalogPresent ) return;
-    for( auto& generation : data.gpuCatalogGenerations )
+    if(m_offlineStorage&&m_offlineCatalogFinalized)return;
+    const auto seal=[&]{if(m_offlineStorage){m_offlineStorage->SealCatalog({uint64_t(data.gpuCatalogPresent),uint64_t(data.gpuCatalogValid),data.gpuCatalogSchemaVersion,data.gpuDetailedEvidenceSchemaVersion});m_offlineCatalogFinalized=true;}};
+    if( !data.gpuCatalogPresent ){seal();return;}
+    if(m_offlineStorage){
+        const auto generations=CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations),batches=CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches),total=generations+batches;m_offlineStorage->ReportFinalizeProgress("catalog_directory",0,total,"rows");m_offlineStorage->BeginCatalogBatchDirectory();
+        for(uint64_t index=0;index<generations;++index){m_offlineStorage->AddCatalogDirectoryGeneration(CatalogValue(OfflineCatalogDomain::CatalogGeneration,index,data.gpuCatalogGenerations).generation);if((index&0xFFF)==0||index+1==generations)m_offlineStorage->ReportFinalizeProgress("catalog_directory",index+1,total,"rows");}
+        for(uint64_t index=0;index<batches;++index){const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);m_offlineStorage->AddCatalogDirectoryBatch(index,batch.generation,batch.kind);if((index&0xFFF)==0||index+1==batches)m_offlineStorage->ReportFinalizeProgress("catalog_directory",generations+index+1,total,"rows");}
+        m_offlineStorage->SealCatalogBatchDirectory();
+    }
+    const auto generationCount=CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve",0,generationCount,"generations");
+    for(uint64_t index=0;index<generationCount;++index)
     {
+        auto generation=CatalogValue(OfflineCatalogDomain::CatalogGeneration,index,data.gpuCatalogGenerations);
+        if(m_offlineStorage)m_offlineStorage->Check();
         const auto resolved = ResolveJnGpuCatalogGeneration( generation.generation,
             JnGpuCatalogResolveReason::FinalizeSave );
         generation.unresolvedCount = resolved.totalUnresolved;
@@ -7518,46 +7801,50 @@ void Worker::FinalizeJnGpuCatalogForSave()
             generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
             data.gpuCatalogValid = false;
         }
+        PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,index,generation,data.gpuCatalogGenerations);
+        if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve",index+1,generationCount,"generations");
     }
 
-    auto checksumRecords = []( const auto& values, uint64_t first, uint32_t count ) -> uint64_t
+    auto checksumRecords = [&]( OfflineCatalogDomain domain,auto& values, uint64_t first, uint32_t count ) -> uint64_t
     {
         using Value = typename std::decay_t<decltype( values )>::value_type;
-        if( first > values.size() || count > values.size() - size_t( first ) ) return 0;
-        return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+        const auto size=CatalogSize(domain,values);if(first>size||count>size-first)return 0;
+        if(!m_offlineStorage)return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+        auto hash=JnGpuCatalogChecksum64(nullptr,0);ForCatalogRows(domain,values,first,count,[&](const auto& row){hash=JnGpuCatalogChecksum64Update(hash,&row,sizeof(row));});return hash;
     };
-    for( auto& batch : data.gpuCatalogBatches )
+    const auto batchCount=CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_checksum",0,batchCount,"batches");
+    for(uint64_t index=0;index<batchCount;++index)
     {
+        auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
+        if(m_offlineStorage)m_offlineStorage->Check();
         switch( JnGpuCatalogBatchKind( batch.kind ) )
         {
-        case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords( data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Allocation: batch.storedChecksum = checksumRecords( data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::View: batch.storedChecksum = checksumRecords( data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Logical: batch.storedChecksum = checksumRecords( data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Part: batch.storedChecksum = checksumRecords( data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Relation: batch.storedChecksum = checksumRecords( data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::VirtualGeometry: batch.storedChecksum = checksumRecords( data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::RangeSet: batch.storedChecksum = checksumRecords( data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::DetailedEvidence: batch.storedChecksum = checksumRecords( data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogResource, data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Allocation: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogAllocation, data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::View: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogView, data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Logical: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogLogical, data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Part: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogPart, data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Relation: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogRelation, data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::VirtualGeometry: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogVg, data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::RangeSet: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogRangeSet, data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::DetailedEvidence: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogDetailedEvidence, data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
         case JnGpuCatalogBatchKind::String:
         {
-            if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
-                batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) )
+            const auto strings=CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings);
+            if( batch.firstRecordIndex > strings || batch.recordCount > strings-batch.firstRecordIndex )
             {
                 batch.valid = 0;
                 data.gpuCatalogValid = false;
                 break;
             }
-            std::vector<uint8_t> bytes;
+            auto hash=JnGpuCatalogChecksum64(nullptr,0);
             for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
             {
-                const auto& value = data.gpuCatalogStrings[i];
-                const auto offset = bytes.size();
-                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
-                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
-                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+                const auto value = CatalogStringValue(i);
+                hash=JnGpuCatalogChecksum64Update(hash,&value.header,sizeof(value.header));
+                hash=JnGpuCatalogChecksum64Update(hash,value.value.data(),value.value.size());
             }
-            batch.storedChecksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            batch.storedChecksum = hash;
             break;
         }
         }
@@ -7566,7 +7853,71 @@ void Worker::FinalizeJnGpuCatalogForSave()
             batch.valid = 0;
             data.gpuCatalogValid = false;
         }
+        PutCatalogValue(OfflineCatalogDomain::CatalogBatch,index,batch,data.gpuCatalogBatches);
+        if(m_offlineStorage&&((index&0xFFF)==0||index+1==batchCount))m_offlineStorage->ReportFinalizeProgress("catalog_checksum",index+1,batchCount,"batches");
     }
+    seal();
+}
+
+uint64_t Worker::PersistedStringToken( const char* value ) const
+{
+    if( !m_offlineStorage ) return uint64_t( value );
+    if( !value ) throw std::runtime_error( "offline_string_null_token" );
+    uint32_t id;
+    if( !m_offlineStorage->FindString( value, strlen( value ), id ) ) throw std::runtime_error( "offline_string_token_missing" );
+    return uint64_t( id ) + 1;
+}
+
+void Worker::FinalizeOfflineStrings()
+{
+    if( !m_offlineStorage ) return;
+    const auto intern = [&]( const char* value ) {
+        if( !value ) throw std::runtime_error( "offline_string_null_reference" );
+        return StoreString( value, strlen( value ) ).ptr;
+    };
+    for( auto& value : m_data.strings ) value.second = intern( value.second );
+    for( auto& value : m_data.threadNames ) value.second = intern( value.second );
+    for( auto& value : m_data.externalNames )
+    {
+        value.second.first = intern( value.second.first );
+        value.second.second = intern( value.second.second );
+    }
+}
+
+bool Worker::HasExternalName( uint64_t id ) const
+{
+    return m_externalStringSource ? m_externalStringSource->HasPointer( 2, id ) :
+        m_data.externalNames.find( id ) != m_data.externalNames.end();
+}
+
+const char* Worker::TryGetLocalThreadName( uint64_t id ) const
+{
+    if( m_externalStringSource ) return m_externalStringSource->PointerString( 1, id );
+    const auto it = m_data.threadNames.find( id );
+    return it == m_data.threadNames.end() ? nullptr : it->second;
+}
+
+void Worker::VisitThreadNameIds( const std::function<void( uint64_t )>& visitor ) const
+{
+    if( m_externalStringSource ) { m_externalStringSource->VisitPointerIds( 1, visitor ); return; }
+    for( const auto& [id, name] : m_data.threadNames ) visitor( id );
+}
+
+void Worker::VisitExternalNameIds( const std::function<void( uint64_t )>& visitor ) const
+{
+    if( m_externalStringSource ) { m_externalStringSource->VisitPointerIds( 2, visitor ); return; }
+    for( const auto& [id, names] : m_data.externalNames ) visitor( id );
+}
+template<class T> static void WriteCatalogVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineCatalogDomain domain)
+{
+    if(!storage){WriteJnVector(file,memory);return;}const auto count=storage->CatalogCount(domain);file.Write(&count,sizeof(count));
+    if(OfflineCatalogInfo(domain).width!=sizeof(T))throw std::runtime_error("catalog_write_width");
+    storage->VisitCatalog(domain,[&](const void* rows,uint64_t n){file.Write(rows,size_t(n)*sizeof(T));});
+}
+static void WriteCatalogStrings(FileWrite& file,const std::vector<JnGpuCatalogStringData>& memory,WorkerOfflineStorage* storage)
+{
+    if(!storage){WriteJnGpuCatalogStrings(file,memory);return;}const auto count=storage->CatalogCount(OfflineCatalogDomain::CatalogString);file.Write(&count,sizeof(count));
+    storage->VisitCatalog(OfflineCatalogDomain::CatalogString,[&](const void* bytes,uint64_t n){for(uint64_t i=0;i<n;++i){OfflineCatalogString row;std::memcpy(&row,static_cast<const unsigned char*>(bytes)+i*sizeof(row),sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("catalog_write_string");file.Write(&row.generation,sizeof(row.generation));file.Write(&row.header,sizeof(row.header));file.Write(row.bytes.data(),row.header.byteLength);}});
 }
 
 static tracy_force_inline int64_t RefTime( int64_t& reference, int64_t delta )
@@ -7638,8 +7989,9 @@ void Worker::ProcessZoneBeginCallstack( const QueueZoneBegin& ev )
     auto td = GetCurrentThreadData();
     auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.callstack.SetVal( it->second );
+    });
     it->second = 0;
 }
 
@@ -7652,13 +8004,23 @@ void Worker::ProcessJnZoneBeginCallsite( const QueueJnZoneBeginCallsite& ev )
     {
         if( found->second != 0 )
         {
-            auto& extra = RequestZoneExtra( *zone );
+            UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
             extra.callstack.SetVal( found->second );
+    });
         }
     }
     else
     {
-        m_jnPendingCpuCallsites[ev.callsiteId].push_back( zone );
+        if( m_offlineStorage )
+        {
+            const auto id = m_offlineCpuZoneIds.find( zone );
+            if( id == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_callsite" );
+            m_jnPendingOfflineCpuCallsites[ev.callsiteId].push_back( id->second );
+        }
+        else
+        {
+            m_jnPendingCpuCallsites[ev.callsiteId].push_back( zone );
+        }
     }
 }
 
@@ -7675,8 +8037,9 @@ void Worker::ProcessZoneBeginAllocSrcLocCallstack( const QueueZoneBeginLean& ev 
     auto td = GetCurrentThreadData();
     auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.callstack.SetVal( it->second );
+    });
     it->second = 0;
 }
 
@@ -7705,9 +8068,21 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
     zone->SetEnd( timeEnd );
     assert( timeEnd >= zone->Start() );
 
+    if( m_offlineStorage )
+    {
+        const auto found = m_offlineCpuZoneIds.find( zone );
+        if( found == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_end" );
+        OfflineCpuZone row;
+        m_offlineStorage->ReadCpuZone( found->second, row );
+        if( row.start != zone->Start() || row.sourceLocation != zone->SrcLoc() ) throw std::runtime_error( "offline_cpu_zone_identity" );
+        row.end = timeEnd;
+        row.extra = zone->extra;
+        m_offlineStorage->PutCpuZone( found->second, row );
+    }
+
     if( m_data.lastTime < timeEnd ) m_data.lastTime = timeEnd;
 
-    if( zone->HasChildren() )
+    if( !m_offlineStorage && zone->HasChildren() )
     {
         auto& childVec = m_data.zoneChildren[zone->Child()];
         const auto sz = childVec.size();
@@ -7784,6 +8159,13 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
 #else
     CountZoneStatistics( zone );
 #endif
+    if( m_offlineStorage )
+    {
+        m_offlineCpuZoneIds.erase( zone );
+#ifdef TRACY_NO_STATISTICS
+        m_zoneEventPool.push_back( zone );
+#endif
+    }
 }
 
 void Worker::ZoneStackFailure( uint64_t thread, const ZoneEvent* ev )
@@ -8077,7 +8459,7 @@ void Worker::ProcessZoneText()
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     if( !extra.text.Active() )
     {
         extra.text = StringIdx( idx );
@@ -8101,6 +8483,7 @@ void Worker::ProcessZoneText()
         memcpy( buf+len0+1, str1, len1 );
         extra.text = StringIdx( StoreString( buf, bsz ).idx );
     }
+    });
 }
 
 void Worker::ProcessZoneName()
@@ -8121,8 +8504,9 @@ void Worker::ProcessZoneName()
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.name = StringIdx( GetSingleStringIdx() );
+    });
 }
 
 void Worker::ProcessZoneColor( const QueueZoneColor& ev )
@@ -8143,9 +8527,10 @@ void Worker::ProcessZoneColor( const QueueZoneColor& ev )
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     const uint32_t color = ( ev.b << 16 ) | ( ev.g << 8 ) | ev.r;
     extra.color = color;
+    });
 }
 
 void Worker::ProcessZoneValue( const QueueZoneValue& ev )
@@ -8169,7 +8554,7 @@ void Worker::ProcessZoneValue( const QueueZoneValue& ev )
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     if( !extra.text.Active() )
     {
         extra.text = StringIdx( StoreString( tmp, tsz ).idx );
@@ -8191,6 +8576,7 @@ void Worker::ProcessZoneValue( const QueueZoneValue& ev )
         memcpy( buf+len0+1, tmp, tsz );
         extra.text = StringIdx( StoreString( buf, bsz ).idx );
     }
+    });
 }
 
 void Worker::ProcessLockAnnounce( const QueueLockAnnounce& ev )
@@ -8541,6 +8927,34 @@ void Worker::ProcessGpuNewContext( const QueueGpuNewContext& ev )
     m_gpuCtxMap[ev.context] = gpu;
 }
 
+GpuEvent* Worker::AllocGpuEvent()
+{
+#ifdef TRACY_NO_STATISTICS
+    if( !m_gpuEventPool.empty() ) return m_gpuEventPool.back_and_pop();
+#endif
+    return m_slab.Alloc<GpuEvent>();
+}
+
+void Worker::SyncOfflineGpuZone( GpuEvent* zone )
+{
+    if( !m_offlineStorage ) return;
+    const auto found = m_offlineGpuZoneIds.find( zone );
+    if( found == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_identity" );
+    const auto callstack = zone->callstack.Val();
+    if( callstack < 0 ) throw std::runtime_error( "offline_gpu_zone_callstack" );
+    const OfflineGpuZone row { zone->CpuStart(), zone->CpuEnd(), zone->GpuStart(), zone->GpuEnd(), zone->SrcLoc(), uint32_t( callstack ), zone->Thread(), zone->query_id };
+    m_offlineStorage->PutGpuZone( found->second, row );
+}
+
+void Worker::ReleaseOfflineGpuZone( GpuEvent* zone )
+{
+    if( !m_offlineStorage ) return;
+    if( m_offlineGpuZoneIds.erase( zone ) != 1 ) throw std::runtime_error( "offline_gpu_zone_release" );
+#ifdef TRACY_NO_STATISTICS
+    m_gpuEventPool.push_back( zone );
+#endif
+}
+
 void Worker::ProcessGpuZoneBeginImpl( GpuEvent* zone, const QueueGpuZoneBegin& ev, bool serial )
 {
     CheckSourceLocation( ev.srcloc );
@@ -8603,20 +9017,39 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
     {
         td = ctx->threadData.emplace( ztid, GpuCtxThreadData {} ).first;
     }
-    auto timeline = &td->second.timeline;
     auto& stack = td->second.stack;
-    if( !stack.empty() )
+    if( m_offlineStorage )
     {
-        auto back = stack.back();
-        if( back->Child() < 0 )
+        auto& roots = m_offlineGpuThreadRoots[ctx];
+        auto root = roots.find( ztid );
+        if( root == roots.end() ) root = roots.emplace( ztid, m_offlineStorage->CreateGpuThread() ).first;
+        uint64_t parent = root->second;
+        if( !stack.empty() )
         {
-            back->SetChild( int32_t( m_data.gpuChildren.size() ) );
-            m_data.gpuChildren.push_back( Vector<short_ptr<GpuEvent>>() );
+            GpuEvent* parentZone = stack.back();
+            const auto found = m_offlineGpuZoneIds.find( parentZone );
+            if( found == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_parent" );
+            parent = found->second;
         }
-        timeline = &m_data.gpuChildren[back->Child()];
+        const OfflineGpuZone row { zone->CpuStart(), zone->CpuEnd(), zone->GpuStart(), zone->GpuEnd(), zone->SrcLoc(), 0, zone->Thread(), zone->query_id };
+        const auto id = m_offlineStorage->AppendGpuZone( parent, row );
+        m_offlineGpuZoneIds.emplace( zone, id );
     }
-
-    timeline->push_back( zone );
+    else
+    {
+        auto timeline = &td->second.timeline;
+        if( !stack.empty() )
+        {
+            auto back = stack.back();
+            if( back->Child() < 0 )
+            {
+                back->SetChild( int32_t( m_data.gpuChildren.size() ) );
+                m_data.gpuChildren.push_back( Vector<short_ptr<GpuEvent>>() );
+            }
+            timeline = &m_data.gpuChildren[back->Child()];
+        }
+        timeline->push_back( zone );
+    }
     stack.push_back( zone );
 
     assert( !ctx->query[ev.queryId] );
@@ -8625,13 +9058,13 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
 
 void Worker::ProcessGpuZoneBegin( const QueueGpuZoneBegin& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, serial );
 }
 
 void Worker::ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, serial );
     if( serial )
     {
@@ -8647,17 +9080,18 @@ void Worker::ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool ser
         zone->callstack.SetVal( it->second );
         it->second = 0;
     }
+    SyncOfflineGpuZone( zone );
 }
 
 void Worker::ProcessGpuZoneBeginAllocSrcLoc( const QueueGpuZoneBeginLean& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginAllocSrcLocImpl( zone, ev, serial );
 }
 
 void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLean& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginAllocSrcLocImpl( zone, ev, serial );
     if( serial )
     {
@@ -8673,6 +9107,7 @@ void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLea
         zone->callstack.SetVal( it->second );
         it->second = 0;
     }
+    SyncOfflineGpuZone( zone );
 }
 
 void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
@@ -8710,6 +9145,7 @@ void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
     }
     const auto time = TscTime( cpuTime );
     zone->SetCpuEnd( time );
+    SyncOfflineGpuZone( zone );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -8777,6 +9213,7 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
     {
         zone->SetGpuStart( gpuTime );
         ctx->count++;
+        SyncOfflineGpuZone( zone );
     }
     else
     {
@@ -8799,6 +9236,8 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
 #else
         CountZoneStatistics( zone );
 #endif
+        SyncOfflineGpuZone( zone );
+        ReleaseOfflineGpuZone( zone );
     }
     if( m_data.lastTime < gpuTime ) m_data.lastTime = gpuTime;
 }
@@ -9134,7 +9573,13 @@ void Worker::ProcessCallstack()
 void Worker::ProcessCallstackSampleInsertSample( const SampleData& sd, ThreadData& td )
 {
     const auto t = sd.time.Val();
-    if( td.samples.empty() )
+    if( m_offlineStorage )
+    {
+        const auto last=m_offlineStorage->LastSampleTime(td.id,0);
+        if(t!=0&&last&&*last>=t){m_inconsistentSamples=true;uint64_t id;uint32_t callstack;if(m_offlineStorage->FindSample(td.id,0,t,id,callstack)){const auto merged=MergeCallstacks(callstack,sd.callstack.Val());m_offlineStorage->PutSample(id,t,merged);return;}}
+        m_offlineStorage->AppendSample(td.id,0,t,sd.callstack.Val());
+    }
+    else if( td.samples.empty() )
     {
         td.samples.push_back( sd );
     }
@@ -9380,7 +9825,7 @@ void Worker::ProcessCallstackSampleContextSwitch( const QueueCallstackSample& ev
 
     ProcessCallstackSampleInsertSample( sd, td );
 
-    td.ctxSwitchSamples.push_back( sd );
+    if(m_offlineStorage)m_offlineStorage->AppendSample(td.id,1,t,callstack);else td.ctxSwitchSamples.push_back( sd );
 }
 
 void Worker::ProcessCallstackSampleRef( const QueueCallstackSampleRef& ev, bool contextSwitch )
@@ -10672,6 +11117,7 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
     {
         refTime += tstart;
         zone->SetStartSrcLoc( refTime, srcloc );
+        if(m_serializedZoneSink)m_serializedZoneSink->ValidateZoneExtraIndex(extra);
         zone->extra = extra;
         refTime = ReadTimelineHaveSize( f, zone, refTime, childIdx, childSz );
         f.Read5( tend, srcloc, tstart, extra, childSz );
@@ -10685,6 +11131,7 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
 
     refTime += tstart;
     zone->SetStartSrcLoc( refTime, srcloc );
+    if(m_serializedZoneSink)m_serializedZoneSink->ValidateZoneExtraIndex(extra);
     zone->extra = extra;
     refTime = ReadTimelineHaveSize( f, zone, refTime, childIdx, childSz );
     f.Read( tend );
@@ -10795,16 +11242,29 @@ void Worker::SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t
 
 void Worker::ProcessJnGpuZoneBeginCallsite( const QueueJnGpuZoneBeginCallsite& ev )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, true );
     const auto found = m_jnCallsiteCallstacks.find( ev.callsiteId );
     if( found != m_jnCallsiteCallstacks.end() )
     {
-        if( found->second != 0 ) zone->callstack.SetVal( found->second );
+        if( found->second != 0 )
+        {
+            zone->callstack.SetVal( found->second );
+            SyncOfflineGpuZone( zone );
+        }
     }
     else
     {
-        m_jnPendingGpuCallsites[ev.callsiteId].push_back( zone );
+        if( m_offlineStorage )
+        {
+            const auto id = m_offlineGpuZoneIds.find( zone );
+            if( id == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_callsite" );
+            m_jnPendingOfflineGpuCallsites[ev.callsiteId].push_back( id->second );
+        }
+        else
+        {
+            m_jnPendingGpuCallsites[ev.callsiteId].push_back( zone );
+        }
     }
 }
 
@@ -10858,9 +11318,11 @@ static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec 
 
 void Worker::Write( FileWrite& f, bool fiDict )
 {
+    if(m_offlineStorage)m_offlineStorage->Check();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_metadata",0,1,"steps");
     DoPostponedWorkAll();
 
-    f.Write( FileHeader, sizeof( FileHeader ) );
+    f.Write( FileHeader.data(), FileHeader.size() );
 
     f.Write( &m_resolution, sizeof( m_resolution ) );
     f.Write( &m_timerMul, sizeof( m_timerMul ) );
@@ -10945,43 +11407,61 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = m_data.stringData.size();
+    // Query compact payloads bind their dictionary through the index manifest.
+    // Persist a reserved marker plus empty pointer tables so a normal Tracy
+    // open rejects the missing dictionary instead of treating it as empty.
+    sz = m_externalStringSource ? std::numeric_limits<uint64_t>::max() : StringTableCount();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_strings",0,sz,"strings");
     f.Write( &sz, sizeof( sz ) );
-    for( auto& v : m_data.stringData )
+    if( m_offlineStorage )
     {
-        uint64_t ptr = (uint64_t)v;
-        f.Write( &ptr, sizeof( ptr ) );
-        sz = strlen( v );
-        f.Write( &sz, sizeof( sz ) );
-        f.Write( v, sz );
+        uint64_t stringDone=0;
+        m_offlineStorage->VisitStrings( [&]( uint32_t id, const char* value, uint64_t bytes ) {
+            const uint64_t token = uint64_t( id ) + 1;
+            f.Write( &token, sizeof( token ) );
+            f.Write( &bytes, sizeof( bytes ) );
+            f.Write( value, size_t( bytes ) );
+            if((++stringDone&0xFFFF)==0||stringDone==sz)m_offlineStorage->ReportFinalizeProgress("write_strings",stringDone,sz,"strings");
+        } );
+    }
+    else
+    {
+        for( auto& v : m_data.stringData )
+        {
+            uint64_t ptr = (uint64_t)v;
+            f.Write( &ptr, sizeof( ptr ) );
+            sz = strlen( v );
+            f.Write( &sz, sizeof( sz ) );
+            f.Write( v, sz );
+        }
     }
 
-    sz = m_data.strings.size();
+    sz = m_externalStringSource ? 0 : m_data.strings.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.strings )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second;
+        uint64_t ptr = PersistedStringToken( v.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 
-    sz = m_data.threadNames.size();
+    sz = m_externalStringSource ? 0 : m_data.threadNames.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.threadNames )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second;
+        uint64_t ptr = PersistedStringToken( v.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 
-    sz = m_data.externalNames.size();
+    sz = m_externalStringSource ? 0 : m_data.externalNames.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.externalNames )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second.first;
+        uint64_t ptr = PersistedStringToken( v.second.first );
         f.Write( &ptr, sizeof( ptr ) );
-        ptr = (uint64_t)v.second.second;
+        ptr = PersistedStringToken( v.second.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 
@@ -11096,18 +11576,21 @@ void Worker::Write( FileWrite& f, bool fiDict )
             f.Write( &v->callstack, sizeof( v->callstack ) );
         }
     }
-
-    sz = m_data.zoneExtra.size();
+    sz = m_offlineStorage ? m_offlineStorage->ZoneExtraCount() : m_data.zoneExtra.size();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_zone_extras",0,sz,"rows");
     f.Write( &sz, sizeof( sz ) );
-    f.Write( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+    if(m_offlineStorage){uint64_t done=0;m_offlineStorage->VisitZoneExtras([&](const void* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(ZoneExtra));done+=n;if((done&0xFFFF)==0||done==sz)m_offlineStorage->ReportFinalizeProgress("write_zone_extras",done,sz,"rows");});}
+    else f.Write( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
 
     sz = 0;
     for( auto& v : m_data.threads ) sz += v->count;
     f.Write( &sz, sizeof( sz ) );
-    sz = m_data.zoneChildren.size();
+    sz = m_data.zoneChildren.size() + ( m_offlineStorage ? m_offlineStorage->CpuBranchCount() : 0 );
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.threads.size();
     f.Write( &sz, sizeof( sz ) );
+    uint64_t offlineContextSampleTotal=0,offlineMainSampleTotal=0,offlineContextSampleDone=0,offlineMainSampleDone=0;std::unique_ptr<BufferedFileWrite> offlineBuffered;
+    if(m_offlineStorage){offlineBuffered=std::make_unique<BufferedFileWrite>(f);for(const auto* thread:m_data.threads){offlineContextSampleTotal+=m_offlineStorage->SampleCount(thread->id,1);offlineMainSampleTotal+=m_offlineStorage->SampleCount(thread->id,0);}m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",0,m_offlineWriteCpuTotal,"zones");}
     for( auto& thread : m_data.threads )
     {
         int64_t refTime = 0;
@@ -11116,7 +11599,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->kernelSampleCnt, sizeof( thread->kernelSampleCnt ) );
         f.Write( &thread->isFiber, sizeof( thread->isFiber ) );
         f.Write( &thread->groupHint, sizeof( thread->groupHint ) );
-        WriteTimeline( f, thread->timeline, refTime );
+        m_offlineWriteCpuThread=thread->id;
+        const auto offlineRoot = m_offlineCpuThreadRoots.find( thread->id );
+        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ){m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");WriteOfflineCpuTimeline( *offlineBuffered, offlineRoot->second, refTime, thread->id );offlineBuffered->Flush();}
+        else WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
         for( auto& v : thread->messages )
@@ -11124,15 +11610,16 @@ void Worker::Write( FileWrite& f, bool fiDict )
             auto ptr = uint64_t( (MessageData*)v );
             f.Write( &ptr, sizeof( ptr ) );
         }
-        sz = thread->ctxSwitchSamples.size();
+        sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,1):thread->ctxSwitchSamples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        for( auto& v : thread->ctxSwitchSamples )
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(*offlineBuffered,refTime,time);Int24 value;value.SetVal(callstack);offlineBuffered->Write(&value,sizeof(value));if((++offlineContextSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");});offlineBuffered->Flush();}
+        else for( auto& v : thread->ctxSwitchSamples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
             f.Write( &v.callstack, sizeof( v.callstack ) );
         }
-        if( m_inconsistentSamples )
+        if( m_inconsistentSamples && !m_offlineStorage )
         {
 #ifdef __EMSCRIPTEN__
             pdqsort_branchless( thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
@@ -11140,27 +11627,32 @@ void Worker::Write( FileWrite& f, bool fiDict )
             ppqsort::sort( ppqsort::execution::par, thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
 #endif
         }
-        sz = thread->samples.size();
+        sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,0):thread->samples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        for( auto& v : thread->samples )
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(*offlineBuffered,refTime,time);Int24 value;value.SetVal(callstack);offlineBuffered->Write(&value,sizeof(value));if((++offlineMainSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");});offlineBuffered->Flush();}
+        else for( auto& v : thread->samples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
             f.Write( &v.callstack, sizeof( v.callstack ) );
         }
     }
+    if(m_offlineStorage){m_offlineStorage->EndCpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuTotal,m_offlineWriteCpuTotal,"zones");m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");}
 
     // GpuCtxData::count only advances after a timestamp query has returned. The
     // serialized timelines also contain zones that began before capture ended but
     // whose query result was still pending, so use the actual created-zone count.
     sz = m_data.gpuCnt;
     f.Write( &sz, sizeof( sz ) );
-    sz = m_data.gpuChildren.size();
+    sz = m_data.gpuChildren.size() + ( m_offlineStorage ? m_offlineStorage->GpuBranchCount() : 0 );
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.gpuData.size();
     f.Write( &sz, sizeof( sz ) );
+    if(m_offlineStorage){m_offlineWriteGpuDone=0;m_offlineWriteGpuTotal=m_data.gpuCnt;m_offlineStorage->BeginGpuZoneWrite(m_offlineWriteGpuTotal);m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",0,m_offlineWriteGpuTotal,"zones");}
+    uint32_t gpuContextIndex=0;
     for( auto& ctx : m_data.gpuData )
     {
+        m_offlineWriteGpuContext=gpuContextIndex;
         f.Write( &ctx->thread, sizeof( ctx->thread ) );
         uint8_t calibration = ctx->hasCalibration;
         f.Write( &calibration, sizeof( calibration ) );
@@ -11184,7 +11676,14 @@ void Worker::Write( FileWrite& f, bool fiDict )
             int64_t refGpuTime = 0;
             uint64_t tid = td.first;
             f.Write( &tid, sizeof( tid ) );
-            WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
+            const auto roots = m_offlineGpuThreadRoots.find( ctx );
+            if( m_offlineStorage && roots != m_offlineGpuThreadRoots.end() )
+            {
+                const auto offlineRoot = roots->second.find( tid );
+                if( offlineRoot != roots->second.end() ) WriteOfflineGpuTimeline( f, offlineRoot->second, refTime, refGpuTime, gpuContextIndex );
+                else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
+            }
+            else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
         }
 
         sz = ctx->notes.size();
@@ -11200,7 +11699,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
                 f.Write( &note.second, sizeof( note.second ) );
             }
         }
+        ++gpuContextIndex;
     }
+    if(m_offlineStorage){m_offlineStorage->EndGpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuTotal,m_offlineWriteGpuTotal,"zones");}
 
     sz = m_data.plots.Data().size();
     for( auto& plot : m_data.plots.Data() ) { if( plot->type == PlotType::Memory ) sz--; }
@@ -11274,9 +11775,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &memdata.name, sizeof( memdata.name ) );
     }
 
-    sz = m_data.callstackPayload.size() - 1;
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_callstacks",0,m_offlineStorage->CallstackCount()-1,"callstacks");
+    sz = m_externalCallstackSource ? std::numeric_limits<uint64_t>::max() : m_data.callstackPayload.size() - 1;
     f.Write( &sz, sizeof( sz ) );
-    for( size_t i=1; i<=sz; i++ )
+    if(!m_externalCallstackSource) for( size_t i=1; i<=sz; i++ )
     {
         auto& cs = m_data.callstackPayload[i];
         uint16_t csz = cs->size();
@@ -11284,10 +11786,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( cs->data(), sizeof( CallstackFrameId ) * csz );
     }
 
-    sz = m_data.callstackFrameMap.size() - m_pendingCallstackFrames;
+    sz = m_externalCallstackSource ? std::numeric_limits<uint64_t>::max() : m_data.callstackFrameMap.size() - m_pendingCallstackFrames;
     f.Write( &sz, sizeof( sz ) );
     uint64_t check = 0;
-    for( auto& frame : m_data.callstackFrameMap )
+    if(!m_externalCallstackSource) for( auto& frame : m_data.callstackFrameMap )
     {
         if( !frame.second ) continue;
         f.Write( &frame.first, sizeof( CallstackFrameId ) );
@@ -11296,7 +11798,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( frame.second->data, sizeof( CallstackFrame ) * frame.second->size );
         check++;
     }
-    assert( check == sz );
+    assert( m_externalCallstackSource || check == sz );
 
     sz = m_data.appInfo.size();
     f.Write( &sz, sizeof( sz ) );
@@ -11499,6 +12001,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( v.second.data, v.second.len );
     }
 
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_jn_domains",0,1,"steps");
     FinalizeJnGpuCatalogForSave();
     f.Write( &JnTraceSectionMagic, sizeof( JnTraceSectionMagic ) );
     const uint16_t schemaVersion = JnTraceSchemaVersion;
@@ -11506,44 +12009,55 @@ void Worker::Write( FileWrite& f, bool fiDict )
     const uint8_t jnPresent = m_data.jnTrace.present;
     f.Write( &jnPresent, sizeof( jnPresent ) );
     WriteJnVector( f, m_data.jnTrace.jobTypes );
-    WriteJnVector( f, m_data.jnTrace.jobSchedules );
-    WriteJnVector( f, m_data.jnTrace.jobConfigs );
-    WriteJnVector( f, m_data.jnTrace.jobDependencies );
-    WriteJnVector( f, m_data.jnTrace.jobStages );
-    WriteJnVector( f, m_data.jnTrace.gfxDispatches );
-    WriteJnVector( f, m_data.jnTrace.gfxEntities );
-    WriteJnVector( f, m_data.jnTrace.gfxLinks );
-    WriteJnVector( f, m_data.jnTrace.frames );
-    WriteJnVector( f, m_data.jnTrace.ioRequests );
-    WriteJnVector( f, m_data.jnTrace.ioConfigs );
-    WriteJnVector( f, m_data.jnTrace.ioStages );
-    WriteJnVector( f, m_data.jnTrace.relations );
-    WriteJnVector( f, m_data.jnTrace.runtimeDomainStates );
-    WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
-    WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
+    WriteOfflineJnVector(f,m_data.jnTrace.jobSchedules,m_offlineStorage,OfflineAppendDomain::JobSchedule);
+    WriteOfflineJnVector(f,m_data.jnTrace.jobConfigs,m_offlineStorage,OfflineAppendDomain::JobConfig);
+    WriteOfflineJnVector(f,m_data.jnTrace.jobDependencies,m_offlineStorage,OfflineAppendDomain::JobDependency);
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->JobStageCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitJobStages([&](const JnJobStageData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.jobStages );
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxDispatches,m_offlineStorage,OfflineAppendDomain::GfxDispatch);
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxEntities,m_offlineStorage,OfflineAppendDomain::GfxEntity);
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxLinks,m_offlineStorage,OfflineAppendDomain::GfxLink);
+    WriteOfflineJnVector(f,m_data.jnTrace.frames,m_offlineStorage,OfflineAppendDomain::Frame);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioRequests,m_offlineStorage,OfflineAppendDomain::IoRequest);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioConfigs,m_offlineStorage,OfflineAppendDomain::IoConfig);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioStages,m_offlineStorage,OfflineAppendDomain::IoStage);
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->RelationCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitRelations([&](const JnRelationData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.relations );
+    WriteOfflineJnVector(f,m_data.jnTrace.runtimeDomainStates,m_offlineStorage,OfflineAppendDomain::RuntimeDomainState);
+    WriteOfflineJnVector(f,m_data.jnTrace.gpuReferencePasses,m_offlineStorage,OfflineAppendDomain::GpuReferencePass);
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->ReferenceUseCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitReferenceUses([&](const JnGpuReferenceUseData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
     WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
-    WriteJnVector( f, m_data.jnTrace.scriptFrames );
-    WriteJnVector( f, m_data.jnTrace.scriptStacks );
-    WriteJnVector( f, m_data.jnTrace.callsites );
+    WriteOfflineJnVector(f,m_data.jnTrace.scriptFrames,m_offlineStorage,OfflineAppendDomain::ScriptFrame);
+    WriteOfflineJnVector(f,m_data.jnTrace.scriptStacks,m_offlineStorage,OfflineAppendDomain::ScriptStack);
+    WriteOfflineJnVector(f,m_data.jnTrace.callsites,m_offlineStorage,OfflineAppendDomain::Callsite);
     const uint8_t gpuCatalogPresent = m_data.jnTrace.gpuCatalogPresent ? 1 : 0;
     const uint8_t gpuCatalogValid = m_data.jnTrace.gpuCatalogValid ? 1 : 0;
     f.Write( &gpuCatalogPresent, sizeof( gpuCatalogPresent ) );
     f.Write( &gpuCatalogValid, sizeof( gpuCatalogValid ) );
     f.Write( &m_data.jnTrace.gpuCatalogSchemaVersion, sizeof( m_data.jnTrace.gpuCatalogSchemaVersion ) );
     f.Write( &m_data.jnTrace.gpuDetailedEvidenceSchemaVersion, sizeof( m_data.jnTrace.gpuDetailedEvidenceSchemaVersion ) );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogControls );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogBatches );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogGenerations );
-    WriteJnGpuCatalogStrings( f, m_data.jnTrace.gpuCatalogStrings );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogResources );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogAllocations );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogViews );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogLogicals );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogParts );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogRelations );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogVg );
-    WriteJnVector( f, m_data.jnTrace.gpuRangeSets );
-    WriteJnVector( f, m_data.jnTrace.gpuDetailedEvidence );
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_catalog",0,OfflineCatalogDomainCount,"domains");
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogControls,m_offlineStorage,OfflineCatalogDomain::CatalogControl);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogBatches,m_offlineStorage,OfflineCatalogDomain::CatalogBatch);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogGenerations,m_offlineStorage,OfflineCatalogDomain::CatalogGeneration);
+    WriteCatalogStrings(f,m_data.jnTrace.gpuCatalogStrings,m_offlineStorage);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogResources,m_offlineStorage,OfflineCatalogDomain::CatalogResource);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogAllocations,m_offlineStorage,OfflineCatalogDomain::CatalogAllocation);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogViews,m_offlineStorage,OfflineCatalogDomain::CatalogView);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogLogicals,m_offlineStorage,OfflineCatalogDomain::CatalogLogical);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogParts,m_offlineStorage,OfflineCatalogDomain::CatalogPart);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogRelations,m_offlineStorage,OfflineCatalogDomain::CatalogRelation);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogVg,m_offlineStorage,OfflineCatalogDomain::CatalogVg);
+    WriteCatalogVector(f,m_data.jnTrace.gpuRangeSets,m_offlineStorage,OfflineCatalogDomain::CatalogRangeSet);
+    WriteCatalogVector(f,m_data.jnTrace.gpuDetailedEvidence,m_offlineStorage,OfflineCatalogDomain::CatalogDetailedEvidence);
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_catalog",OfflineCatalogDomainCount,OfflineCatalogDomainCount,"domains");
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )
@@ -11560,6 +12074,28 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& ve
     }
 }
 
+void Worker::WriteOfflineCpuTimeline( BufferedFileWrite& f, uint64_t root, int64_t& refTime, uint64_t thread )
+{
+    const auto size = m_offlineStorage->CpuRootChildren( root );
+    f.Write( &size, sizeof( size ) );
+    m_offlineStorage->VisitCpuZones( root, [&]( uint64_t, const OfflineCpuZone& zone, uint32_t children, bool begin ) {
+        if( begin )
+        {
+            m_offlineStorage->RecordCpuZoneWriteBegin(thread,zone.start,zone.sourceLocation,zone.extra,children);
+            f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
+            WriteTimeOffset( f, refTime, zone.start );
+            f.Write( &zone.extra, sizeof( zone.extra ) );
+            f.Write( &children, sizeof( children ) );
+            if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");
+        }
+        else
+        {
+            m_offlineStorage->RecordCpuZoneWriteEnd(zone.end);
+            WriteTimeOffset( f, refTime, zone.end );
+        }
+    } );
+}
+
 template<typename Adapter, typename V>
 void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
 {
@@ -11567,6 +12103,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
     for( auto& val : vec )
     {
         auto& v = a(val);
+        if(m_offlineStorage){const uint32_t children=v.HasChildren()?uint32_t(GetZoneChildren(v.Child()).size()):0;m_offlineStorage->RecordCpuZoneWriteBegin(m_offlineWriteCpuThread,v.Start(),v.SrcLoc(),v.extra,children);if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");}
         int16_t srcloc = v.SrcLoc();
         f.Write( &srcloc, sizeof( srcloc ) );
         int64_t start = v.Start();
@@ -11582,6 +12119,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
             WriteTimeline( f, GetZoneChildren( v.Child() ), refTime );
         }
         WriteTimeOffset( f, refTime, v.End() );
+        if(m_offlineStorage)m_offlineStorage->RecordCpuZoneWriteEnd(v.End());
     }
 }
 
@@ -11599,6 +12137,35 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec
     }
 }
 
+void Worker::WriteOfflineGpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, int64_t& refGpuTime, uint32_t context )
+{
+    const uint64_t size = m_offlineStorage->GpuRootChildren( root );
+    f.Write( &size, sizeof( size ) );
+    m_offlineStorage->VisitGpuZones( root, [&]( uint64_t, const OfflineGpuZone& zone, uint32_t children, bool begin ) {
+        if( begin )
+        {
+            m_offlineStorage->RecordGpuZoneWriteBegin(context,DecompressThread(zone.thread),zone.cpuStart,zone.gpuStart,zone.sourceLocation,zone.callstack,children);
+            WriteTimeOffset( f, refTime, zone.cpuStart );
+            WriteTimeOffset( f, refGpuTime, zone.gpuStart );
+            f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
+            Int24 callstack;
+            callstack.SetVal( zone.callstack );
+            f.Write( &callstack, sizeof( callstack ) );
+            f.Write( &zone.thread, sizeof( zone.thread ) );
+            const uint64_t childCount = children;
+            f.Write( &childCount, sizeof( childCount ) );
+            if((++m_offlineWriteGpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuDone,m_offlineWriteGpuTotal,"zones");
+        }
+        else
+        {
+            m_offlineStorage->RecordGpuZoneWriteEnd(zone.cpuEnd,zone.gpuEnd,zone.queryId);
+            WriteTimeOffset( f, refTime, zone.cpuEnd );
+            WriteTimeOffset( f, refGpuTime, zone.gpuEnd );
+            f.Write( &zone.queryId, sizeof( zone.queryId ) );
+        }
+    } );
+}
+
 template<typename Adapter, typename V>
 void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime, int64_t& refGpuTime )
 {
@@ -11606,6 +12173,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime, in
     for( auto& val : vec )
     {
         auto& v = a(val);
+        if(m_offlineStorage){const uint64_t children=v.Child()<0?0:GetGpuChildren(v.Child()).size();m_offlineStorage->RecordGpuZoneWriteBegin(m_offlineWriteGpuContext,DecompressThread(v.Thread()),v.CpuStart(),v.GpuStart(),v.SrcLoc(),v.callstack.Val(),children);if((++m_offlineWriteGpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuDone,m_offlineWriteGpuTotal,"zones");}
         WriteTimeOffset( f, refTime, v.CpuStart() );
         WriteTimeOffset( f, refGpuTime, v.GpuStart() );
         const int16_t srcloc = v.SrcLoc();
@@ -11627,6 +12195,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime, in
         WriteTimeOffset( f, refTime, v.CpuEnd() );
         WriteTimeOffset( f, refGpuTime, v.GpuEnd() );
         f.Write( &v.query_id, sizeof( v.query_id ) );
+        if(m_offlineStorage)m_offlineStorage->RecordGpuZoneWriteEnd(v.CpuEnd(),v.GpuEnd(),v.query_id);
     }
 }
 
@@ -11673,9 +12242,10 @@ const Worker::CpuThreadTopology* Worker::GetThreadTopology( uint32_t cpuThread )
 ZoneExtra& Worker::AllocZoneExtra( ZoneEvent& ev )
 {
     assert( ev.extra == 0 );
-    ev.extra = uint32_t( m_data.zoneExtra.size() );
+    const auto index = m_data.zoneExtra.size();
     auto& extra = m_data.zoneExtra.push_next();
     memset( (char*)&extra, 0, sizeof( extra ) );
+    ev.extra = uint32_t(index);
     return extra;
 }
 

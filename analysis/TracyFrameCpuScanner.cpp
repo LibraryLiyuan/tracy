@@ -1,4 +1,5 @@
 #include "TracyFrameCpuScanner.hpp"
+#include <chrono>
 
 #include "TracyHash.hpp"
 #include "TracyAnalysisDictionary.hpp"
@@ -48,8 +49,6 @@ struct WorkingZone
 {
     AnalysisWorkspaceReservation workspace;
     std::string ref;
-    std::string exactSignature;
-    std::string logicalSignature;
     uint32_t exactSignatureOrdinal = 0;
     uint32_t logicalSignatureOrdinal = 0;
     std::string threadRef;
@@ -73,6 +72,88 @@ struct WorkingStack
         if( capacity > UINT64_MAX / ( 2 * sizeof( WorkingZone ) ) ) throw std::runtime_error( "analysis_workspace_budget" );
         workspace.Resize( uint64_t( capacity ) * 2 * sizeof( WorkingZone ) );
         zones.reserve( capacity );
+    }
+};
+
+struct SignatureCacheKey
+{
+    uint32_t parentOrdinalPlusOne = 0;
+    std::string threadIdentity;
+    std::string sourceLocationRef;
+    std::string name;
+    std::string function;
+    std::string file;
+    uint32_t line = 0;
+};
+
+struct SignatureCacheView
+{
+    uint32_t parentOrdinalPlusOne = 0;
+    std::string_view threadIdentity;
+    std::string_view sourceLocationRef;
+    std::string_view name;
+    std::string_view function;
+    std::string_view file;
+    uint32_t line = 0;
+};
+
+struct SignatureCacheHash
+{
+    using is_transparent = void;
+
+    size_t operator()( const SignatureCacheKey& key ) const noexcept
+    {
+        return Hash( { key.parentOrdinalPlusOne, key.threadIdentity, key.sourceLocationRef,
+            key.name, key.function, key.file, key.line } );
+    }
+
+    size_t operator()( const SignatureCacheView& key ) const noexcept { return Hash( key ); }
+
+private:
+    static void Combine( size_t& seed, size_t value ) noexcept
+    {
+        seed ^= value + size_t( 0x9e3779b9 ) + ( seed << 6 ) + ( seed >> 2 );
+    }
+
+    static size_t Hash( const SignatureCacheView& key ) noexcept
+    {
+        size_t seed = std::hash<uint32_t> {}( key.parentOrdinalPlusOne );
+        Combine( seed, std::hash<std::string_view> {}( key.threadIdentity ) );
+        Combine( seed, std::hash<std::string_view> {}( key.sourceLocationRef ) );
+        Combine( seed, std::hash<std::string_view> {}( key.name ) );
+        Combine( seed, std::hash<std::string_view> {}( key.function ) );
+        Combine( seed, std::hash<std::string_view> {}( key.file ) );
+        Combine( seed, std::hash<uint32_t> {}( key.line ) );
+        return seed;
+    }
+};
+
+struct SignatureCacheEqual
+{
+    using is_transparent = void;
+
+    bool operator()( const SignatureCacheKey& lhs,
+        const SignatureCacheKey& rhs ) const noexcept
+    {
+        return Equal( lhs, { rhs.parentOrdinalPlusOne, rhs.threadIdentity,
+            rhs.sourceLocationRef, rhs.name, rhs.function, rhs.file, rhs.line } );
+    }
+
+    bool operator()( const SignatureCacheKey& lhs,
+        const SignatureCacheView& rhs ) const noexcept { return Equal( lhs, rhs ); }
+
+    bool operator()( const SignatureCacheView& lhs,
+        const SignatureCacheKey& rhs ) const noexcept { return Equal( rhs, lhs ); }
+
+private:
+    static bool Equal( const SignatureCacheKey& lhs,
+        const SignatureCacheView& rhs ) noexcept
+    {
+        return lhs.parentOrdinalPlusOne == rhs.parentOrdinalPlusOne &&
+            lhs.threadIdentity == rhs.threadIdentity &&
+            lhs.sourceLocationRef == rhs.sourceLocationRef &&
+            lhs.name == rhs.name && lhs.function == rhs.function &&
+            lhs.file == rhs.file && lhs.line == rhs.line;
     }
 };
 
@@ -147,7 +228,8 @@ void HashString( Sha256Builder& hash, std::string_view value )
 }
 
 std::string SignatureId( bool logical, std::string_view threadIdentity,
-    std::string_view parent, const CpuZoneDto& zone, bool stableSite = false )
+    std::string_view parent, const CpuZoneDto& zone, std::string_view signatureName,
+    bool stableSite = false )
 {
     Sha256Builder hash;
     const uint8_t kind = logical ? 1 : 0;
@@ -157,7 +239,7 @@ std::string SignatureId( bool logical, std::string_view threadIdentity,
     HashString( hash, zone.sourceLocationRef );
     if( !stableSite || zone.sourceLocationRef.empty() )
     {
-        HashString( hash, zone.name );
+        HashString( hash, signatureName );
         HashString( hash, zone.function );
         HashString( hash, zone.file );
         hash.Update( &zone.line, sizeof( zone.line ) );
@@ -225,14 +307,21 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanView( const CpuSignatureFrameViewSi
 CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSink* sink,
     const CpuSignatureFrameViewSink* viewSink, const CpuFrameScanOptions& options ) const
 {
+    const auto scanStarted=std::chrono::steady_clock::now();
+    const bool timed=options.collectTiming || bool(options.timingProgress);
+    const auto elapsedNs=[](auto started) -> uint64_t {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-started).count());
+    };
     const auto checkCancelled = [&] { CheckCancelled( options.cancelled ); };
     checkCancelled();
     if( !options.includeExactSignatures && !options.includeLogicalSignatures )
         throw BoundedScanError( "frame_cpu_scan_signature_mode_empty" );
     CpuFrameScanResult result( options.workspace );
+    uint64_t emittedRunCount = 0;
     AnalysisWorkspaceReservation metadataWorkspace( options.workspace ), frameWorkspace( options.workspace ),
         signatureWorkspace( options.workspace ), presenceWorkspace( options.workspace ), runWorkspace( options.workspace );
-    BoundedTraceScanner scanner( m_source );
+    BoundedTraceScanner scanner( m_source, options.canonicalizeLogicalDynamicNames );
 
     const auto sourceFrameSets = m_source.GetFrameSets();
     checkCancelled();
@@ -269,6 +358,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         if( options.completeFrameSink ) options.completeFrameSink(
             frame.frameSetRef, frame.index, frame.beginNs, frame.endNs );
         checkCancelled();
+        if( completeFrames.size() == completeFrames.capacity() )
+        {
+            const auto current = completeFrames.capacity();
+            if( current > SIZE_MAX / 2 ) throw BoundedScanError( "frame_cpu_scan_workspace_budget" );
+            const auto next = std::max<size_t>( 1, current * 2 );
+            frameWorkspace.Add( uint64_t( next - current ) * sizeof( FrameBoundary ) );
+            completeFrames.reserve( next );
+        }
         ++completeFramesBySet[frame.frameSetRef];
         ++result.completeFrameCount;
         completeFrames.emplace_back( std::move( frame ) );
@@ -280,7 +377,12 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     {
         checkCancelled();
         AnalysisWorkspaceReservation pageWorkspace( options.workspace );
+        const auto readStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         const auto batch = scanner.Read( frameRequest );
+        if(timed) {
+            result.timings.frameReadNs+=elapsedNs(readStarted);
+            ++result.timings.frameReadCalls;
+        }
         checkCancelled();
         result.maximumBatchObserved = std::max( result.maximumBatchObserved, batch.Count() );
         const auto& frames = std::get<std::vector<FrameDto>>( batch.records );
@@ -293,9 +395,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         {
             checkCancelled();
             const auto valid = frame.complete && frame.endNs && *frame.endNs > frame.beginNs;
-            // Every valid frame remains either a completed boundary or the
-            // pending continuous tail. Includes indexes and vector growth.
-            if( valid ) frameWorkspace.Add( 1024 + 8 * ( frame.ref.size() + frame.frameSetRef.size() ) );
+            // Charge the two retained strings before either the pending map or
+            // a FrameBoundary temporary copies them. Vector object storage is
+            // charged separately immediately before capacity growth.
+            if( valid ) frameWorkspace.Add( 64 + 2ull * ( frame.ref.size() + frame.frameSetRef.size() ) );
             if( continuousFrameSets.contains( frame.frameSetRef ) )
             {
                 // A continuous FrameSet's previous frame is proven complete by
@@ -362,6 +465,16 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     } );
     std::map<std::string, std::vector<FrameBoundary*>> framesBySet;
     for( auto& frame : completeFrames ) { checkCancelled(); framesBySet[frame.frameSetRef].push_back( &frame ); }
+    // A single bounded cursor set is enough when source rows stay on one
+    // thread. Switching threads or moving backward in time falls back to the
+    // original binary search, so the cache does not retain per-thread state.
+    constexpr size_t MaximumFrameCursors=64;
+    struct FrameSearchCursor { uint64_t generation=0; int64_t startNs=0; size_t first=0; };
+    std::array<FrameSearchCursor,MaximumFrameCursors> frameCursors{};
+    std::array<bool,MaximumFrameCursors> monotoneEnds{};
+    const bool useFrameCursors=options.useFrameCursor && framesBySet.size()<=MaximumFrameCursors;
+    const std::string* cursorThread=nullptr;
+    uint64_t cursorGeneration=1;
     std::vector<std::string> frameSetRefs;
     frameSetRefs.reserve( framesBySet.size() );
     for( auto& [frameSetRef, frames] : framesBySet )
@@ -370,6 +483,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         if( frameSetRefs.size() >= std::numeric_limits<uint32_t>::max() )
             throw BoundedScanError( "frame_cpu_scan_frame_set_limit" );
         const auto ordinal = uint32_t( frameSetRefs.size() );
+        if(useFrameCursors) monotoneEnds[ordinal]=std::is_sorted(frames.begin(),frames.end(),
+            [](const FrameBoundary* left,const FrameBoundary* right){return left->endNs<right->endNs;});
         frameSetRefs.emplace_back( frameSetRef );
         for( auto* frame : frames ) { checkCancelled(); frame->frameSetOrdinal = ordinal; }
     }
@@ -404,6 +519,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     };
     std::map<std::string_view, uint32_t, std::less<>> signatureIndex;
     std::vector<SignatureEntry> signatureEntries;
+    std::unordered_map<SignatureCacheKey, uint32_t,
+        SignatureCacheHash, SignatureCacheEqual> exactSignatureCache;
+    std::unordered_map<SignatureCacheKey, uint32_t,
+        SignatureCacheHash, SignatureCacheEqual> logicalSignatureCache;
     std::map<RunKey, size_t> runIndex;
     std::unordered_set<uint64_t> streamedPresence;
     std::unordered_map<std::string, WorkingStack> stacks;
@@ -426,8 +545,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         AddRepresentative( it->representativeRefs, ref );
     };
 
-    auto ensureDefinition = [&]( const CpuZoneDto& zone, bool logical, const std::string& id,
-        const std::string& parent, const std::string& role, uint32_t depth,
+    auto ensureDefinition = [&]( const CpuZoneDto& zone, bool logical, std::string_view id,
+        std::string_view parent, std::string_view definitionName, const std::string& role, uint32_t depth,
         AnalysisDictionary::PathId parentPath ) -> uint32_t {
         checkCancelled();
         const auto found = signatureIndex.find( id );
@@ -437,17 +556,18 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         signatureWorkspace.Add(256); // map node plus transient vector growth
         const auto ordinal = uint32_t( signatureEntries.size() );
         const auto signature = dictionary.Intern( id );
-        const auto leaf = dictionary.Intern( zone.name.empty() ? zone.function : zone.name );
+        const auto leaf = dictionary.Intern( definitionName.empty() ? zone.function : definitionName );
         const auto path = dictionary.AppendPath( parentPath, leaf );
         AnalysisWorkspaceReservation definitionWorkspace( options.workspace, 2048 + 8ull *
-            ( id.size() + parent.size() + zone.name.size() + zone.sourceLocationRef.size() +
+            ( id.size() + parent.size() + definitionName.size() + zone.sourceLocationRef.size() +
               zone.function.size() + zone.file.size() + zone.threadRef.size() + role.size() ) );
         const auto workClass = Classify( zone );
         signatureEntries.push_back( { signature, path, workClass } );
         signatureIndex.emplace( dictionary.Text( signature ), ordinal );
         auto resolved = dictionary.ResolvePath( path );
-        CpuSignatureDefinition definition { id, parent, zone.name, zone.sourceLocationRef,
-            zone.function, zone.file, zone.line, logical ? std::string {} : zone.threadRef,
+        CpuSignatureDefinition definition { std::string( id ), std::string( parent ), std::string( definitionName ), zone.sourceLocationRef,
+            zone.function, zone.file, zone.line, logical ?
+                ( options.includeLogicalThreadRole ? role : std::string {} ) : zone.threadRef,
             role, std::move( resolved.text ), depth, workClass, logical };
         if( options.definitionSink )
         {
@@ -463,7 +583,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         return ordinal;
     };
 
-    auto updateRun = [&]( const std::string& signature, uint32_t signatureOrdinal,
+    auto updateRun = [&]( std::string_view signature, uint32_t signatureOrdinal,
         const FrameContribution& contribution, int64_t directChildUnion,
         bool exact, const std::string& ref ) {
         if( signature.empty() ) return;
@@ -482,17 +602,24 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     contribution.frame->index, inclusive, directChildUnion,
                     inclusive - directChildUnion, 1,
                     exact && directChildUnion <= inclusive, ref, workClass };
+                const bool sample=timed && (emittedRunCount & 4095u)==0;
+                const auto sampleStarted=sample ? std::chrono::steady_clock::now() : scanStarted;
                 accepted = ( *viewSink )( run );
+                if(sample) { result.timings.sinkSampleNs+=elapsedNs(sampleStarted); ++result.timings.sinkSamples; }
             }
             else
             {
-                const CpuSignatureFrameRun run { signature, contribution.frame->frameSetRef,
+                const CpuSignatureFrameRun run { std::string( signature ), contribution.frame->frameSetRef,
                     contribution.frame->ref, contribution.frame->index, inclusive,
                     directChildUnion, inclusive - directChildUnion, 1,
                     exact && directChildUnion <= inclusive, { ref }, workClass };
+                const bool sample=timed && (emittedRunCount & 4095u)==0;
+                const auto sampleStarted=sample ? std::chrono::steady_clock::now() : scanStarted;
                 accepted = ( *sink )( run );
+                if(sample) { result.timings.sinkSampleNs+=elapsedNs(sampleStarted); ++result.timings.sinkSamples; }
             }
             if( !accepted ) throw std::runtime_error( "frame_cpu_scan_sink_cancelled" );
+            ++emittedRunCount;
             checkCancelled();
             const auto presence = ( uint64_t( signatureOrdinal ) << 32 ) | contribution.frame->frameSetOrdinal;
             if( !streamedPresence.contains( presence ) )
@@ -502,13 +629,13 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             }
             return;
         }
-        const RunKey key { signature, contribution.frame->ref };
+        const RunKey key { std::string( signature ), contribution.frame->ref };
         if( !runIndex.contains( key ) ) runWorkspace.Add( 256 + 4 * ( key.signature.size() + key.frame.size() ) );
         auto [it, inserted] = runIndex.emplace( key, result.runs.size() );
         if( inserted )
         {
             result.outputWorkspace.Add( 1024 + 4 * ( signature.size() + contribution.frame->frameSetRef.size() + contribution.frame->ref.size() ) );
-            result.runs.push_back( { signature, contribution.frame->frameSetRef, contribution.frame->ref,
+            result.runs.push_back( { std::string( signature ), contribution.frame->frameSetRef, contribution.frame->ref,
                 contribution.frame->index, 0, 0, 0, 0, true, {} } );
         }
         auto& run = result.runs[it->second];
@@ -540,10 +667,12 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 finding( "child_union_exceeds_parent", "Direct child interval union exceeds its clipped parent interval.", zone.ref );
             }
             if( options.includeExactSignatures )
-                updateRun( zone.exactSignature, zone.exactSignatureOrdinal,
+                updateRun( dictionary.Text( signatureEntries[zone.exactSignatureOrdinal].signature ),
+                    zone.exactSignatureOrdinal,
                     contribution, childUnion, exact, zone.ref );
             if( options.includeLogicalSignatures )
-                updateRun( zone.logicalSignature, zone.logicalSignatureOrdinal,
+                updateRun( dictionary.Text( signatureEntries[zone.logicalSignatureOrdinal].signature ),
+                    zone.logicalSignatureOrdinal,
                     contribution, childUnion, exact, zone.ref );
         }
     };
@@ -555,7 +684,13 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     {
         checkCancelled();
         AnalysisWorkspaceReservation pageWorkspace( options.workspace );
+        const auto readStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         const auto batch = scanner.Read( zoneRequest );
+        if(timed) {
+            result.timings.zoneReadNs+=elapsedNs(readStarted);
+            ++result.timings.zoneReadCalls;
+        }
+        const auto processStarted=timed ? std::chrono::steady_clock::now() : scanStarted;
         checkCancelled();
         result.maximumBatchObserved = std::max( result.maximumBatchObserved, batch.Count() );
         const auto& zones = std::get<std::vector<CpuZoneDto>>( batch.records );
@@ -565,7 +700,16 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             checkCancelled();
             ++result.inputZoneCount;
             if( !stacks.contains( zone.threadRef ) ) metadataWorkspace.Add( 1024 + 4 * zone.threadRef.size() );
-            auto& storage = stacks.try_emplace( zone.threadRef, options.workspace ).first->second;
+            const auto [threadEntry,insertedThread] = stacks.try_emplace( zone.threadRef, options.workspace );
+            (void)insertedThread;
+            auto& storage = threadEntry->second;
+            if(useFrameCursors && cursorThread!=&threadEntry->first) {
+                cursorThread=&threadEntry->first;
+                if(++cursorGeneration==0) {
+                    frameCursors.fill({});
+                    cursorGeneration=1;
+                }
+            }
             auto& stack = storage.zones;
 
             size_t parentPosition = std::numeric_limits<size_t>::max();
@@ -613,70 +757,157 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             const auto role = roleIt == threadRoles.end() ? std::string( "Other" ) : roleIt->second.name;
             const auto roleCacheIndex = roleIt == threadRoles.end() ? uint8_t( 3 ) : roleIt->second.cacheIndex;
             const auto parentExact = options.includeExactSignatures && !stack.empty() &&
-                zone.parentRef && parentResolved ? stack.back().exactSignature : std::string {};
+                zone.parentRef && parentResolved ?
+                dictionary.Text( signatureEntries[stack.back().exactSignatureOrdinal].signature ) : std::string_view {};
             const auto stableLogicalSite =
                 options.logicalSignatureMode == CpuLogicalSignatureMode::StableSite;
             const auto parentLogical = options.includeLogicalSignatures && !stableLogicalSite &&
                 !stack.empty() && zone.parentRef && parentResolved ?
-                stack.back().logicalSignature : std::string {};
-            const auto exactId = options.includeExactSignatures ?
-                SignatureId( false, zone.threadRef, parentExact, zone ) : std::string {};
-            std::string logicalId;
+                dictionary.Text( signatureEntries[stack.back().logicalSignatureOrdinal].signature ) : std::string_view {};
+            const auto parentExactOrdinalPlusOne = options.includeExactSignatures && !stack.empty() &&
+                zone.parentRef && parentResolved ? stack.back().exactSignatureOrdinal + 1 : 0;
+            const SignatureCacheView exactCacheKey { parentExactOrdinalPlusOne,
+                zone.threadRef, zone.sourceLocationRef, zone.name, zone.function, zone.file, zone.line };
+            std::string exactIdStorage;
+            std::string_view exactId;
+            uint32_t exactSignatureOrdinal = 0;
+            bool exactSignatureCached = false;
+            if( options.includeExactSignatures )
+            {
+                const auto found = exactSignatureCache.find( exactCacheKey );
+                if( found != exactSignatureCache.end() )
+                {
+                    exactSignatureCached = true;
+                    exactSignatureOrdinal = found->second;
+                    exactId = dictionary.Text( signatureEntries[exactSignatureOrdinal].signature );
+                }
+                else
+                {
+                    exactIdStorage = SignatureId( false, zone.threadRef, parentExact, zone, zone.name );
+                    exactId = exactIdStorage;
+                    ++result.exactSignatureHashCount;
+                }
+            }
+            const auto logicalName = std::string_view( zone.name );
+            const auto parentLogicalOrdinalPlusOne = options.includeLogicalSignatures && !stableLogicalSite &&
+                !stack.empty() && zone.parentRef && parentResolved ? stack.back().logicalSignatureOrdinal + 1 : 0;
+            const SignatureCacheView logicalCacheKey { parentLogicalOrdinalPlusOne,
+                role, zone.sourceLocationRef, logicalName, zone.function, zone.file, zone.line };
+            std::string logicalIdStorage;
+            std::string_view logicalId;
+            uint32_t logicalSignatureOrdinal = 0;
+            bool logicalSignatureCached = false;
             if( options.includeLogicalSignatures )
             {
                 if( stableLogicalSite && !zone.sourceLocationRef.empty() )
                 {
                     auto& cache = stableLogicalSignatures[roleCacheIndex];
                     const auto found = cache.find( zone.sourceLocationRef );
-                    if( found != cache.end() ) logicalId = found->second;
+                    if( found != cache.end() )
+                    {
+                        logicalId = found->second;
+                        logicalSignatureOrdinal = signatureIndex.at( logicalId );
+                        logicalSignatureCached = true;
+                    }
                     else
                     {
-                        logicalId = SignatureId( true, role, parentLogical, zone, true );
+                        logicalIdStorage = SignatureId( true, role, parentLogical, zone, logicalName, true );
+                        logicalId = logicalIdStorage;
+                        ++result.logicalSignatureHashCount;
                         signatureWorkspace.Add(128+4ull*(zone.sourceLocationRef.size()+logicalId.size()));
                         cache.emplace( zone.sourceLocationRef, logicalId );
                     }
                 }
-                else logicalId = SignatureId( true, role, parentLogical, zone, stableLogicalSite );
+                else
+                {
+                    const auto found = logicalSignatureCache.find( logicalCacheKey );
+                    if( found != logicalSignatureCache.end() )
+                    {
+                        logicalSignatureCached = true;
+                        logicalSignatureOrdinal = found->second;
+                        logicalId = dictionary.Text( signatureEntries[logicalSignatureOrdinal].signature );
+                    }
+                    else
+                    {
+                        logicalIdStorage = SignatureId( true, role, parentLogical, zone, logicalName, stableLogicalSite );
+                        logicalId = logicalIdStorage;
+                        ++result.logicalSignatureHashCount;
+                    }
+                }
             }
             const auto depth = zone.parentRef && parentResolved && !stack.empty() ? uint32_t( stack.size() ) : 0u;
             result.maximumDepth = std::max( result.maximumDepth, size_t( depth ) );
-            const auto exactParentPath = parentExact.empty() ? 0 :
-                signatureEntries[signatureIndex.at(parentExact)].path;
-            const auto logicalParentPath = parentLogical.empty() ? 0 :
-                signatureEntries[signatureIndex.at(parentLogical)].path;
-            uint32_t exactSignatureOrdinal = 0;
-            uint32_t logicalSignatureOrdinal = 0;
-            if( options.includeExactSignatures )
-                exactSignatureOrdinal = ensureDefinition( zone, false, exactId, parentExact, role, depth,
+            const auto exactParentPath = parentExactOrdinalPlusOne == 0 ? 0 :
+                signatureEntries[parentExactOrdinalPlusOne - 1].path;
+            const auto logicalParentPath = parentLogicalOrdinalPlusOne == 0 ? 0 :
+                signatureEntries[parentLogicalOrdinalPlusOne - 1].path;
+            if( options.includeExactSignatures && !exactSignatureCached )
+            {
+                exactSignatureOrdinal = ensureDefinition( zone, false, exactId, parentExact, zone.name, role, depth,
                     exactParentPath );
-            if( options.includeLogicalSignatures )
-                logicalSignatureOrdinal = ensureDefinition( zone, true, logicalId, parentLogical, role, depth,
+                signatureWorkspace.Add( 256 + 4ull * ( zone.threadRef.size() +
+                    zone.sourceLocationRef.size() + zone.name.size() + zone.function.size() + zone.file.size() ) );
+                const auto [cacheIt, inserted] = exactSignatureCache.emplace(
+                    SignatureCacheKey { parentExactOrdinalPlusOne, zone.threadRef,
+                        zone.sourceLocationRef, zone.name, zone.function, zone.file, zone.line },
+                    exactSignatureOrdinal );
+                if( !inserted && cacheIt->second != exactSignatureOrdinal )
+                    throw BoundedScanError( "frame_cpu_scan_exact_signature_cache_conflict" );
+            }
+            if( options.includeLogicalSignatures && !logicalSignatureCached )
+            {
+                logicalSignatureOrdinal = ensureDefinition( zone, true, logicalId, parentLogical, logicalName, role, depth,
                     stableLogicalSite ? 0 : logicalParentPath );
+                if( !stableLogicalSite )
+                {
+                    signatureWorkspace.Add( 256 + 4ull * ( role.size() + zone.sourceLocationRef.size() +
+                        logicalName.size() + zone.function.size() + zone.file.size() ) );
+                    const auto [cacheIt, inserted] = logicalSignatureCache.emplace(
+                        SignatureCacheKey { parentLogicalOrdinalPlusOne, role,
+                            zone.sourceLocationRef, std::string( logicalName ), zone.function, zone.file, zone.line },
+                        logicalSignatureOrdinal );
+                    if( !inserted && cacheIt->second != logicalSignatureOrdinal )
+                        throw BoundedScanError( "frame_cpu_scan_logical_signature_cache_conflict" );
+                }
+            }
 
             WorkingZone active;
             active.workspace = AnalysisWorkspaceReservation( options.workspace, 2048 + 8 *
-                ( zone.ref.size() + zone.threadRef.size() + exactId.size() + logicalId.size() ) );
+                ( zone.ref.size() + zone.threadRef.size() ) );
             active.ref = zone.ref;
-            active.exactSignature = exactId;
-            active.logicalSignature = logicalId;
             active.exactSignatureOrdinal = exactSignatureOrdinal;
             active.logicalSignatureOrdinal = logicalSignatureOrdinal;
             active.threadRef = zone.threadRef;
             active.beginNs = zone.startNs;
             active.endNs = *zone.endNs;
             active.exact = structuralExact;
+            size_t frameSetIndex=0;
             for( const auto& [frameSet, candidates] : framesBySet )
             {
                 checkCancelled();
                 size_t first = 0;
-                size_t last = candidates.size();
-                while( first < last )
+                const bool cursorReady=useFrameCursors && monotoneEnds[frameSetIndex];
+                if(cursorReady && frameCursors[frameSetIndex].generation==cursorGeneration &&
+                    zone.startNs>=frameCursors[frameSetIndex].startNs)
                 {
-                    ++result.frameBoundaryProbeCount;
-                    const auto middle = first + ( last - first ) / 2;
-                    if( candidates[middle]->endNs <= zone.startNs ) first = middle + 1;
-                    else last = middle;
+                    first=frameCursors[frameSetIndex].first;
+                    while(first<candidates.size()) {
+                        ++result.frameBoundaryProbeCount;
+                        if(candidates[first]->endNs>zone.startNs) break;
+                        ++first;
+                    }
                 }
+                else {
+                    size_t last = candidates.size();
+                    while( first < last )
+                    {
+                        ++result.frameBoundaryProbeCount;
+                        const auto middle = first + ( last - first ) / 2;
+                        if( candidates[middle]->endNs <= zone.startNs ) first = middle + 1;
+                        else last = middle;
+                    }
+                }
+                if(cursorReady) frameCursors[frameSetIndex]={cursorGeneration,zone.startNs,first};
                 for( auto index = first; index < candidates.size(); ++index )
                 {
                     checkCancelled();
@@ -691,6 +922,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                         active.frames.push_back( { &frame, begin, end } );
                     }
                 }
+                ++frameSetIndex;
             }
             if( active.frames.empty() )
             {
@@ -725,12 +957,22 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             storage.ReserveNext();
             stack.emplace_back( std::move( active ) );
         }
+        if(timed) result.timings.zoneProcessNs+=elapsedNs(processStarted);
+        if(options.timingProgress) {
+            result.timings.inputZones=result.inputZoneCount;
+            result.timings.frameBoundaryProbes=result.frameBoundaryProbeCount;
+            result.timings.logicalSignatureHashes=result.logicalSignatureHashCount;
+            result.timings.emittedRuns=emittedRunCount;
+        }
+        if(options.timingProgress) options.timingProgress(result.timings);
+        if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
         if( batch.cursor.complete ) break;
         zoneRequest.cursor = batch.cursor;
     }
 
     for( auto& [thread, storage] : stacks )
         while( !storage.zones.empty() ) closeTop( storage.zones );
+    if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
 
     if( sink || viewSink )
     {
@@ -775,6 +1017,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         return lhs.frameSetRef < rhs.frameSetRef;
     } );
     checkCancelled();
+    if(timed) result.timings.totalNs=elapsedNs(scanStarted);
+    if(options.timingProgress) {
+        result.timings.inputZones=result.inputZoneCount;
+        result.timings.frameBoundaryProbes=result.frameBoundaryProbeCount;
+        result.timings.logicalSignatureHashes=result.logicalSignatureHashCount;
+        result.timings.emittedRuns=emittedRunCount;
+    }
+    if(options.timingProgress) options.timingProgress(result.timings);
     return result;
 }
 

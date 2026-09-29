@@ -9,7 +9,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace tracy { class SerializedZoneSink; }
+namespace tracy { class SerializedZoneSink; class SerializedStringSource; class SerializedCallstackSource; struct FileReadHooks; struct FileWriteHooks; }
 
 namespace tracy::analysis
 {
@@ -60,12 +60,17 @@ class WorkerTraceSource final : public TraceSource, public NativeBoundedTraceSou
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
 
-    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full, SerializedZoneSink* serializedZoneSink = nullptr );
+    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {},
+        std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full,
+        SerializedZoneSink* serializedZoneSink = nullptr, std::shared_ptr<tracy::FileReadHooks> readHooks = {},
+        SerializedStringSource* serializedStringSource = nullptr,
+        SerializedCallstackSource* serializedCallstackSource = nullptr );
     static WorkerLoadProgress GetLoadProgress();
     static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;
 
-    void WriteCompactSnapshot( const std::filesystem::path& path );
+    void WriteCompactSnapshot( const std::filesystem::path& path,
+        std::shared_ptr<tracy::FileWriteHooks> hooks = {} );
     std::optional<std::string> ResolveStringIndex( uint32_t index ) const;
 
     WorkerTraceSource( const WorkerTraceSource& ) = delete;
@@ -74,6 +79,9 @@ public:
     std::vector<Capability> GetCapabilities() const override;
     TraceReadView AcquireReadView() const override;
     TraceInfoDto GetTraceInfo() const override;
+    TraceInfoDto GetTraceInfoMetadata() const override;
+    AppInfoSummaryDto GetAppInfoSummary() const override;
+    AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const override;
     std::vector<ThreadDto> GetThreads() const override;
     std::vector<FrameSetDto> GetFrameSets() const override;
     std::vector<GpuContextDto> GetGpuContexts() const override;
@@ -85,6 +93,8 @@ public:
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
+    std::vector<MemoryEventDto> ScanMemoryEventsForSummary( size_t offset, size_t limit,
+        const std::function<void()>& check = {} ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
 
@@ -112,6 +122,9 @@ public:
     uint64_t GetGfxLinkCount() const override;
     std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    uint64_t GetCorrelatedFrameEventCount() const override;
+    std::vector<CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override;
     std::vector<RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
@@ -141,6 +154,7 @@ public:
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override;
+    std::vector<int64_t> GetContextSwitchStartTimes( uint64_t thread ) const;
     std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
     std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& range ) const override;
@@ -190,6 +204,7 @@ public:
     BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
+    TraceInfoDto GetTraceInfoImpl( bool includeAppInfo ) const;
     std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId,
         const std::unordered_set<uint64_t>* explicitJobIds = nullptr,
         const std::function<void()>& check = {} ) const;

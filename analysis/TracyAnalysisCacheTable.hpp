@@ -14,10 +14,14 @@
 
 namespace tracy::analysis
 {
+bool AnalysisCacheCompressionDefault();
+bool AnalysisCacheCleanupDefault();
+
 // A Query-internal immutable, sorted record table. This is not a TraceSource
 // and does not decode or replace .tracy/stream. Callers retain exact semantics.
 struct AnalysisCacheTableOptions
 {
+    bool compressBlocks = AnalysisCacheCompressionDefault(); // Internal writer control; never a public MCP parameter.
     uint64_t blockBytes = 4 * 1024 * 1024;
     uint64_t manifestBytes = 8 * 1024 * 1024;
     std::function<bool()> cancelled;
@@ -62,6 +66,8 @@ struct AnalysisCacheReadMetrics
     uint64_t blocksLoaded = 0;
     uint64_t payloadBytesRead = 0;
     uint64_t peakBlockBytes = 0;
+    uint64_t storedBytesRead = 0;
+    uint64_t decodedBytes = 0;
 };
 
 class AnalysisCacheTableWriter
@@ -97,6 +103,7 @@ public:
     std::optional<AnalysisCacheRecord> Find(std::string_view key);
     AnalysisCachePage ReadPage(uint64_t ordinal, size_t limit, uint64_t maxResponseBytes);
     AnalysisCacheReadMetrics Metrics() const;
+    void ValidateAll(); // Stream all blocks and verify index coverage and logical hash.
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

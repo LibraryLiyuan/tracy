@@ -161,7 +161,7 @@ static float smoothstep( float x )
 static void SetWindowTitleCallback( const char* title )
 {
     char tmp[1024];
-    sprintf( tmp, "%s - JN Unity GUI Preview - Tracy Profiler %i.%i.%i", title, tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
+    sprintf( tmp, "%s - JNTRACYX v1 - JN Unity GUI Preview - Tracy Profiler %i.%i.%i", title, tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
     bptr->SetTitle( tmp );
     s_customTitle = true;
 }
@@ -252,7 +252,7 @@ static void ScaleChanged( float scale )
 
 int main( int argc, char** argv )
 {
-    sprintf( title, "JN Unity GUI Preview - Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
+    sprintf( title, "JNTRACYX v1 - JN Unity GUI Preview - Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
 
     std::unique_ptr<tracy::FileRead> initFileOpen;
 #if defined(__EMSCRIPTEN__) && !defined(TRACY_LOCAL_REPORT_VIEWER)
@@ -1060,6 +1060,16 @@ static void DrawContents()
                             {
                                 badVer.state = tracy::BadVersionState::LoadFailure;
                                 badVer.msg = e.msg;
+                            }
+                            catch( const std::exception& e )
+                            {
+                                badVer.state = tracy::BadVersionState::LoadFailure;
+                                badVer.msg = e.what();
+                            }
+                            catch( ... )
+                            {
+                                badVer.state = tracy::BadVersionState::LoadFailure;
+                                badVer.msg = "Unknown trace loading failure";
                             }
                         } );
                     }

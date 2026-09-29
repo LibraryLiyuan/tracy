@@ -12,10 +12,13 @@ class AnalysisCacheQuery
 public:
     AnalysisCacheQuery(std::filesystem::path indexRoot, std::string sourceIdentity,
         uint64_t records, std::function<AnalysisCacheRecord(uint64_t)> read,
-        AnalysisCacheTableOptions options = {}, uint64_t responseBytes = 3*1024*1024);
+        AnalysisCacheTableOptions options = {}, uint64_t responseBytes = 3*1024*1024,
+        std::function<void()> finalDiskCheck = {});
     ~AnalysisCacheQuery();
     nlohmann::json Page(size_t limit, const std::string& cursor,
         const std::vector<std::string>& fields, const nlohmann::json& filter);
+    static void PublishFilterForTesting(const std::filesystem::path& temporary,
+        const std::filesystem::path& target);
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

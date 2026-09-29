@@ -11,16 +11,19 @@ static constexpr uint32_t JnGpuCatalogBatchMagic = 0x3143474A; // JGC1
 static constexpr uint16_t JnGpuCatalogSchemaVersion = 1;
 static constexpr uint16_t JnGpuDetailedEvidenceSchemaVersion = 1;
 
-inline uint64_t JnGpuCatalogChecksum64( const void* data, size_t size )
+inline uint64_t JnGpuCatalogChecksum64Update( uint64_t hash, const void* data, size_t size )
 {
     const auto* bytes = static_cast<const uint8_t*>( data );
-    uint64_t hash = 14695981039346656037ull;
     for( size_t i = 0; i < size; ++i )
     {
         hash ^= bytes[i];
         hash *= 1099511628211ull;
     }
     return hash;
+}
+inline uint64_t JnGpuCatalogChecksum64( const void* data, size_t size )
+{
+    return JnGpuCatalogChecksum64Update(14695981039346656037ull,data,size);
 }
 
 enum class JnGpuCatalogRecordOperation : uint8_t
@@ -329,6 +332,9 @@ struct JnGpuCatalogPartRecordV1
 
 struct JnGpuCatalogRelationRecordV1
 {
+    // flags bit 0/1 marks an unresolved source/target resource pointer.  A
+    // resolved RtasUses source is a Resource id; its target may be an RTAS
+    // enrichment identity and is not required to exist in the Resource table.
     int64_t time;
     uint64_t sourceId;
     uint64_t targetId;
