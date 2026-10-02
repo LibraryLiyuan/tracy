@@ -72,6 +72,7 @@ public:
     bool StringsSealed()const{return m_sealed;}
     const uint64_t* InternCallstack(const uint64_t*,uint32_t,uint32_t&) override;
     uint64_t CallstackCount()const override{return m_callstacks?m_callstacks->Count():1;}
+    const uint64_t* CallstackFrames(uint32_t,uint32_t&);
     uint64_t CallstackUsedBytes()const{return m_callstacks?m_callstacks->UsedBytes():0;}
     uint64_t CallstackReservedBytes()const{return m_callstacks?m_callstacks->ReservedBytes():0;}
     std::string CallstackHash()const;

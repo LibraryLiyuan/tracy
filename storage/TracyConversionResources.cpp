@@ -19,15 +19,19 @@ std::filesystem::path Key(const std::filesystem::path& path)
 { return std::filesystem::absolute(path).lexically_normal(); }
 uint64_t PathMemory(const std::filesystem::path& p){return 512+4ull*p.native().size()*sizeof(std::filesystem::path::value_type);}
 }
+uint64_t ConversionDiskLimit(uint64_t streamBytes,uint64_t absoluteDiskLimit)
+{
+    const auto ratioLimit=streamBytes*ConversionDiskRatioLimit;
+    return absoluteDiskLimit?std::min(ratioLimit,absoluteDiskLimit):ratioLimit;
+}
 ConversionResources::ConversionResources(ResourceLimits limits,SampleProvider sample,std::function<uint64_t()> freeDisk,std::function<bool()> cancelled)
     :m_limits(limits),m_sample(std::move(sample)),m_freeDisk(std::move(freeDisk)),m_cancelProbe(std::move(cancelled))
 {
-    if(!limits.streamBytes || limits.streamBytes>UINT64_MAX/3 || !limits.clusterBytes ||
+    if(!limits.streamBytes || limits.streamBytes>UINT64_MAX/ConversionDiskRatioLimit || !limits.clusterBytes ||
         !limits.maximumPrivateBytes || limits.maximumPrivateBytes>(32ull<<30) ||
         limits.targetPrivateBytes>limits.maximumPrivateBytes || !m_sample || !m_freeDisk)
         Refuse("conversion_resource_configuration");
-    m_diskLimit=limits.streamBytes*3;
-    if(limits.absoluteDiskLimit) m_diskLimit=std::min(m_diskLimit,limits.absoluteDiskLimit);
+    m_diskLimit=ConversionDiskLimit(limits.streamBytes,limits.absoluteDiskLimit);
     if(limits.controlReserveBytes>m_diskLimit)Refuse("conversion_control_reserve");
     m_workspace=std::make_shared<analysis::AnalysisWorkspaceBudget>(limits.workspaceBytes,limits.workspaceBytes,
         [this](uint64_t bytes){if(!m_initializing)Check(bytes);});

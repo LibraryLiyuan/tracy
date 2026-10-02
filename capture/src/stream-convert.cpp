@@ -2516,9 +2516,9 @@ int ConvertMain(int argc,char** argv)
         }
         tracy::storage::ResourceLimits limits;limits.streamBytes=std::filesystem::file_size(options.input);limits.absoluteDiskLimit=options.diskBudget;
         limits.maximumPrivateBytes=options.processMemoryLimit;
-        if(!limits.streamBytes||limits.streamBytes>UINT64_MAX/3)throw std::runtime_error("conversion_input_size_overflow");
+        if(!limits.streamBytes||limits.streamBytes>UINT64_MAX/tracy::storage::ConversionDiskRatioLimit)throw std::runtime_error("conversion_input_size_overflow");
         limits.clusterBytes=tracy::storage::ConversionResources::VolumeCluster(options.output);
-        const auto disk=options.diskBudget?std::min(options.diskBudget,limits.streamBytes*3):limits.streamBytes*3;
+        const auto disk=tracy::storage::ConversionDiskLimit(limits.streamBytes,options.diskBudget);
         limits.controlReserveBytes=std::min<uint64_t>(1ull<<20,disk/4);
         resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[&]{return CancelRequested()||std::filesystem::exists(tracy::analysis::AnalysisIoPath(options.cancelFile));});
         files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();

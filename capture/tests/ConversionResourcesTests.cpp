@@ -30,18 +30,21 @@ int main(int argc,char** argv)
     if(argc!=2) return 2;
     const auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
     ResourceLimits limits; limits.streamBytes=4096;limits.clusterBytes=4096;limits.diskReserveBytes=0;
+    Check(ConversionDiskLimit(4096,0)==20480);
+    Check(ConversionDiskLimit(4096,16384)==16384);
+    Check(ConversionDiskLimit(4096,32768)==20480);
     ResourceSample sample;sample.privateBytes=64;sample.physicalTotal=64ull<<30;sample.physicalAvailable=32ull<<30;
     sample.systemCommit=4ull<<30;sample.systemCommitLimit=64ull<<30;
     ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
-    Check(resources.DiskLimit()==12288);
+    Check(resources.DiskLimit()==20480);
     PeakCase(resources,sample);
     const auto first=root/"first.bin",second=root/"second.bin";
     resources.BeforeFileGrowth(first,1); {std::ofstream f(first);f<<'a';}
     resources.BeforeFileGrowth(first,4000);Check(resources.DiskCurrent()==4096);
-    resources.BeforeFileGrowth(second,4097);{std::ofstream f(second);f<<'b';}
-    Check(resources.DiskCurrent()==12288);
-    Refuses([&]{resources.BeforeFileGrowth(second,8193);});Check(resources.DiskCurrent()==12288);
-    Check(resources.RemoveOwned(first));Check(resources.DiskCurrent()==8192);
+    resources.BeforeFileGrowth(second,12289);{std::ofstream f(second);f<<'b';}
+    Check(resources.DiskCurrent()==20480);
+    Refuses([&]{resources.BeforeFileGrowth(second,16385);});Check(resources.DiskCurrent()==20480);
+    Check(resources.RemoveOwned(first));Check(resources.DiskCurrent()==16384);
     Check(resources.RemoveOwned(second));Check(resources.DiskCurrent()==0);
     CleanupCase(resources,root);
     sample.systemCommit=sample.systemCommitLimit-(2ull<<30);

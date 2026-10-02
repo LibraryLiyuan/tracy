@@ -201,6 +201,7 @@ struct LegacyVersion : public std::exception
 struct LoadFailure : public std::exception
 {
     LoadFailure( const char* msg ) : msg( msg ) {}
+    const char* what() const noexcept override { return msg.c_str(); }
     std::string msg;
 };
 

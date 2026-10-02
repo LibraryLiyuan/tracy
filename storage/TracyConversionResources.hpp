@@ -10,6 +10,8 @@
 #include <vector>
 namespace tracy::storage
 {
+inline constexpr uint64_t ConversionDiskRatioLimit=5;
+uint64_t ConversionDiskLimit(uint64_t streamBytes,uint64_t absoluteDiskLimit=0);
 struct ResourceSample
 {
     uint64_t privateBytes=0,workingSetBytes=0,physicalTotal=0,physicalAvailable=0;
