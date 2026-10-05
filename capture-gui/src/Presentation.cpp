@@ -7,17 +7,13 @@ ProcessingText DescribeProcessing(std::string_view state, std::string_view phase
 {
     if (state == "converting")
     {
+        if (phase == "EventStore")
+            return {"正在完成事件库", "正在整理录制数据、建立磁盘索引并核验完整性，完成后自动保存分析文件。", 0};
+        if (phase == "FileIdentity")
+            return {"正在核对转换文件身份", "格式转换已完成。正在计算文件身份，随后自动建立索引并校验。", 1};
         std::string detail = "正在将原始录制数据转换为 .tracy 文件，完成后自动建立索引并校验。";
-        if (phase == "Scan")
-            detail = "正在读取和检查原始录制数据，准备转换。";
-        else if (phase == "DecodeBuild")
-            detail = "正在解码录制数据并生成 .tracy 文件内容。";
-        else if (phase == "Write")
-            detail = "正在把转换后的数据写入 .tracy 文件。";
-        else if (phase == "Validate")
-            detail = "正在检查转换生成的文件；随后会建立索引并校验采集数据。";
-        else if (phase == "Publish" || phase == "Complete")
-            detail = "正在完成文件转换，随后自动建立索引并校验。";
+        if (phase == "BoundedExport")
+            detail = "正在建立磁盘索引并有界导出 .tracy，同时校验输出。大录制首次建库需要等待；详细进度保存在日志中。";
         return {"正在转换录制文件", detail, 0};
     }
     if (state == "validating")
@@ -68,5 +64,17 @@ std::string RecordingDuration(const Json &task)
     if (!duration && task.contains("capture_status"))
         duration = read(task["capture_status"]);
     return duration ? FormatDuration(*duration) : "未记录";
+}
+std::string RecordingStopReason(const Json &task)
+{
+    const auto reason = task.value("stop_reason", "");
+    if (reason == "user") return "手动停止";
+    if (reason == "timer") return "达到定时录制时长";
+    if (reason == "connection_timeout") return "连接等待超时";
+    if (reason == "disk_protection") return "磁盘剩余空间达到保护阈值";
+    if (reason == "memory_protection") return "录制进程内存达到保护阈值";
+    if (reason == "target_exited") return "目标进程已退出";
+    if (reason == "target_mismatch") return "连接的进程与所选目标不一致";
+    return reason.empty() ? "" : "采集已停止，详情见日志";
 }
 } // namespace capturegui

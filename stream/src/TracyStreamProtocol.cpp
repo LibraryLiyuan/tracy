@@ -412,4 +412,11 @@ uint64_t StreamProtocolObserver::PeakBufferedBytes() const
     return m_peakBufferedBytes;
 }
 
+ProtocolJournalStatus StreamProtocolObserver::Status() const
+{
+    std::lock_guard lock( m_lock );
+    return { m_clientBytes, m_serverBytes, m_committedSize, m_durableSize,
+        m_backpressureWaitCount, m_peakBufferedBytes, m_failed, m_finalized, m_closeReason };
+}
+
 }

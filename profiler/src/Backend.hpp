@@ -5,6 +5,17 @@
 #include <stdint.h>
 
 #include "WindowPosition.hpp"
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+void BeginStreamingFrameTiming(bool unpaced);
+void ConfigureStreamingPresentation(bool active,bool unpaced=false);
+double StreamingFrameWorkMilliseconds();
+double StreamingFrameUiMilliseconds();
+double StreamingFrameRenderMilliseconds();
+double StreamingFramePresentMilliseconds();
+double StreamingFrameCpuMilliseconds();
+// Saves the next rendered frame as a PNG at `path`.
+void RequestStreamingScreenshot(const char* path);
+#endif
 
 class RunQueue;
 
@@ -16,6 +27,9 @@ public:
 
     void Show();
     void Run();
+#ifdef _WIN32
+    void RequestClose();
+#endif
     void Attention();
 
     void NewFrame( int& w, int& h );

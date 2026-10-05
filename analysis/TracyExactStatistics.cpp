@@ -5,6 +5,7 @@
 #include "TracyAnalysisDictionary.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -16,8 +17,12 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <queue>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -927,8 +932,6 @@ struct NeutralStatisticsStreamBuilder::Impl
     {
         uint32_t signature = 0;
         uint64_t frame = 0;
-        bool operator==( const BufferedKey& other ) const
-        { return signature == other.signature && frame == other.frame; }
     };
     struct BufferedKeyHash
     {
@@ -955,7 +958,10 @@ struct NeutralStatisticsStreamBuilder::Impl
     uint64_t mergeFailures = 0;
     uint64_t fileOrdinal = 0;
     std::vector<PackedNeutralRun> buffer;
-    std::unordered_map<BufferedKey, size_t, BufferedKeyHash> bufferIndexes;
+    // Open-addressing index of `buffer` by (signature, frame): a slot holds a
+    // buffer position + 1, or 0. Twice as many slots as buffered runs.
+    std::vector<uint32_t> bufferSlots;
+    size_t slotMask = 0;
     std::vector<std::filesystem::path> runs;
     std::map<SignatureKeyView, uint32_t, SignatureKeyLess> signatureIndexes;
     std::vector<SignatureKeyView> signatures;
@@ -963,6 +969,9 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::vector<Denominator> denominators;
     std::vector<NeutralDomainAuditInput> audits;
     CompleteFrameFilter completeFrameFilter;
+    size_t finishWorkers = 1;
+    SignaturePrepare prepare;
+    std::shared_ptr<void> currentPrepared;
     std::string error;
     bool finished = false;
 
@@ -977,11 +986,17 @@ struct NeutralStatisticsStreamBuilder::Impl
     {
         if(maximumBufferedRuns > (UINT64_MAX-65536)/256)
             throw std::runtime_error("analysis_workspace_budget");
-        // Packed values, hash entries/buckets, stream buffers and allocator slack.
-        rawBudget.Resize(65536 + uint64_t(maximumBufferedRuns)*256);
+        // Packed values (the filling and the spilling buffer), hash
+        // entries/buckets, stream buffers and allocator slack.
+        rawBudget.Resize(65536 + uint64_t(maximumBufferedRuns)*320);
         std::filesystem::create_directories( root );
         buffer.reserve( maximumBufferedRuns );
-        bufferIndexes.reserve( maximumBufferedRuns );
+        spilling.reserve( maximumBufferedRuns );
+        if( maximumBufferedRuns >= ( size_t( 1 ) << 30 ) ) throw std::runtime_error( "analysis_workspace_budget" );
+        size_t slots = 2;
+        while( slots < 2 * maximumBufferedRuns ) slots *= 2;
+        bufferSlots.assign( slots, 0 );
+        slotMask = slots - 1;
     }
 
     const SignatureKeyView& Key( uint32_t index ) const { return signatures[index]; }
@@ -1003,7 +1018,8 @@ struct NeutralStatisticsStreamBuilder::Impl
     {
         return left.signature == right.signature && left.frame == right.frame;
     }
-    void Merge( PackedNeutralRun& target, const PackedNeutralRun& value )
+    void Merge( PackedNeutralRun& target, const PackedNeutralRun& value ) { Merge( target, value, mergeFailures ); }
+    void Merge( PackedNeutralRun& target, const PackedNeutralRun& value, uint64_t& failures ) const
     {
         const auto exact = ( target.flags & 1u ) != 0 && ( value.flags & 1u ) != 0;
         const auto logical = ( target.flags & 2u ) != 0 || ( value.flags & 2u ) != 0;
@@ -1015,48 +1031,82 @@ struct NeutralStatisticsStreamBuilder::Impl
             !AddChecked( target.occurrences, value.occurrences ) )
         {
             target.flags &= ~1u;
-            ++mergeFailures;
+            ++failures;
         }
     }
     std::filesystem::path NextPath( std::string_view label )
     {
         return root / ( std::string( label ) + "-" + std::to_string( fileOrdinal++ ) + ".work" );
     }
-    bool WriteCompacted( std::vector<PackedNeutralRun>& values, const std::filesystem::path& path )
+    bool WriteCompacted( std::vector<PackedNeutralRun>& values, const std::filesystem::path& path,
+        std::string& failure, uint64_t& failures ) const
     {
         std::sort( values.begin(), values.end(), [&]( const auto& left, const auto& right ) {
             return Less( left, right );
         } );
         std::ofstream output( path, std::ios::binary | std::ios::trunc );
-        if( !output ) { error = "neutral_run_open_failed"; return false; }
+        if( !output ) { failure = "neutral_run_open_failed"; return false; }
         std::optional<PackedNeutralRun> pending;
         for( const auto& value : values )
         {
-            if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
+            if( pending && SameFrame( *pending, value ) ) Merge( *pending, value, failures );
             else
             {
                 if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
                 pending = value;
             }
-            if( !output ) { error = "neutral_run_write_failed"; return false; }
+            if( !output ) { failure = "neutral_run_write_failed"; return false; }
         }
         if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
         output.flush();
-        if( !output ) { error = "neutral_run_flush_failed"; return false; }
+        if( !output ) { failure = "neutral_run_flush_failed"; return false; }
         return true;
     }
-    bool Flush()
+    // A full buffer is sorted and written by a spill thread while the next one
+    // fills. Run paths are taken here in order, so the run files do not change.
+    std::thread spillThread;
+    std::vector<PackedNeutralRun> spilling;
+    std::string spillError;
+    uint64_t spillMergeFailures = 0;
+    std::exception_ptr spillException;
+    bool JoinSpill()
     {
-        if( buffer.empty() ) return true;
+        if( spillThread.joinable() ) spillThread.join();
+        mergeFailures += std::exchange( spillMergeFailures, 0 );
+        if( spillException ) std::rethrow_exception( std::exchange( spillException, nullptr ) );
+        if( spillError.empty() ) return true;
+        if( error.empty() ) error = spillError;
+        spillError.clear();
+        return false;
+    }
+    bool Flush( bool background )
+    {
+        if( buffer.empty() ) return JoinSpill();
         // Current and next merge-pass path vectors, including reallocation.
         runBudget.Resize((runs.size()+1)*(1024+8ull*root.native().size()));
         maximumBufferedRunsObserved = std::max( maximumBufferedRunsObserved, buffer.size() );
         const auto path = NextPath( "neutral-run" );
-        if( !WriteCompacted( buffer, path ) ) return false;
-        runs.push_back( path );
+        if( !JoinSpill() ) return false;
+        spilling.swap( buffer );
         buffer.clear();
-        bufferIndexes.clear();
+        std::fill( bufferSlots.begin(), bufferSlots.end(), 0u );
+        runs.push_back( path );
+        if( !background )
+        {
+            const auto written = WriteCompacted( spilling, path, error, mergeFailures );
+            spilling.clear();
+            return written;
+        }
+        spillThread = std::thread( [this, path] {
+            try { WriteCompacted( spilling, path, spillError, spillMergeFailures ); }
+            catch( ... ) { spillException = std::current_exception(); }
+            spilling.clear();
+        } );
         return true;
+    }
+    ~Impl()
+    {
+        if( spillThread.joinable() ) spillThread.join();
     }
 
     struct Reader
@@ -1075,6 +1125,12 @@ struct NeutralStatisticsStreamBuilder::Impl
 
     bool MergeGroup( const std::vector<std::filesystem::path>& source,
         const std::filesystem::path& outputPath, const std::function<bool()>& cancelled )
+    {
+        return MergeGroup( source, outputPath, cancelled, nullptr, error, mergeFailures );
+    }
+    bool MergeGroup( const std::vector<std::filesystem::path>& source,
+        const std::filesystem::path& outputPath, const std::function<bool()>& cancelled,
+        const std::atomic<bool>* abort, std::string& error, uint64_t& failures ) const
     {
         AnalysisWorkspaceReservation mergeBudget(workspace,65536+source.size()*16384ull);
         std::vector<Reader> readers;
@@ -1095,7 +1151,7 @@ struct NeutralStatisticsStreamBuilder::Impl
         uint64_t processed = 0;
         while( !queue.empty() )
         {
-            if( ( ++processed & 0x3fff ) == 0 && cancelled && cancelled() )
+            if( ( ++processed & 0x3fff ) == 0 && ( ( cancelled && cancelled() ) || ( abort && abort->load() ) ) )
             { error = "cancelled"; return false; }
             const auto index = queue.top(); queue.pop();
             const auto value = readers[index].value;
@@ -1103,7 +1159,7 @@ struct NeutralStatisticsStreamBuilder::Impl
             if( !readers[index].valid && !readers[index].input.eof() )
             { error = "neutral_merge_read_failed"; return false; }
             if( readers[index].valid ) queue.push( index );
-            if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
+            if( pending && SameFrame( *pending, value ) ) Merge( *pending, value, failures );
             else
             {
                 if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
@@ -1117,26 +1173,135 @@ struct NeutralStatisticsStreamBuilder::Impl
         return true;
     }
 
-    bool Consolidate( const std::function<bool()>& cancelled )
+    static constexpr size_t FanIn = 64;
+    // Merges runs until at most `keep` remain. With several finish workers,
+    // the groups of one pass are merged beside each other; the run files of a
+    // pass are the same either way.
+    bool Consolidate( const std::function<bool()>& cancelled, size_t keep = 1 )
     {
-        constexpr size_t FanIn = 32;
-        while( runs.size() > 1 )
+        while( runs.size() > keep )
         {
+            std::vector<std::vector<std::filesystem::path>> groups;
             std::vector<std::filesystem::path> next;
             for( size_t first = 0; first < runs.size(); first += FanIn )
             {
                 const auto last = std::min( first + FanIn, runs.size() );
-                std::vector<std::filesystem::path> group( runs.begin() + first, runs.begin() + last );
-                const auto output = NextPath( "neutral-merge" );
-                if( !MergeGroup( group, output, cancelled ) ) return false;
-                next.push_back( output );
-                for( const auto& path : group ) RemoveQuietly( path,disk );
+                groups.emplace_back( runs.begin() + first, runs.begin() + last );
+                next.push_back( NextPath( "neutral-merge" ) );
+            }
+            // Each merge opens up to FanIn runs; the C runtime allows 512 open
+            // streams by default, so at most four merges run at once.
+            const auto threads = std::min( { finishWorkers, groups.size(), size_t( 4 ) } );
+            if( threads <= 1 )
+            {
+                for( size_t group = 0; group < groups.size(); ++group )
+                {
+                    if( !MergeGroup( groups[group], next[group], cancelled ) ) return false;
+                    for( const auto& path : groups[group] ) RemoveQuietly( path,disk );
+                }
+            }
+            else
+            {
+                std::vector<std::string> errors( groups.size() );
+                std::vector<uint64_t> failures( groups.size(), 0 );
+                std::vector<std::exception_ptr> exceptions( groups.size() );
+                std::atomic<size_t> nextGroup { 0 };
+                std::atomic<bool> abort { false };
+                std::atomic<size_t> done { 0 };
+                std::vector<std::thread> pool;
+                for( size_t n = 0; n < threads; ++n ) pool.emplace_back( [&] {
+                    for( ;; )
+                    {
+                        const auto group = nextGroup.fetch_add( 1 );
+                        if( group >= groups.size() ) return;
+                        try
+                        {
+                            if( !abort.load() && !MergeGroup( groups[group], next[group], {}, &abort, errors[group], failures[group] ) )
+                                abort = true;
+                        }
+                        catch( ... ) { exceptions[group] = std::current_exception(); abort = true; }
+                        ++done;
+                    }
+                } );
+                // Cancellation is polled here while the merges run.
+                while( done.load() < groups.size() && !abort.load() )
+                {
+                    if( cancelled && cancelled() ) { abort = true; break; }
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
+                }
+                for( auto& thread : pool ) thread.join();
+                for( size_t group = 0; group < groups.size(); ++group )
+                {
+                    mergeFailures += failures[group];
+                    if( exceptions[group] ) std::rethrow_exception( exceptions[group] );
+                    if( !errors[group].empty() && errors[group] != "cancelled" ) { error = errors[group]; return false; }
+                }
+                if( abort.load() ) { error = "cancelled"; return false; }
+                for( const auto& group : groups ) for( const auto& path : group ) RemoveQuietly( path,disk );
             }
             runs = std::move( next );
             runBudget.Resize(runs.size()*(1024+8ull*root.native().size()));
         }
         return true;
     }
+
+    // The final merge of the remaining runs, read as one stream of merged
+    // records, as the file that a last merge pass would write.
+    struct MergedReader
+    {
+        const Impl& impl;
+        std::vector<std::unique_ptr<Reader>> readers;
+        std::vector<size_t> heap;
+        PackedNeutralRun value {};
+        bool valid = false;
+        bool failed = false;
+        bool openFailed = false;
+        uint64_t failures = 0;
+        MergedReader( const Impl& owner, const std::vector<std::filesystem::path>& paths ) : impl( owner )
+        {
+            for( const auto& path : paths )
+            {
+                readers.push_back( std::make_unique<Reader>( path ) );
+                if( !readers.back()->input ) { openFailed = failed = true; return; }
+                if( readers.back()->valid ) heap.push_back( readers.size() - 1 );
+            }
+            std::make_heap( heap.begin(), heap.end(), Later() );
+            Advance();
+        }
+        auto Later() const
+        {
+            return [this]( size_t left, size_t right ) { return impl.Less( readers[right]->value, readers[left]->value ); };
+        }
+        size_t Pop()
+        {
+            std::pop_heap( heap.begin(), heap.end(), Later() );
+            const auto index = heap.back();
+            heap.pop_back();
+            return index;
+        }
+        void Refill( size_t index )
+        {
+            auto& reader = *readers[index];
+            reader.Advance();
+            if( !reader.valid && !reader.input.eof() ) { failed = true; return; }
+            if( reader.valid ) { heap.push_back( index ); std::push_heap( heap.begin(), heap.end(), Later() ); }
+        }
+        void Advance()
+        {
+            valid = false;
+            if( failed || heap.empty() ) return;
+            const auto first = Pop();
+            value = readers[first]->value;
+            Refill( first );
+            while( !failed && !heap.empty() && impl.SameFrame( readers[heap.front()]->value, value ) )
+            {
+                const auto index = Pop();
+                impl.Merge( value, readers[index]->value, failures );
+                Refill( index );
+            }
+            valid = !failed;
+        }
+    };
 };
 
 NeutralStatisticsStreamBuilder::NeutralStatisticsStreamBuilder( std::filesystem::path temporaryRoot,
@@ -1197,17 +1362,26 @@ bool NeutralStatisticsStreamBuilder::AddRegisteredRun( SignatureToken signature,
     const PackedNeutralRun value { signature,
         ( exact ? 1u : 0u ) | ( logical ? 2u : 0u ), frameIndex,
         inclusiveNs, exclusiveNs, waitNs, criticalPathNs, occurrenceCount };
-    const Impl::BufferedKey key { signature, frameIndex };
-    const auto found = m_impl->bufferIndexes.find( key );
-    if( found != m_impl->bufferIndexes.end() ) m_impl->Merge( m_impl->buffer[found->second], value );
-    else
+    auto& impl = *m_impl;
+    auto slot = Impl::BufferedKeyHash {}( Impl::BufferedKey { signature, frameIndex } ) & impl.slotMask;
+    for( ;; slot = ( slot + 1 ) & impl.slotMask )
     {
-        const auto index = m_impl->buffer.size();
-        m_impl->buffer.push_back( value );
-        m_impl->bufferIndexes.emplace( key, index );
+        const auto position = impl.bufferSlots[slot];
+        if( position == 0 )
+        {
+            impl.bufferSlots[slot] = uint32_t( impl.buffer.size() + 1 );
+            impl.buffer.push_back( value );
+            break;
+        }
+        auto& entry = impl.buffer[position - 1];
+        if( entry.signature == signature && entry.frame == frameIndex )
+        {
+            impl.Merge( entry, value );
+            break;
+        }
     }
     ++m_impl->inputRunCount;
-    if( m_impl->buffer.size() >= m_impl->maximumBufferedRuns && !m_impl->Flush() ) return false;
+    if( m_impl->buffer.size() >= m_impl->maximumBufferedRuns && !m_impl->Flush( true ) ) return false;
     return true;
 }
 
@@ -1241,6 +1415,23 @@ size_t NeutralStatisticsStreamBuilder::MaximumBufferedRunsObserved() const
 uint64_t NeutralStatisticsStreamBuilder::InputRunCount() const
 {
     return m_impl ? m_impl->inputRunCount : 0;
+}
+
+void NeutralStatisticsStreamBuilder::SetSignaturePrepare( SignaturePrepare prepare )
+{
+    if(!m_impl || m_impl->finished) throw std::runtime_error("neutral_signature_prepare_after_finish");
+    m_impl->prepare = std::move( prepare );
+}
+
+const std::shared_ptr<void>& NeutralStatisticsStreamBuilder::PreparedSignature() const
+{
+    return m_impl->currentPrepared;
+}
+
+void NeutralStatisticsStreamBuilder::SetFinishWorkers( size_t workers )
+{
+    if(!m_impl || m_impl->finished) throw std::runtime_error("neutral_finish_workers_after_finish");
+    m_impl->finishWorkers = std::max<size_t>( workers, 1 );
 }
 
 void NeutralStatisticsStreamBuilder::SetCompleteFrameFilter(CompleteFrameFilter filter)
@@ -1282,7 +1473,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
     if( !m_impl || m_impl->finished ) { error = "neutral_stream_builder_already_finished"; return false; }
     m_impl->finished = true;
     if( !m_impl->error.empty() ) { error = m_impl->error; return false; }
-    if( !m_impl->Flush() || !m_impl->Consolidate( cancelled ) )
+    if( !m_impl->Flush( false ) || !m_impl->Consolidate( cancelled, Impl::FanIn ) )
     { error = m_impl->error; return false; }
 
     std::map<SignatureKeyView, uint64_t, SignatureKeyLess> denominators;
@@ -1297,6 +1488,10 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
                 std::string(value.key.domain) + ":" + std::string(value.key.signature) );
         }
     }
+    // Overflows of the streamed last merge are only known after it; their
+    // finding takes the place it would have had before the signatures'.
+    const auto overflowFinding = result.qualityFindings.size();
+    const auto overflowBefore = m_impl->mergeFailures;
     if( m_impl->mergeFailures != 0 )
     {
         result.qualityComplete = false;
@@ -1306,28 +1501,35 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     std::map<std::string,uint64_t> streamedOutputs;
     size_t ordinal = 0;
-    auto finishSignature = [&]( uint32_t signatureIndex,
-        std::vector<NeutralMergedFrameValues>& frames ) {
-        if( frames.empty() ) return;
+    // One signature's statistics, computed without touching shared state; its
+    // quality findings are kept in order and applied when it is committed.
+    struct Finished
+    {
+        AnalysisWorkspaceReservation metricBudget;
+        NeutralSignatureAggregate aggregate;
+        std::vector<std::string> findings;
+        std::shared_ptr<void> prepared;
+    };
+    const auto computeSignature = [&]( uint32_t signatureIndex,
+        const std::vector<NeutralMergedFrameValues>& frames, size_t itemOrdinal, Finished& done ) {
         // Four MetricPoint arrays, BuildMetric's values and distribution/MAD
         // scratch. The external path also retains run-name vectors and up to
         // 64 merge streams. Reserve before creating any of those allocations.
-        AnalysisWorkspaceReservation metricBudget(m_impl->workspace,65536+frames.size()*128ull);
+        auto& metricBudget = done.metricBudget;
+        metricBudget = AnalysisWorkspaceReservation(m_impl->workspace,65536+frames.size()*128ull);
         if(frames.size()>m_impl->maximumBufferedValues)
             metricBudget.Add(1024*1024 + (1+(frames.size()-1)/m_impl->maximumBufferedValues)*
                 (2048+8ull*m_impl->root.native().size()));
         const auto& signature = m_impl->Key( signatureIndex );
         metricBudget.Add(8ull*(signature.domain.size()+signature.signature.size()+signature.frameScope.size()));
-        NeutralSignatureAggregate aggregate;
+        auto& aggregate = done.aggregate;
         aggregate.domain = signature.domain;
         aggregate.signatureId = signature.signature;
         aggregate.frameScope = signature.frameScope;
         const auto denominator = denominators.find( signature );
         if( denominator == denominators.end() )
         {
-            result.qualityComplete = false;
-            ++result.unreportedGapCount;
-            result.qualityFindings.push_back( "missing_complete_frame_denominator:" +
+            done.findings.push_back( "missing_complete_frame_denominator:" +
                 std::string(signature.domain) + ":" + std::string(signature.signature) );
             aggregate.exact = false;
         }
@@ -1355,7 +1557,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         const auto knownFrameCount = aggregate.completeFrameCount >= unknownCompleteFrames ?
             aggregate.completeFrameCount - unknownCompleteFrames : 0;
         if( unknownCompleteFrames > aggregate.completeFrameCount ) aggregate.exact = false;
-        const auto itemPrefix = "signature-" + std::to_string( ordinal++ );
+        const auto itemPrefix = "signature-" + std::to_string( itemOrdinal );
         const auto buildMetric=[&](const std::vector<MetricPoint>& points,const char* suffix) {
             const auto prefix=itemPrefix+suffix;
             if(aggregate.outsideCompleteFrameCount==0)
@@ -1380,9 +1582,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             aggregate.exclusive.whenPresent.exact && aggregate.wait.whenPresent.exact && aggregate.criticalPath.whenPresent.exact;
         if( !aggregate.exact )
         {
-            result.qualityComplete = false;
-            ++result.unreportedGapCount;
-            result.qualityFindings.push_back( "non_exact_signature_statistics:" +
+            done.findings.push_back( "non_exact_signature_statistics:" +
                 std::string(signature.domain) + ":" + std::string(signature.signature) );
         }
         // Known observations remain useful, but a partial source cannot claim
@@ -1399,9 +1599,21 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
                 metric->pattern = AnomalyPattern::None;
             }
         }
+        if( m_impl->prepare ) done.prepared = m_impl->prepare( aggregate, frames );
+    };
+    const auto commitSignature = [&]( Finished& done, std::vector<NeutralMergedFrameValues>& frames ) {
+        for( auto& finding : done.findings )
+        {
+            result.qualityComplete = false;
+            ++result.unreportedGapCount;
+            result.qualityFindings.push_back( std::move( finding ) );
+        }
+        auto& aggregate = done.aggregate;
         result.maximumBufferedValuesObserved = std::max( result.maximumBufferedValuesObserved,
             std::min<uint64_t>( m_impl->maximumBufferedValues, aggregate.presentFrameCount ) );
+        m_impl->currentPrepared = std::move( done.prepared );
         if( signatureSink ) signatureSink( aggregate, frames );
+        m_impl->currentPrepared.reset();
         ++streamedOutputs[aggregate.domain];
         ++m_impl->outputSignatureCount;
         if(retainResults)
@@ -1411,10 +1623,162 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         }
     };
 
+    // With several workers, signatures are computed ahead of the one committed
+    // next, a bounded number at a time; each is committed in signature order.
+    struct Task
+    {
+        uint32_t signature = 0;
+        size_t ordinal = 0;
+        std::vector<NeutralMergedFrameValues> frames;
+        AnalysisWorkspaceReservation framesWorkspace;
+        Finished done;
+        std::exception_ptr error;
+        bool ready = false;
+    };
+    std::mutex taskMutex;
+    std::condition_variable taskChanged;
+    std::deque<std::unique_ptr<Task>> tasks;
+    size_t claimed = 0;
+    // Signatures computed ahead hold their frames, metric scratch and prepared
+    // output; their estimated bytes stay within an eighth of the workspace.
+    uint64_t tasksBytes = 0;
+    const auto taskBytes = []( size_t frames ) { return uint64_t( 196608 ) + 512ull * frames; };
+    const uint64_t taskBytesLimit = m_impl->workspace ? m_impl->workspace->Snapshot().maximumBytes / 8 : ( uint64_t( 512 ) << 20 );
+    bool closing = false;
+    std::vector<std::thread> pool;
+    struct Join
+    {
+        std::mutex& mutex; std::condition_variable& changed; bool& closing; std::vector<std::thread>& pool;
+        ~Join()
+        {
+            { std::lock_guard lock( mutex ); closing = true; }
+            changed.notify_all();
+            for( auto& thread : pool ) thread.join();
+        }
+    } join { taskMutex, taskChanged, closing, pool };
+    auto workers = m_impl->finishWorkers;
+    const auto work = [&] {
+        for(;;)
+        {
+            Task* task = nullptr;
+            {
+                std::unique_lock lock( taskMutex );
+                taskChanged.wait( lock, [&] { return closing || claimed < tasks.size(); } );
+                if( closing || claimed >= tasks.size() ) return;
+                task = tasks[claimed++].get();
+            }
+            try { computeSignature( task->signature, task->frames, task->ordinal, task->done ); }
+            catch( ... ) { task->error = std::current_exception(); }
+            {
+                std::lock_guard lock( taskMutex );
+                task->ready = true;
+            }
+            taskChanged.notify_all();
+        }
+    };
+    const auto isBudget = []( const std::exception_ptr& error ) {
+        try { std::rethrow_exception( error ); }
+        catch( const std::exception& e ) { return std::string_view( e.what() ).find( "analysis_workspace_budget" ) != std::string_view::npos; }
+        catch( ... ) { return false; }
+    };
+    const auto commitFront = [&] {
+        std::unique_ptr<Task> task;
+        {
+            std::unique_lock lock( taskMutex );
+            taskChanged.wait( lock, [&] { return tasks.front()->ready; } );
+            task = std::move( tasks.front() );
+            tasks.pop_front();
+            --claimed;
+            tasksBytes -= taskBytes( task->frames.size() );
+        }
+        if( task->error && isBudget( task->error ) )
+        {
+            // Signatures computed ahead used the workspace a sequential finish
+            // would have had. Drop them and finish the rest one at a time.
+            {
+                std::lock_guard lock( taskMutex );
+                closing = true;
+            }
+            taskChanged.notify_all();
+            for( auto& thread : pool ) thread.join();
+            pool.clear();
+            std::deque<std::unique_ptr<Task>> rest;
+            rest.push_back( std::move( task ) );
+            for( auto& later : tasks ) rest.push_back( std::move( later ) );
+            tasks.clear(); claimed = 0; tasksBytes = 0;
+            workers = 1;
+            for( auto& item : rest ) { item->done.metricBudget = AnalysisWorkspaceReservation(); item->done.prepared.reset(); item->done.findings.clear(); }
+            for( auto& item : rest )
+            {
+                Finished done;
+                computeSignature( item->signature, item->frames, item->ordinal, done );
+                commitSignature( done, item->frames );
+                item.reset();
+            }
+            return;
+        }
+        if( task->error ) std::rethrow_exception( task->error );
+        commitSignature( task->done, task->frames );
+    };
+    auto finishSignature = [&]( uint32_t signatureIndex, std::vector<NeutralMergedFrameValues>& frames,
+        AnalysisWorkspaceReservation& framesWorkspace ) {
+        if( frames.empty() ) return;
+        if( workers <= 1 )
+        {
+            Finished done;
+            computeSignature( signatureIndex, frames, ordinal++, done );
+            commitSignature( done, frames );
+            return;
+        }
+        if( pool.empty() ) for( size_t n = 0; n < workers; ++n ) pool.emplace_back( work );
+        // Make room for this signature first; it may run alone if it is large.
+        // The workspace keeps half its maximum for the committing thread.
+        for( ;; )
+        {
+            {
+                std::lock_guard lock( taskMutex );
+                if( tasks.empty() || ( tasks.size() < 4 * workers && tasksBytes + taskBytes( frames.size() ) <= taskBytesLimit &&
+                    ( !m_impl->workspace || m_impl->workspace->Snapshot().currentBytes <= m_impl->workspace->Snapshot().maximumBytes / 2 ) ) ) break;
+            }
+            commitFront();
+            if( workers <= 1 ) break;
+        }
+        if( workers <= 1 )
+        {
+            Finished done;
+            computeSignature( signatureIndex, frames, ordinal++, done );
+            commitSignature( done, frames );
+            return;
+        }
+        auto task = std::make_unique<Task>();
+        task->signature = signatureIndex;
+        task->ordinal = ordinal++;
+        task->frames = std::move( frames );
+        task->framesWorkspace = std::move( framesWorkspace );
+        framesWorkspace = AnalysisWorkspaceReservation( m_impl->workspace );
+        frames = {};
+        {
+            std::lock_guard lock( taskMutex );
+            tasksBytes += taskBytes( task->frames.size() );
+            tasks.push_back( std::move( task ) );
+        }
+        taskChanged.notify_all();
+    };
+    const auto finishAll = [&] {
+        for( ;; )
+        {
+            {
+                std::lock_guard lock( taskMutex );
+                if( tasks.empty() ) break;
+            }
+            commitFront();
+        }
+    };
+
     if( !m_impl->runs.empty() )
     {
-        Impl::Reader reader( m_impl->runs.front() );
-        if( !reader.input ) { error = "neutral_final_run_open_failed"; return false; }
+        Impl::MergedReader reader( *m_impl, m_impl->runs );
+        if( reader.openFailed ) { error = "neutral_final_run_open_failed"; return false; }
         uint32_t currentSignature = 0;
         bool haveSignature = false;
         AnalysisWorkspaceReservation frameBudget(m_impl->workspace);
@@ -1426,11 +1790,11 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             { error = "cancelled"; return false; }
             const auto value = reader.value;
             reader.Advance();
-            if( !reader.valid && !reader.input.eof() ) { error = "neutral_final_run_read_failed"; return false; }
+            if( reader.failed ) { error = "neutral_final_run_read_failed"; return false; }
             if( haveSignature && value.signature != currentSignature )
             {
                 if(cancelled && cancelled()) { error = "cancelled"; return false; }
-                finishSignature( currentSignature, frames );
+                finishSignature( currentSignature, frames, frameBudget );
                 if(cancelled && cancelled()) { error = "cancelled"; return false; }
                 frames.clear();
             }
@@ -1447,10 +1811,20 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
                 ( value.flags & 1u ) != 0, ( value.flags & 2u ) != 0 } );
         }
         if(cancelled && cancelled()) { error = "cancelled"; return false; }
-        if( haveSignature ) finishSignature( currentSignature, frames );
+        if( haveSignature ) finishSignature( currentSignature, frames, frameBudget );
+        finishAll();
         if(cancelled && cancelled()) { error = "cancelled"; return false; }
-        reader.input.close();
-        RemoveQuietly( m_impl->runs.front(),m_impl->disk );
+        if( reader.failures != 0 )
+        {
+            result.qualityComplete = false;
+            result.unreportedGapCount += reader.failures;
+            if( overflowBefore == 0 )
+                result.qualityFindings.insert( result.qualityFindings.begin() + ptrdiff_t( overflowFinding ),
+                    "duration_or_occurrence_overflow_during_frame_merge" );
+            m_impl->mergeFailures += reader.failures;
+        }
+        reader.readers.clear();
+        for( const auto& path : m_impl->runs ) RemoveQuietly( path,m_impl->disk );
         m_impl->runs.clear();
     }
 

@@ -2,6 +2,7 @@
 #define __TRACYWORKERTRACESOURCE_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyFrameTriageSource.hpp"
 #include "TracyMemoryAnalysis.hpp"
 
 #include <filesystem>
@@ -55,13 +56,16 @@ enum class WorkerTraceLoadMode
 };
 
 class WorkerTraceSource final : public TraceSource, public NativeBoundedTraceSource,
-    public GpuCatalogBoundedScanSource
+    public GpuCatalogBoundedScanSource, public FrameTriageSource
 {
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
 
     static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full, SerializedZoneSink* serializedZoneSink = nullptr );
     static WorkerLoadProgress GetLoadProgress();
+    std::vector<JnGpuReferencePassData> ScanGpuReferencePasses( size_t offset, size_t limit ) const;
+    std::vector<JnGpuReferenceUseData> ScanGpuReferenceUses( size_t offset, size_t limit ) const;
+    std::vector<JnGpuReferenceEndData> ScanGpuReferenceEnds( size_t offset, size_t limit ) const;
     static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;
 
@@ -87,6 +91,8 @@ public:
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
+    void VisitTopLevelGpuZones( const std::function<void( size_t, int64_t, int64_t )>& visit ) const override;
+    void VisitPlotPoints( std::string_view plotRef, const std::function<void( int64_t, double )>& visit ) const override;
 
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;

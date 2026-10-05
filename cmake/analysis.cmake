@@ -15,6 +15,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyCandidatePolicyCache.cpp
     ${TRACY_ANALYSIS_DIR}/TracyExactStatistics.cpp
     ${TRACY_ANALYSIS_DIR}/TracyFrameCpuScanner.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyFrameTriage.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuJobManagedScanner.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryIoSamplingTelemetryScanner.cpp
     ${TRACY_ANALYSIS_DIR}/TracyHash.cpp
@@ -22,6 +23,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisCache.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyNeutralAggregateStore.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyWindowedTraceSource.cpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.cpp
 )
 
@@ -36,10 +38,13 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyDeterministicScanTypes.hpp
     ${TRACY_ANALYSIS_DIR}/TracyAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyBoundedScanCursor.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyCpuZoneScanSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyCandidatePolicy.hpp
     ${TRACY_ANALYSIS_DIR}/TracyCandidatePolicyCache.hpp
     ${TRACY_ANALYSIS_DIR}/TracyExactStatistics.hpp
     ${TRACY_ANALYSIS_DIR}/TracyFrameCpuScanner.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyFrameTriage.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyFrameTriageSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuJobManagedScanner.hpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryIoSamplingTelemetryScanner.hpp
     ${TRACY_ANALYSIS_DIR}/TracyHash.hpp
@@ -48,6 +53,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyNeutralAggregateStore.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSource.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyWindowedTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.hpp
 )
 

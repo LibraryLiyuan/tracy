@@ -13,6 +13,13 @@ namespace tracy
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
 static constexpr uint16_t JnTraceSchemaVersion = 12;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
+// Optional footer after the complete schema-12 JN section. Older readers stop at
+// that section and can still open the file. New readers preserve image indices
+// whose corresponding Frame has not arrived (the standard image body omits them).
+static constexpr uint32_t JnFrameImageRefsMagic = 0x3149464A; // JFI1
+static constexpr uint16_t JnFrameImageRefsVersion = 1;
+static constexpr uint32_t JnParametersMagic = 0x314D504A; // JPM1, recorded parameter definitions
+static constexpr uint16_t JnParametersVersion = 1;
 
 #pragma pack( push, 1 )
 

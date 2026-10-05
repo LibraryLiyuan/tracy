@@ -3,6 +3,7 @@
 #include "TracyStreamSnapshotMap.hpp"
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <thread>
 namespace capturegui
 {
@@ -18,6 +19,16 @@ static uint64_t Number(const Json &j)
     if (j.is_string())
         return std::stoull(j.get<std::string>());
     return j.get<uint64_t>();
+}
+// Removes the work directories of event store builds of this journal that
+// ended without publishing. Only called while no store build of it runs.
+static void RemoveStoreWork(const fs::path &stream)
+{
+    const auto prefix = stream.filename().wstring() + L".store.building-";
+    std::error_code e;
+    for (auto &entry : fs::directory_iterator(stream.parent_path(), e))
+        if (entry.path().filename().wstring().starts_with(prefix))
+            fs::remove_all(entry.path(), e);
 }
 Controller::~Controller()
 {
@@ -130,13 +141,21 @@ bool Controller::Start(const Settings &s, ProcessIdentity t)
     Spawn([=, this] { Work(s, t); });
     return true;
 }
-bool Controller::Recover(const fs::path &p)
+bool Controller::Recover(const fs::path &p, const Settings *currentTools)
 {
     if (Snapshot().busy)
         return false;
+    const bool useCurrentTools = currentTools != nullptr;
+    const auto toolDirectory = currentTools ? currentTools->toolDirectory : std::string();
+    const bool customTools = currentTools && currentTools->customTools;
     Spawn([=, this] {
         auto task = ReadJson(p / L"task.json");
         auto settings = Settings::FromJson(task.at("settings"));
+        if (useCurrentTools)
+        {
+            settings.toolDirectory = toolDirectory;
+            settings.customTools = customTools;
+        }
         Work(settings, ProcessIdentity::FromJson(task.at("target")), p);
     });
     return true;
@@ -180,10 +199,11 @@ void Controller::Reset()
 void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recover)
 {
     const bool restoring = !recover.empty();
+    PreferBundledTools(s, ExecutableDirectory());
     m_directory.clear();
     m_task = Json::object();
     fs::path tools = fs::absolute(Wide(s.toolDirectory));
-    for (auto name : {L"tracy-capture.exe", L"tracy-stream-convert.exe", L"tracy-query.exe"})
+    for (auto name : {L"tracy-capture.exe", L"tracy-stream-export.exe", L"tracy-query.exe"})
         if (!fs::is_regular_file(tools / name))
             throw std::runtime_error("缺少必需工具：" + PathText(tools / name));
     if (s.port < 1 || s.port > 65535 || s.drainSeconds < 0 || s.drainSeconds > 3600 || s.seconds < 1 ||
@@ -254,6 +274,30 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
     auto describe = mcp.Tool("tracy_describe", Json::object());
     if (describe.value("schema_version", "") != "1.35.0")
         throw std::runtime_error("需要 Query schema 1.35.0");
+    // The event store is built while the recording runs, following the
+    // journal; the stop marker tells it that the journal is final.
+    const auto storeStop = m_directory / L"store.follow.stop", storeSummary = m_directory / L"store-summary.json";
+    Process storeBuild;
+    bool storeStarted = false;
+    // Saving is timed from the stop request to publication.
+    std::optional<std::chrono::steady_clock::time_point> stopRequestedAt;
+    const auto secondsSince = [](std::chrono::steady_clock::time_point since) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+    };
+    const auto startStore = [&] {
+        std::vector<std::string> args = {PathText(stream), "--store-only", "--follow", PathText(storeStop), "--summary", PathText(storeSummary)};
+        storeBuild.Start(tools / L"tracy-stream-export.exe", args, logDir / L"store.log");
+        Owned("store", storeBuild, tools / L"tracy-stream-export.exe", args);
+        storeStarted = true;
+    };
+    if (restoring)
+        for (auto &p : previous)
+            if (p.value("role", "") == "store" && Alive(ProcessIdentity::FromJson(p["identity"])))
+            {
+                storeBuild.Adopt(ProcessIdentity::FromJson(p["identity"]));
+                storeStarted = true;
+                break;
+            }
     bool captureNeeded = !restoring;
     Process capture;
     bool adopted = false;
@@ -294,19 +338,35 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
             Owned("capture", capture, tools / L"tracy-capture.exe", args);
         }
         State("connecting", "正在连接目标；首次数据到达后开始计时");
-        auto started = std::chrono::steady_clock::now();
+        auto lastConnectionProgress = std::chrono::steady_clock::now();
+        uint64_t lastConnectionBytes = FileSize(stream);
+        Json lastObserved = Json::object();
         bool recording = false, stopSent = fs::exists(stop);
         while (capture.Running())
         {
             CheckCancelled();
-            Json observed = Json::object();
+            if (!storeStarted && fs::exists(stream) && !fs::exists(storeSummary))
+                startStore();
             try
             {
-                observed = ReadJson(status);
+                auto observed = ReadJson(status);
+                if (observed.is_object() && observed.contains("first_data_received"))
+                {
+                    // A transient read or malformed status must not erase a connected session.
+                    (void)observed.value("first_data_received", false);
+                    (void)observed.value("elapsed_ms", 0ull);
+                    (void)observed.value("client_pid", 0ull);
+                    lastObserved = std::move(observed);
+                }
             }
             catch (...)
             {
             }
+            const auto &observed = lastObserved;
+            const auto currentConnectionBytes = FileSize(stream);
+            if (currentConnectionBytes > lastConnectionBytes)
+                lastConnectionProgress = std::chrono::steady_clock::now();
+            lastConnectionBytes = currentConnectionBytes;
             bool data = observed.value("first_data_received", false);
             uint64_t elapsed = observed.value("elapsed_ms", 0ull);
             auto memory = capture.Memory();
@@ -331,7 +391,7 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
                 reason = "memory_protection";
             else if (!Alive(target))
                 reason = "target_exited";
-            else if (!data && std::chrono::steady_clock::now() - started > 60s)
+            else if (CaptureConnectionTimedOut(recording, data, uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lastConnectionProgress).count())))
                 reason = "connection_timeout";
             if (!reason.empty() && !stopSent)
             {
@@ -341,21 +401,29 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
                 if (!marker)
                     throw std::runtime_error("无法请求正常停止");
                 stopSent = true;
+                stopRequestedAt = std::chrono::steady_clock::now();
                 m_task["stop_reason"] = reason;
                 State(data ? "draining" : "connecting", data ? "正在排空，请保持游戏运行" : "正在取消连接");
             }
             {
                 std::lock_guard lock(m_mutex);
                 m_view.elapsedMs = elapsed;
-                m_view.streamBytes = FileSize(stream);
+                m_view.streamBytes = currentConnectionBytes;
                 m_view.memoryBytes = memory;
                 m_view.freeBytes = free;
+                m_view.recordingBytesPerSecond = observed.value("bytes_per_second", 0.0);
+                m_view.remainingDiskSeconds = observed.value("remaining_disk_seconds", -1.0);
+                m_view.committedBytes = observed.contains("committed_bytes") ? Number(observed["committed_bytes"]) : 0;
+                m_view.durableBytes = observed.contains("durable_bytes") ? Number(observed["durable_bytes"]) : 0;
+                m_view.backpressureWaits = observed.contains("backpressure_wait_count") ? Number(observed["backpressure_wait_count"]) : 0;
                 if (free <= s.warnGiB * (1ull << 30) && !stopSent)
                     m_view.message = "磁盘空间不足警告；正在录制";
             }
             std::this_thread::sleep_for(200ms);
         }
         m_task["capture_exit_code"] = capture.ExitCode();
+        if (stopRequestedAt)
+            m_task["processing_seconds"]["drain"] = secondsSince(*stopRequestedAt);
         try
         {
             auto observed = ReadJson(status);
@@ -386,13 +454,19 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
     std::this_thread::sleep_for(1000ms);
     if (FileSize(stream) != size)
         throw std::runtime_error("stream 仍在变化，不能转换");
+    const auto journalScanStart = std::chrono::steady_clock::now();
     auto scan = tracy::stream::ScanJournal(stream);
+    m_task["processing_seconds"]["journal_scan"] = secondsSince(journalScanStart);
     if (!scan.HasRecoverablePrefix() || scan.header.protocolVersion != 90)
         throw std::runtime_error("stream 不可恢复或协议不是 90");
     bool complete = scan.complete && m_task.value("capture_exit_code", DWORD(999)) == 0;
+    if (m_task.contains("capture_status") && m_task["capture_status"].contains("capture_complete"))
+        complete = complete && m_task["capture_status"].value("capture_complete", false);
     m_task["completeness"] = complete ? "Complete" : "RecoverablePrefix";
     m_task["watermark_ns"] = std::to_string(scan.lastMonotonicNs);
+    const auto streamIdentityStart = std::chrono::steady_clock::now();
     auto streamSha = Sha256(stream);
+    m_task["processing_seconds"]["stream_identity"] = secondsSince(streamIdentityStart);
     if (restoring && m_task.contains("stream_sha256") && m_task["stream_sha256"] != streamSha)
         throw std::runtime_error("原始 stream 已变化，旧候选和校验证据失效");
     m_task["stream_sha256"] = streamSha;
@@ -400,6 +474,83 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
     {
         std::lock_guard lock(m_mutex);
         m_view.gameMayClose = true;
+    }
+    // The journal is final: the following store build finishes. If it did not
+    // run or failed, the store is built (or verified) from the final journal.
+    {
+        std::ofstream marker(storeStop, std::ios::binary);
+    }
+    if (storeStarted)
+    {
+        State("converting", "正在完成事件库，现在可以关闭游戏");
+        { std::lock_guard lock(m_mutex); m_view.stage = "EventStore"; m_view.percent = -1; }
+        const auto storeFinishStart = std::chrono::steady_clock::now();
+        while (storeBuild.Running())
+        {
+            CheckCancelled();
+            { std::lock_guard lock(m_mutex); m_view.memoryBytes = storeBuild.Memory(); }
+            std::this_thread::sleep_for(250ms);
+        }
+        m_task["store_follow_exit_code"] = storeBuild.ExitCode();
+        m_task["processing_seconds"]["store_finish"] = secondsSince(storeFinishStart);
+    }
+    RemoveStoreWork(stream);
+    // A published .tracy snapshot keeps the task a snapshot task on recovery.
+    const auto storeDirectory = fs::path(stream.wstring() + L".store");
+    const bool storeMode = m_task.value("output_kind", "") == "store" ||
+                           (!fs::exists(final) && (s.storeMinutes <= 0 || m_task.value("elapsed_ms", 0ull) >= uint64_t(s.storeMinutes) * 60000ull));
+    if (storeMode && fs::exists(storeSummary) && !fs::exists(storeDirectory / L"manifest.json"))
+        fs::remove(storeSummary);
+    if (!fs::exists(storeSummary) && storeMode)
+    {
+        State("converting", "正在建立事件库，现在可以关闭游戏");
+        { std::lock_guard lock(m_mutex); m_view.stage = "EventStore"; m_view.percent = -1; }
+        Process build;
+        std::vector<std::string> args = {PathText(stream), "--store-only", "--summary", PathText(storeSummary)};
+        build.Start(tools / L"tracy-stream-export.exe", args, logDir / L"store-build.log");
+        Owned("store", build, tools / L"tracy-stream-export.exe", args);
+        const auto storeBuildStart = std::chrono::steady_clock::now();
+        while (build.Running())
+        {
+            CheckCancelled();
+            { std::lock_guard lock(m_mutex); m_view.memoryBytes = build.Memory(); }
+            std::this_thread::sleep_for(250ms);
+        }
+        m_task["processing_seconds"]["store_build"] = secondsSince(storeBuildStart);
+        if (build.ExitCode() != 0 || !fs::exists(storeSummary))
+            throw std::runtime_error("事件库建立失败；原始 stream 已保留，可重试。退出码 " + std::to_string(build.ExitCode()));
+    }
+    if (storeMode)
+    {
+        // Long recordings are published as the journal and its event store:
+        // the store's summary is the quality report, and the long-capture view
+        // and Query read the store directly.
+        query.Kill();
+        auto summary = ReadJson(storeSummary);
+        if (summary.value("source_sha256", "") != streamSha || !fs::exists(storeDirectory / L"manifest.json"))
+            throw std::runtime_error("事件库与原始 stream 不一致，拒绝发布");
+        m_task["output_kind"] = "store";
+        m_task["store"] = PathText(storeDirectory);
+        m_task["final"] = PathText(stream);
+        m_task["store_summary"] = PathText(storeSummary);
+        m_task["quality"] = summary;
+        m_task["quality_passed"] = summary.value("valid", false);
+        if (stopRequestedAt)
+            m_task["processing_seconds"]["save_total"] = secondsSince(*stopRequestedAt);
+        Persist();
+        {
+            std::lock_guard lock(m_mutex);
+            m_view.quality = summary.value("valid", false) ? "事件库已建立并校验；仍需查看缺失域和采集限制。"
+                                                           : "事件库已建立，但存在数据质量问题；相关域的分析受限。";
+            m_view.percent = 100;
+        }
+        State(complete ? "complete" : "partial",
+              complete ? "录制完整，事件库已建立并校验" : "仅有效前缀可用于分析；尾部数据不完整");
+        if (fs::exists(m_directory / L"interrupted.json"))
+            fs::rename(m_directory / L"interrupted.json", logDir / L"previous-interruption.json");
+        if (s.sound)
+            MessageBeep(MB_OK);
+        return;
     }
     if (fs::exists(final))
     {
@@ -441,6 +592,7 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
             fs::rename(candidate, failed / (L"attempt-" + std::to_wstring(attempt) + L".pending.tracy"));
         }
         State("converting", "正在转换，现在可以关闭游戏");
+        { std::lock_guard lock(m_mutex); m_view.stage = "BoundedExport"; m_view.percent = -1; }
         Process converter;
         bool adoptedConverter = false;
         if (restoring)
@@ -451,45 +603,39 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
                     adoptedConverter = true;
                     break;
                 }
-        fs::path progress = m_directory / L"conversion-progress.json";
         if (!adoptedConverter)
         {
-            std::vector<std::string> args = {"-i",
-                                             PathText(stream),
-                                             "-o",
-                                             PathText(candidate),
-                                             "--progress-json",
-                                             PathText(progress),
-                                             "--report-json",
-                                             PathText(logDir / L"conversion-report.json"),
-                                             "--keep-failed-output"};
-            converter.Start(tools / L"tracy-stream-convert.exe", args, logDir / L"converter.log");
-            Owned("converter", converter, tools / L"tracy-stream-convert.exe", args);
+            std::vector<std::string> args = {PathText(stream), PathText(candidate)};
+            converter.Start(tools / L"tracy-stream-export.exe", args, logDir / L"converter.log");
+            Owned("converter", converter, tools / L"tracy-stream-export.exe", args);
+            m_task["conversion_backend"] = "bounded-export";
+            Persist();
         }
         while (converter.Running())
         {
             CheckCancelled();
-            try
             {
-                auto p = ReadJson(progress);
                 std::lock_guard lock(m_mutex);
-                m_view.stage = p.value("stage", "");
-                m_view.percent = p.value("percent", -1.0);
-                m_view.memoryBytes = p.contains("working_set_bytes") ? Number(p["working_set_bytes"]) : 0;
-            }
-            catch (...)
-            {
+                m_view.memoryBytes = converter.Memory();
             }
             std::this_thread::sleep_for(250ms);
         }
         if (converter.ExitCode() != 0 || !fs::is_regular_file(candidate))
             throw std::runtime_error("转换失败；原始 stream 已保留，可重试。退出码 " +
                                      std::to_string(converter.ExitCode()));
+        State("converting", "正在计算转换文件身份");
+        { std::lock_guard lock(m_mutex); m_view.stage = "FileIdentity"; m_view.percent = -1; }
+        const auto identityStart = std::chrono::steady_clock::now();
         m_task["candidate_sha256"] = Sha256(candidate);
+        m_task["processing_seconds"]["candidate_identity"] = std::chrono::duration<double>(std::chrono::steady_clock::now()-identityStart).count();
         Persist();
     }
     CheckCancelled();
     State("validating", "正在校验文件和采集质量");
+    const auto queryLoadStart = std::chrono::steady_clock::now();
+    auto queryStateStarted = queryLoadStart;
+    std::string queryState = "opening";
+    Json queryStateSeconds = Json::object();
     auto opened = mcp.Tool("tracy_trace_open", {{"path", PathText(candidate)}});
     auto trace = opened.at("data").at("trace_id").get<std::string>();
     for (;;)
@@ -497,6 +643,11 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         CheckCancelled();
         auto statusReply = mcp.Tool("tracy_trace_status", {{"trace_id", trace}});
         auto state = statusReply.at("data").at("status").at("state").get<std::string>();
+        const auto stateObservedAt = std::chrono::steady_clock::now();
+        queryStateSeconds[queryState] = queryStateSeconds.value(queryState, 0.0) +
+            std::chrono::duration<double>(stateObservedAt-queryStateStarted).count();
+        queryStateStarted = stateObservedAt;
+        queryState = state;
         if (state == "ready")
             break;
         if (state == "failed" || state == "closed")
@@ -509,6 +660,9 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         std::this_thread::sleep_for(400ms);
     }
     {
+        m_task["processing_seconds"]["query_load_and_index"] = std::chrono::duration<double>(std::chrono::steady_clock::now()-queryLoadStart).count();
+        m_task["processing_seconds"]["query_states_sampled"] = queryStateSeconds;
+        m_task["query_state_poll_period_ms"] = 400;
         std::lock_guard lock(m_mutex);
         m_view.stage = "checking";
         m_view.percent = -1;
@@ -518,6 +672,7 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
                         {{"trace_id", trace}, {"method", method}, {"params", Json::object()}});
     };
     Json evidence;
+    const auto validationStart = std::chrono::steady_clock::now();
     for (auto method : {"trace.identity", "trace.app_info", "system.capabilities", "capture.context",
                         "capture.coverage", "gpu.catalog.status", "gpu.catalog.validation"})
     {
@@ -543,6 +698,7 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         validation = mcp.Tool("tracy_job", {{"operation", "result"}, {"job_id", id}});
     }
     evidence["validation"] = validation;
+    m_task["processing_seconds"]["query_validation"] = std::chrono::duration<double>(std::chrono::steady_clock::now()-validationStart).count();
     AtomicJson(logDir / L"validation.json", evidence);
     {
         std::lock_guard lock(m_mutex);
@@ -558,7 +714,10 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         CheckCancelled();
         std::this_thread::sleep_for(25ms);
     }
-    if (!CanPublish(true, m_task.at("candidate_sha256").get<std::string>() == Sha256(candidate),
+    const auto publishIdentityStart = std::chrono::steady_clock::now();
+    const auto publicationIdentity = Sha256(candidate);
+    m_task["processing_seconds"]["publication_identity"] = std::chrono::duration<double>(std::chrono::steady_clock::now()-publishIdentityStart).count();
+    if (!CanPublish(true, m_task.at("candidate_sha256").get<std::string>() == publicationIdentity,
                     scan.HasRecoverablePrefix()))
         throw std::runtime_error("候选身份变化，拒绝发布");
     m_task["validation_evidence"] = PathText(logDir / L"validation.json");
@@ -618,7 +777,9 @@ std::vector<Json> Controller::History(const fs::path &output)
 std::string Controller::AnalysisRequest(const Json &task)
 {
     auto s = task.at("settings");
+    const bool store = task.value("output_kind", "") == "store";
     return "请使用 diagnose-jn-unity-tracy 技能分析本次录制。\n文件：" + task.value("final", "") +
+           ( store ? "\n格式：tracy-stream 录制及其事件库（" + task.value("store", "") + "），由 Query 直接读取事件库" : std::string() ) +
            "\n名称：" + task.value("name", "") + "\n场景：" + s.value("scene", "") + "\n操作备注：" +
            s.value("note", "") + "\n完整性：" + task.value("completeness", "未知") + "\n校验证据：" +
            task.value("validation_evidence", "") +

@@ -2,11 +2,14 @@
 #include <backends/imgui_impl_opengl3.h>
 #include <backends/imgui_impl_opengl3_loader.h>
 
+#include <algorithm>
 #include <chrono>
 #include <GLFW/glfw3.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "profiler/TracyConfig.hpp"
 #include "profiler/TracyImGui.hpp"
@@ -29,6 +32,120 @@ static RunQueue* s_mainThreadTasks;
 static WindowPosition* s_winPos;
 static bool s_iconified;
 static float s_prevScale = -1;
+#if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
+#  include <Windows.h>
+static std::chrono::steady_clock::time_point s_streamFrameStart;
+static double s_streamFrameWork = 0;
+static double s_streamFrameUi = 0, s_streamFrameRender = 0;
+static bool s_streamFrameTimed = false;
+static double s_streamCpuStart = -1, s_streamFrameCpu = -1;
+static bool s_streamAdaptivePresentation = false;
+static double s_streamFramePresent = 0;
+void ConfigureStreamingPresentation( bool active, bool unpaced )
+{
+    static int interval = 1;
+    const int requested = active ? 0 : 1;
+    if( requested != interval )
+    {
+        glfwSwapInterval( requested );
+        interval = requested;
+    }
+    s_streamAdaptivePresentation = active && !unpaced;
+}
+static double StreamingThreadCpuMilliseconds()
+{
+    FILETIME created, exited, kernel, user;
+    if( !GetThreadTimes( GetCurrentThread(), &created, &exited, &kernel, &user ) ) return -1;
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    return double( k.QuadPart + u.QuadPart ) / 10000.;
+}
+// A screenshot of the next rendered frame, for checking the long-capture
+// views without a person at the screen. Written as an uncompressed PNG.
+static std::string s_streamScreenshot;
+void RequestStreamingScreenshot( const char* path ) { s_streamScreenshot = path; }
+static void WriteStreamingScreenshot( int w, int h )
+{
+    std::vector<uint8_t> pixels( size_t( w ) * h * 4 );
+    glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+    glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data() );
+    std::vector<uint8_t> raw;
+    raw.reserve( size_t( w * 3 + 1 ) * h );
+    for( int y = h - 1; y >= 0; --y )
+    {
+        raw.push_back( 0 );
+        for( int x = 0; x < w; ++x )
+        {
+            const auto* p = &pixels[( size_t( y ) * w + x ) * 4];
+            raw.insert( raw.end(), p, p + 3 );
+        }
+    }
+    uint32_t table[256];
+    for( uint32_t n = 0; n < 256; ++n )
+    {
+        uint32_t c = n;
+        for( int k = 0; k < 8; ++k ) c = c & 1 ? 0xEDB88320u ^ ( c >> 1 ) : c >> 1;
+        table[n] = c;
+    }
+    const auto crc = [&]( const uint8_t* data, size_t size, uint32_t c ) {
+        for( size_t n = 0; n < size; ++n ) c = table[( c ^ data[n] ) & 0xFF] ^ ( c >> 8 );
+        return c;
+    };
+    std::vector<uint8_t> zlib = { 0x78, 0x01 };
+    uint32_t a = 1, b = 0;
+    for( size_t offset = 0; offset < raw.size(); )
+    {
+        const auto size = std::min<size_t>( 65535, raw.size() - offset );
+        zlib.push_back( offset + size == raw.size() ? 1 : 0 );
+        zlib.push_back( uint8_t( size ) );
+        zlib.push_back( uint8_t( size >> 8 ) );
+        zlib.push_back( uint8_t( ~size ) );
+        zlib.push_back( uint8_t( ~size >> 8 ) );
+        zlib.insert( zlib.end(), raw.begin() + offset, raw.begin() + offset + size );
+        for( size_t n = offset; n < offset + size; ++n )
+        {
+            a = ( a + raw[n] ) % 65521;
+            b = ( b + a ) % 65521;
+        }
+        offset += size;
+    }
+    const uint32_t adler = ( b << 16 ) | a;
+    for( int shift = 24; shift >= 0; shift -= 8 ) zlib.push_back( uint8_t( adler >> shift ) );
+    FILE* file = fopen( s_streamScreenshot.c_str(), "wb" );
+    if( !file ) return;
+    const auto chunk = [&]( const char* type, const std::vector<uint8_t>& data ) {
+        const uint8_t length[4] = { uint8_t( data.size() >> 24 ), uint8_t( data.size() >> 16 ), uint8_t( data.size() >> 8 ), uint8_t( data.size() ) };
+        fwrite( length, 1, 4, file );
+        fwrite( type, 1, 4, file );
+        fwrite( data.data(), 1, data.size(), file );
+        auto c = crc( reinterpret_cast<const uint8_t*>( type ), 4, 0xFFFFFFFFu );
+        c = crc( data.data(), data.size(), c ) ^ 0xFFFFFFFFu;
+        const uint8_t sum[4] = { uint8_t( c >> 24 ), uint8_t( c >> 16 ), uint8_t( c >> 8 ), uint8_t( c ) };
+        fwrite( sum, 1, 4, file );
+    };
+    static const uint8_t signature[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    fwrite( signature, 1, 8, file );
+    chunk( "IHDR", { uint8_t( w >> 24 ), uint8_t( w >> 16 ), uint8_t( w >> 8 ), uint8_t( w ), uint8_t( h >> 24 ), uint8_t( h >> 16 ), uint8_t( h >> 8 ), uint8_t( h ), 8, 2, 0, 0, 0 } );
+    chunk( "IDAT", zlib );
+    chunk( "IEND", {} );
+    fclose( file );
+}
+void BeginStreamingFrameTiming( bool unpaced )
+{
+    (void)unpaced;
+    s_streamFrameStart = std::chrono::steady_clock::now();
+    s_streamCpuStart = StreamingThreadCpuMilliseconds();
+    s_streamFrameTimed = true;
+}
+double StreamingFrameWorkMilliseconds() { return s_streamFrameWork; }
+double StreamingFrameUiMilliseconds() { return s_streamFrameUi; }
+double StreamingFrameRenderMilliseconds() { return s_streamFrameRender; }
+double StreamingFramePresentMilliseconds() { return s_streamFramePresent; }
+double StreamingFrameCpuMilliseconds() { return s_streamFrameCpu; }
+#endif
 
 #ifdef __APPLE__
 typedef long NSInteger;
@@ -181,6 +298,9 @@ void Backend::Show()
     glfwShowWindow( s_window );
 }
 
+#ifdef _WIN32
+void Backend::RequestClose(){glfwSetWindowShouldClose(s_window,GLFW_TRUE);}
+#endif
 void Backend::Run()
 {
     while( !glfwWindowShouldClose( s_window ) )
@@ -191,10 +311,20 @@ void Backend::Run()
         }
         else
         {
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+            const auto frameStart = std::chrono::steady_clock::now();
+#endif
             glfwPollEvents();
             s_redraw();
             if( tracy::s_config.focusLostLimit && !glfwGetWindowAttrib( s_window, GLFW_FOCUSED ) ) std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
             s_mainThreadTasks->Run();
+#if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
+            if( s_streamAdaptivePresentation && !glfwWindowShouldClose( s_window ) )
+            {
+                const auto remaining = 1. / 60. - std::chrono::duration<double>( std::chrono::steady_clock::now() - frameStart ).count();
+                if( remaining > 0 ) glfwWaitEventsTimeout( remaining );
+            }
+#endif
         }
     }
 }
@@ -232,6 +362,10 @@ void Backend::NewFrame( int& w, int& h )
 
 void Backend::EndFrame()
 {
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+    const auto renderStart = std::chrono::steady_clock::now();
+    if( s_streamFrameTimed ) s_streamFrameUi = std::chrono::duration<double, std::milli>( renderStart - s_streamFrameStart ).count();
+#endif
     const ImVec4 clear_color = ImColor( 20, 20, 17 );
 
     ImGui::Render();
@@ -240,7 +374,27 @@ void Backend::EndFrame()
     glClear( GL_COLOR_BUFFER_BIT );
     ImGui_ImplOpenGL3_RenderDrawData( ImGui::GetDrawData() );
 
+#if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
+    if( !s_streamScreenshot.empty() )
+    {
+        WriteStreamingScreenshot( m_w, m_h );
+        s_streamScreenshot.clear();
+    }
+    const auto presentStart = std::chrono::steady_clock::now();
+#endif
     glfwSwapBuffers( s_window );
+#if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
+    if( s_streamFrameTimed )
+    {
+        const auto finished = std::chrono::steady_clock::now();
+        const auto cpu = StreamingThreadCpuMilliseconds();
+        s_streamFrameCpu = ( cpu >= 0 && s_streamCpuStart >= 0 ) ? cpu - s_streamCpuStart : -1;
+        s_streamFrameWork = std::chrono::duration<double, std::milli>( finished - s_streamFrameStart ).count();
+        s_streamFrameRender = std::chrono::duration<double, std::milli>( presentStart - renderStart ).count();
+        s_streamFramePresent = std::chrono::duration<double, std::milli>( finished - presentStart ).count();
+        s_streamFrameTimed = false;
+    }
+#endif
 }
 
 void Backend::SetIcon( uint8_t* data, int w, int h )

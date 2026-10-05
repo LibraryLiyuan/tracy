@@ -386,14 +386,24 @@ json McpServer::ToolsList( const json& id ) const
     tools.emplace_back( Tool( "tracy_validate", "Validate persisted timing, references, memory lifetimes, samples, and GPU attribution evidence. Findings contain severity and reviewable refs when available.", json { { "trace_id", traceId }, { "async", { { "type", "boolean" } } } }, required( { "trace_id" } ) ) );
     json scanProperties = {
         { "operation", enumeration( { "profile_validate", "start", "status", "cancel", "resume",
-            "summary", "signatures", "candidates", "candidate_get", "representative_frames", "quality", "close" } ) },
+            "summary", "signatures", "candidates", "candidate_get", "representative_frames", "quality", "close", "triage" } ) },
         { "trace_id", traceId }, { "scan_id", { { "type", "string" } } },
         { "candidate_id", { { "type", "string" } } }, { "profile", { { "type", "object" } } },
         { "limit", integer( 1, 1000 ) }, { "cursor", { { "type", "string" } } },
         { "fields", { { "type", "array" }, { "items", { { "type", "string" } } } } },
-        { "filter", { { "type", "object" } } }
+        { "filter", { { "type", "object" } } },
+        { "frame_set", { { "type", "string" }, { "description", "triage: frame set ref or name; default Player.Frame, else the first set." } } },
+        { "segment_seconds", { { "type", "number" }, { "minimum", 0 }, { "maximum", 3600 } } },
+        { "window_seconds", { { "type", "number" }, { "minimum", 0.5 }, { "maximum", 60 } } },
+        { "max_windows", integer( 1, 32 ) },
+        { "windows", { { "type", "array" }, { "minItems", 1 }, { "maxItems", 64 },
+            { "description", "start: restrict the scan to these {start_ns, end_ns} windows, e.g. the scan_windows of operation=triage." },
+            { "items", { { "type", "object" }, { "required", json::array( { "start_ns", "end_ns" } ) },
+                { "properties", { { "start_ns", { { "type", json::array( { "string", "integer" } ) } } },
+                    { "end_ns", { { "type", json::array( { "string", "integer" } ) } } } } } } } } }
     };
-    tools.emplace_back( Tool( "tracy_scan", "Start, resume, cancel, poll, and page a persistent deterministic whole-trace scan. Scan state survives MCP and Query process restarts.",
+    tools.emplace_back( Tool( "tracy_scan", "Start, resume, cancel, poll, and page a persistent deterministic whole-trace scan. Scan state survives MCP and Query process restarts. "
+        "operation=triage labels every frame of a long capture by what limited it (main/render/job threads, GPU, GPU memory, loading/IO, pacing) in one fast pass and recommends windows to scan.",
         std::move( scanProperties ), required( { "operation" } ), true ) );
     tools.emplace_back( Tool( "tracy_job", "Poll, retrieve, or cooperatively cancel a long-running trace-open or analysis job.",
         json { { "job_id", { { "type", "string" } } }, { "operation", enumeration( { "status", "result", "cancel" } ) } }, required( { "job_id", "operation" } ) ) );
@@ -423,7 +433,8 @@ json McpServer::CallTool( const std::string& name, json arguments )
             { "summary", "analysis.scan.summary" }, { "signatures", "analysis.scan.signatures" },
             { "candidates", "analysis.scan.candidates" }, { "candidate_get", "analysis.scan.candidate.get" },
             { "representative_frames", "analysis.scan.representative_frames" },
-            { "quality", "analysis.scan.quality" }, { "close", "analysis.scan.close" }
+            { "quality", "analysis.scan.quality" }, { "close", "analysis.scan.close" },
+            { "triage", "analysis.scan.triage" }
         };
         const auto found = methods.find( operation );
         if( found == methods.end() ) throw QueryError( "INVALID_PARAMS", "unsupported tracy_scan operation" );

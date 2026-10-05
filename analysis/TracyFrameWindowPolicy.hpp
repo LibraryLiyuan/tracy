@@ -127,6 +127,9 @@ struct TimelineState
 {
     std::map<std::string,PolicyFrameTimeline> timelines;
     std::map<std::string,std::vector<Window>> windows;
+    // Frame indexes of each timeline's exact frames within the frame budget,
+    // ascending: the candidates for a signature's lower-load reference frame.
+    std::map<std::string,std::vector<uint64_t>> normalFrames;
 };
 template<class Visit>
 TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
@@ -150,6 +153,8 @@ TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
         for( size_t i = 1; i < t.frames.size(); ++i )
             if( t.frames[i].frameIndex == t.frames[i-1].frameIndex ) throw std::runtime_error( "duplicate_frame_timeline" );
         windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled ) );
+        auto& normal = state.normalFrames[scope];
+        for( const auto& frame : t.frames ) if( frame.exact && frame.valueNs <= budgetNs ) normal.push_back( frame.frameIndex );
     }
     return state;
 }
@@ -238,7 +243,8 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
         {
             const auto manifestation = std::string( w.stable ? "stable_slow:" : "sustained_pressure:" ) + std::to_string( w.begin ) + ":" + std::to_string( w.end );
             std::vector<PolicyFrameEvidence> part;
-            for( const auto& frame : series ) if( frame.exact && frame.frameIndex >= w.begin && frame.frameIndex <= w.end ) part.push_back( frame );
+            for( auto frame = std::lower_bound( series.begin(), series.end(), w.begin, []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
+                frame != series.end() && frame->frameIndex <= w.end; ++frame ) if( frame->exact ) part.push_back( *frame );
             if( part.empty() ) continue;
             const auto peak = *std::max_element( part.begin(), part.end(), []( const auto& a, const auto& b ) { return a.valueNs < b.valueNs; } );
             select( ci, manifestation, w.stable ? "stable_slow_window" : "sustained_pressure_window", peak,
@@ -254,26 +260,30 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
         acceptTop(TopKey{c.frameScope, c.threadOrQueue, c.metricPreference, target},
             TopItem{frame.valueNs, ci, frame.frameIndex, manifestation, evidence, c.signatureId});
     };
-    // Compute eligible reference points once per signature. lower_bound keeps
+    // Eligible reference points are the timeline's normal frames, except
+    // those where this signature's value is known to be inexact (a frame
+    // without the signature is an exact zero). lower_bound keeps
     // nearest-distance selection (and the earlier-frame tie break) deterministic.
-    std::vector<PolicyFrameEvidence> normalFrames;
-    if(t != timelines.end() && c.observationUnit == "frame") for(const auto& frame:t->second.frames)
-    {
-        if(input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
-        if(!frame.exact || frame.valueNs>budgetNs)continue;
-        const auto value=at(frame.frameIndex); if(value.exact)normalFrames.push_back(value);
-    }
+    const std::vector<uint64_t>* normalFrames = nullptr;
+    if(t != timelines.end() && c.observationUnit == "frame") normalFrames = &state.normalFrames.at(c.frameScope);
+    const auto eligible = [&](uint64_t frame) {
+        auto it = std::lower_bound( series.begin(), series.end(), frame,
+            []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
+        return it == series.end() || it->frameIndex != frame || it->exact;
+    };
     const auto reference = [&](uint64_t begin,uint64_t end)->std::optional<PolicyFrameEvidence> {
-        auto after=std::upper_bound(normalFrames.begin(),normalFrames.end(),end,
-            [](uint64_t index,const auto& frame){return index<frame.frameIndex;});
-        auto before=std::lower_bound(normalFrames.begin(),normalFrames.end(),begin,
-            [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
-        if(before!=normalFrames.begin())
+        if(!normalFrames) return {};
+        auto after=std::upper_bound(normalFrames->begin(),normalFrames->end(),end);
+        while(after!=normalFrames->end() && !eligible(*after)) ++after;
+        auto before=std::lower_bound(normalFrames->begin(),normalFrames->end(),begin);
+        while(before!=normalFrames->begin())
         {
             --before;
-            if(after==normalFrames.end() || begin-before->frameIndex<=after->frameIndex-end)return *before;
+            if(!eligible(*before)) continue;
+            if(after==normalFrames->end() || begin-*before<=*after-end)return at(*before);
+            break;
         }
-        if(after!=normalFrames.end())return *after;
+        if(after!=normalFrames->end())return at(*after);
         return {};
     };
     std::vector<PolicyFrameEvidence> qualified;
@@ -324,8 +334,10 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
     {
         std::vector<PolicyFrameEvidence> values;
         std::vector<int64_t> costs;
-        for( const auto& frame : t->second.frames ) if( frame.frameIndex >= window.begin && frame.frameIndex <= window.end && frame.exact )
-        { auto v = at( frame.frameIndex ); if( v.exact ) { values.push_back( v ); costs.push_back( v.valueNs ); } }
+        const auto& timelineFrames = t->second.frames;
+        for( auto frame = std::lower_bound( timelineFrames.begin(), timelineFrames.end(), window.begin, []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
+            frame != timelineFrames.end() && frame->frameIndex <= window.end; ++frame ) if( frame->exact )
+        { auto v = at( frame->frameIndex ); if( v.exact ) { values.push_back( v ); costs.push_back( v.valueNs ); } }
         if( values.empty() || double( values.size() ) / double( window.end-window.begin+1 ) < config.value( "window_valid_ratio", 0.8 ) ) continue;
         const auto median = Median( costs );
         const auto peak = *std::max_element( values.begin(), values.end(), []( const auto& a, const auto& b ) { return a.valueNs < b.valueNs; } );

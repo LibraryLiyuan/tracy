@@ -9,6 +9,7 @@
 #include "../../stream/src/TracyStreamSnapshotMap.hpp"
 
 #include "CaptureStatus.hpp"
+#include "ProcessMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -309,38 +310,6 @@ bool AtomicWriteText( const std::filesystem::path& path, const std::string& text
     return false;
 }
 
-struct ProcessMemoryState
-{
-    uint64_t workingSet = 0;
-    uint64_t commit = 0;
-    uint64_t physicalAvailable = 0;
-    uint64_t physicalTotal = 0;
-    uint32_t commitLoadPercent = 0;
-};
-
-ProcessMemoryState GetProcessMemoryState()
-{
-    ProcessMemoryState state;
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX counters {};
-    counters.cb = sizeof( counters );
-    if( GetProcessMemoryInfo( GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>( &counters ), sizeof( counters ) ) )
-    {
-        state.workingSet = counters.WorkingSetSize;
-        state.commit = counters.PrivateUsage;
-    }
-    MEMORYSTATUSEX memory {};
-    memory.dwLength = sizeof( memory );
-    if( GlobalMemoryStatusEx( &memory ) )
-    {
-        state.physicalAvailable = memory.ullAvailPhys;
-        state.physicalTotal = memory.ullTotalPhys;
-        state.commitLoadPercent = memory.dwMemoryLoad;
-    }
-#endif
-    return state;
-}
-
 enum class ProgressStage : uint8_t
 {
     Scan,
@@ -377,6 +346,8 @@ public:
         , m_threads( threads )
         , m_started( std::chrono::steady_clock::now() )
         , m_stageStarted( m_started )
+        , m_measuredAt( m_started )
+        , m_activity( GetProcessActivityState() )
         , m_thread( [this] { Run(); } )
     {
     }
@@ -389,6 +360,7 @@ public:
     void SetStage( ProgressStage stage, uint64_t total = 0, const char* unit = "items" )
     {
         std::lock_guard<std::mutex> lock( m_lock );
+        MeasureLocked();
         m_stage = stage;
         m_completed = 0;
         m_total = total;
@@ -414,6 +386,26 @@ public:
     uint64_t PeakCommitBytes() const { return m_peakCommit.load( std::memory_order_relaxed ); }
     uint64_t PeakWorkingSetBytes() const { return m_peakWorkingSet.load( std::memory_order_relaxed ); }
 
+    std::string ResourceReport()
+    {
+        std::lock_guard<std::mutex> lock( m_lock );
+        std::ostringstream json;
+        json << "{\"memory_sampling\":\"2s_and_stage_boundaries\",\"stages\":{";
+        for( size_t i = 0; i < m_resources.size(); ++i )
+        {
+            if( i != 0 ) json << ',';
+            const auto& value = m_resources[i];
+            json << '\"' << ProgressStageName( ProgressStage( i ) ) << "\":{\"wall_seconds\":" << value.wallSeconds
+                << ",\"process_cpu_seconds\":" << value.cpuSeconds << ",\"process_io_available\":"
+                << ( value.activityAvailable ? "true" : "false" ) << ",\"process_read_bytes\":\"" << value.readBytes
+                << "\",\"process_write_bytes\":\"" << value.writeBytes << "\",\"sampled_peak_private_commit_bytes\":\""
+                << value.peakCommit << "\",\"sampled_peak_working_set_bytes\":\"" << value.peakWorkingSet
+                << "\",\"peak_system_commit_load_percent\":" << value.peakSystemCommitLoad << '}';
+        }
+        json << "}}";
+        return json.str();
+    }
+
     void Stop()
     {
         {
@@ -427,6 +419,31 @@ public:
     }
 
 private:
+    ProcessMemoryState MeasureLocked()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto memory = GetProcessMemoryState();
+        const auto activity = GetProcessActivityState();
+        auto& value = m_resources[size_t( m_stage )];
+        value.wallSeconds += std::chrono::duration<double>( now - m_measuredAt ).count();
+        value.peakCommit = std::max( value.peakCommit, memory.commit );
+        value.peakWorkingSet = std::max( value.peakWorkingSet, memory.workingSet );
+        value.peakSystemCommitLoad = std::max( value.peakSystemCommitLoad, memory.commitLoadPercent );
+        if( activity.available && m_activity.available )
+        {
+            value.activityAvailable = true;
+            value.cpuSeconds += double( activity.cpuTicks100ns - m_activity.cpuTicks100ns ) / 10000000.0;
+            value.readBytes += activity.readBytes - m_activity.readBytes;
+            value.writeBytes += activity.writeBytes - m_activity.writeBytes;
+        }
+        m_activity = activity;
+        m_measuredAt = now;
+        m_peakCommit.store( std::max( m_peakCommit.load( std::memory_order_relaxed ), memory.commit ), std::memory_order_relaxed );
+        m_peakWorkingSet.store( std::max( m_peakWorkingSet.load( std::memory_order_relaxed ), memory.workingSet ), std::memory_order_relaxed );
+        if( MemoryPressureExceeded( memory ) ) m_pressureExceeded.store( true, std::memory_order_relaxed );
+        return memory;
+    }
+
     void Run()
     {
         std::unique_lock<std::mutex> lock( m_lock );
@@ -448,8 +465,10 @@ private:
         std::string unit;
         std::filesystem::path temporaryPath;
         std::chrono::steady_clock::time_point stageStarted;
+        ProcessMemoryState memory;
         {
             std::lock_guard<std::mutex> lock( m_lock );
+            memory = MeasureLocked();
             stage = m_stage;
             completed = m_completed;
             total = m_total;
@@ -471,20 +490,6 @@ private:
             const auto size = std::filesystem::file_size( temporaryPath, sizeError );
             if( !sizeError ) temporarySize = size;
         }
-        const auto memory = GetProcessMemoryState();
-        auto peakCommit = m_peakCommit.load( std::memory_order_relaxed );
-        while( memory.commit > peakCommit && !m_peakCommit.compare_exchange_weak( peakCommit, memory.commit, std::memory_order_relaxed ) ) {}
-        auto peakWorkingSet = m_peakWorkingSet.load( std::memory_order_relaxed );
-        while( memory.workingSet > peakWorkingSet &&
-            !m_peakWorkingSet.compare_exchange_weak( peakWorkingSet, memory.workingSet, std::memory_order_relaxed ) ) {}
-        if( memory.physicalTotal != 0 )
-        {
-            const auto minimumAvailable = std::max<uint64_t>( 8ull * 1024 * 1024 * 1024, memory.physicalTotal * 15 / 100 );
-            if( memory.commit > memory.physicalTotal * 60 / 100 || memory.physicalAvailable < minimumAvailable ||
-                memory.commitLoadPercent >= 85 )
-                m_pressureExceeded.store( true, std::memory_order_relaxed );
-        }
-
         if( percent >= 0 )
             std::printf( "[%s] %.1f%% %llu/%llu %s, %.1f/s, elapsed %.1fs, ETA %.1fs, memory %.2f GiB, temp %.2f MiB\n",
                 ProgressStageName( stage ), percent, static_cast<unsigned long long>( completed ),
@@ -505,7 +510,13 @@ private:
                 << ",\"eta_seconds\":" << eta << ",\"rate\":" << rate << ",\"threads\":" << m_threads
                 << ",\"working_set_bytes\":\"" << memory.workingSet << "\",\"commit_bytes\":\"" << memory.commit
                 << "\",\"system_available_bytes\":\"" << memory.physicalAvailable
-                << "\",\"temporary_output_bytes\":\"" << temporarySize << "\",\"cancel_requested\":"
+                << "\",\"system_physical_total_bytes\":\"" << memory.physicalTotal
+                << "\",\"physical_load_percent\":" << memory.physicalLoadPercent
+                << ",\"system_commit_available\":" << ( memory.systemCommitAvailable ? "true" : "false" )
+                << ",\"system_commit_total_bytes\":\"" << memory.systemCommitTotal
+                << "\",\"system_commit_limit_bytes\":\"" << memory.systemCommitLimit
+                << "\",\"system_commit_load_percent\":" << memory.commitLoadPercent
+                << ",\"temporary_output_bytes\":\"" << temporarySize << "\",\"cancel_requested\":"
                 << ( CancelRequested() ? "true" : "false" ) << "}";
             AtomicWriteText( m_jsonPath, json.str() );
         }
@@ -522,6 +533,16 @@ private:
     std::string m_unit = "bytes";
     std::filesystem::path m_temporaryPath;
     std::chrono::steady_clock::time_point m_stageStarted;
+    std::chrono::steady_clock::time_point m_measuredAt;
+    ProcessActivityState m_activity;
+    struct StageResources
+    {
+        double wallSeconds = 0, cpuSeconds = 0;
+        uint64_t readBytes = 0, writeBytes = 0, peakCommit = 0, peakWorkingSet = 0;
+        uint32_t peakSystemCommitLoad = 0;
+        bool activityAvailable = false;
+    };
+    std::array<StageResources, 8> m_resources {};
     bool m_stop = false;
     std::atomic<bool> m_pressureExceeded { false };
     std::atomic<uint64_t> m_peakCommit { 0 };
@@ -2161,7 +2182,7 @@ int ConvertMain( int argc, char** argv )
             << "\"},\"stages_seconds\":{"
             << "\"scan\":" << scanSeconds << ",\"analysis\":" << analysisSeconds << ",\"replay\":" << replaySeconds
             << ",\"write\":" << writeSeconds << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
-            << mapSeconds << ",\"total\":" << totalSeconds << "}}";
+            << mapSeconds << ",\"total\":" << totalSeconds << "},\"resources\":" << progress.ResourceReport() << '}';
         if( !AtomicWriteText( options.reportJson, report.str() ) )
         {
             std::fprintf( stderr, "Snapshot is valid, but --report-json could not be published.\n" );

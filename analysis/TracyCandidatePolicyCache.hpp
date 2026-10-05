@@ -10,7 +10,10 @@ struct CandidatePolicyCacheOptions
     AnalysisCacheTableOptions table;
     uint64_t sortBufferBytes = 8*1024*1024;
     uint64_t familyBytes = 4*1024*1024;
-    uint64_t frameWorkspaceBytes = 128*1024*1024;
+    uint64_t frameWorkspaceBytes = 1024ull*1024*1024;
+    // Threads that evaluate signature contexts' frame series; outputs are
+    // appended in context order, so the cache does not depend on it.
+    size_t workers = 1;
 };
 // metadata must not contain signature/ranking/context vectors. The immutable
 // neutral cache is the only statistics/context source. No all-result DOM.

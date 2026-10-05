@@ -12,4 +12,5 @@ struct ProcessingText
 ProcessingText DescribeProcessing(std::string_view state, std::string_view phase);
 std::string FormatDuration(uint64_t milliseconds);
 std::string RecordingDuration(const Json &task);
+std::string RecordingStopReason(const Json &task);
 } // namespace capturegui

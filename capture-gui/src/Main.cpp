@@ -179,7 +179,8 @@ void ResultActions(const Json &task, const Settings &settings, std::string &noti
                 notice = "请先在设置中选择 Tracy Viewer";
             else
             {
-                auto args = Quote(final.wstring());
+                // An event store opens in the profiler's long-capture view.
+                auto args = task.value("output_kind", "") == "store" ? L"--stream " + Quote(final.wstring()) : Quote(final.wstring());
                 if ((INT_PTR)ShellExecuteW(hwnd, L"open", Wide(settings.viewer).c_str(), args.c_str(),
                                            nullptr, SW_SHOWNORMAL) <= 32)
                     notice = "无法启动 Viewer";
@@ -224,6 +225,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         {
             settings = Settings::FromJson(Json::object());
         }
+        PreferBundledTools(settings, ExecutableDirectory());
         settings.name = "Player_" + Timestamp();
         Controller core;
         controller = &core;
@@ -525,6 +527,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                     Text(view.task.value("name", settings.name));
                     if (!view.busy)
                         Text("录制时长：" + RecordingDuration(view.task));
+                    const auto stopReason = RecordingStopReason(view.task);
+                    if (!stopReason.empty()) Text("停止原因：" + stopReason);
                     if (view.busy)
                     {
                         ProcessingPanel(view);
@@ -541,6 +545,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                             Muted("磁盘剩余");
                             Text(Size(view.freeBytes));
                             ImGui::EndTable();
+                        }
+                        if (view.state == "recording" || view.state == "draining")
+                        {
+                            Muted("已提交 " + Size(view.committedBytes) + "  /  已持久化 " + Size(view.durableBytes));
+                            Muted("平均写入 " + Size(uint64_t(view.recordingBytesPerSecond)) + "/s  /  背压等待 " + std::to_string(view.backpressureWaits));
+                            if (view.remainingDiskSeconds >= 0)
+                                Muted("按当前平均速率，磁盘还可录约 " + FormatDuration(uint64_t(view.remainingDiskSeconds * 1000)));
                         }
 
                         Muted(view.gameMayClose ? "现在可以关闭游戏。"
@@ -560,7 +571,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         else
                         {
                             if (!view.directory.empty() && ImGui::Button("恢复检查 / 重试"))
-                                core.Recover(Wide(view.directory));
+                                core.Recover(Wide(view.directory), &settings);
                             ImGui::SameLine();
                             if (ImGui::Button("保留文件，开始新任务"))
                             {
@@ -628,7 +639,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                             ImGui::BeginDisabled(view.busy);
                             if (ImGui::Button("恢复 / 重试"))
                             {
-                                core.Recover(Wide(t.at("directory").get<std::string>()));
+                                core.Recover(Wide(t.at("directory").get<std::string>()), &settings);
                                 tab = 0;
                             }
                             ImGui::EndDisabled();
@@ -644,7 +655,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             {
                 Heading("设置");
                 ImGui::BeginDisabled(view.busy);
-                PathField("工具目录（Capture / Convert / Query）", settings.toolDirectory, true);
+                const auto previousTools = settings.toolDirectory;
+                PathField("工具目录（Capture / Export / Query）", settings.toolDirectory, true);
+                if (settings.toolDirectory != previousTools) settings.customTools = true;
+                if (ImGui::Button("使用当前程序目录的配套工具"))
+                {
+                    settings.customTools = false;
+                    PreferBundledTools(settings, ExecutableDirectory());
+                }
                 PathField("Tracy Viewer（可选）", settings.viewer, false, L"Windows program\0*.exe\0");
                 Heading("全局快捷键");
                 bool ctrl = settings.hotkeyModifiers & MOD_CONTROL,

@@ -1,12 +1,23 @@
 #include "TracyFrameCpuScanner.hpp"
 #include "FakeTraceSource.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
+#include "TracyCpuZoneScanSource.hpp"
+#include "TracyWindowedTraceSource.hpp"
+
+#include <algorithm>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
 #include <cassert>
 #include <chrono>
+#include <functional>
 #include <limits>
 #include <map>
 #include <iostream>
+#include <sstream>
+#include <tuple>
 
 using namespace tracy::analysis;
 
@@ -272,8 +283,430 @@ void SetCpuCancellation( Options& options, std::function<bool()> cancelled )
     options.cancelled = std::move( cancelled );
 }
 
+// Zones grouped by thread that are also offered as compact records, so the
+// record pass can be compared with the DTO pass on the same input.
+class CompactCpuSource final : public tracy::query::test::FakeTraceSource,
+    public NativeBoundedTraceSource, public CpuZoneScanSource
+{
+public:
+    std::vector<FrameSetDto> frameSets;
+    std::vector<FrameDto> frames;
+    std::vector<ThreadDto> threads;
+    std::vector<CpuZoneDto> zones;
+
+    void AddThread( uint64_t id, std::string name )
+    {
+        ThreadDto thread;
+        thread.ref = MakeEntityRef( "thread", id );
+        thread.nativeId = id;
+        thread.name = std::move( name );
+        threads.push_back( std::move( thread ) );
+    }
+    // A zone of thread `thread` (an index into `threads`); `name` selects a
+    // source location unless `display` names the zone differently.
+    std::string Add( size_t thread, std::optional<std::string> parent, const std::string& name, int64_t begin,
+        std::optional<int64_t> end, std::string display = {} )
+    {
+        CpuZoneDto zone;
+        zone.ref = MakeEntityRef( "cpu-zone", zones.size() );
+        zone.threadRef = threads[thread].ref;
+        zone.sourceLocationRef = "source:" + name;
+        zone.name = display.empty() ? name : display;
+        zone.function = name + "Function";
+        zone.file = "Runtime/" + name + ".cpp";
+        zone.line = uint32_t( name.size() * 7 );
+        zone.parentRef = std::move( parent );
+        zone.startNs = begin;
+        zone.endNs = end;
+        zone.complete = end.has_value();
+        zone.timingValid = !end || *end >= begin;
+        if( !zone.timingValid ) zone.timingInvalidReason = "negative_interval";
+        zones.push_back( std::move( zone ) );
+        return zones.back().ref;
+    }
+    // Builds the compact records; `zones` must not change afterwards.
+    void Index()
+    {
+        std::map<std::string, uint64_t> ordinals;
+        for( size_t n = 0; n < zones.size(); ++n ) ordinals.emplace( zones[n].ref, n );
+        std::map<std::tuple<std::string, std::string, std::string, uint32_t>, uint32_t> locationIndex;
+        records.clear();
+        scanThreads.clear();
+        locations.clear();
+        for( size_t n = 0; n < zones.size(); ++n )
+        {
+            const auto& zone = zones[n];
+            if( scanThreads.empty() || scanThreads.back().ref != zone.threadRef ) scanThreads.push_back( { zone.threadRef, n, 0, {} } );
+            auto& thread = scanThreads.back();
+            ++thread.count;
+            if( !zone.parentRef )
+            {
+                thread.roots.push_back( n );
+                thread.rootStarts.push_back( zone.startNs );
+                thread.rootEnds.push_back( zone.startNs );
+            }
+            // Each root's segment spans its zones, escaping and reversed ones included.
+            if( !thread.roots.empty() )
+            {
+                thread.rootStarts.back() = std::min( thread.rootStarts.back(), zone.startNs );
+                thread.rootEnds.back() = std::max( thread.rootEnds.back(), zone.endNs ? std::max( *zone.endNs, zone.startNs ) : std::numeric_limits<int64_t>::max() );
+            }
+            const auto key = std::make_tuple( zone.sourceLocationRef, zone.function, zone.file, zone.line );
+            auto location = locationIndex.find( key );
+            if( location == locationIndex.end() )
+            {
+                location = locationIndex.emplace( key, uint32_t( locations.size() ) ).first;
+                locations.push_back( { zone.sourceLocationRef, zone.name, zone.function, zone.file, zone.line } );
+            }
+            CpuZoneScanRecord record;
+            record.ordinal = n;
+            if( zone.parentRef )
+            {
+                const auto parent = ordinals.find( *zone.parentRef );
+                record.parent = parent == ordinals.end() ? CpuZoneScanRecord::NoParent - 1 : parent->second;
+            }
+            record.startNs = zone.startNs;
+            record.hasEnd = zone.endNs.has_value();
+            record.endNs = zone.endNs.value_or( 0 );
+            record.complete = zone.complete;
+            record.timingValid = zone.timingValid;
+            record.hasInvalidReason = zone.timingInvalidReason.has_value();
+            if( zone.timingInvalidReason ) record.invalidReason = *zone.timingInvalidReason;
+            record.location = location->second;
+            record.hasName = zone.name != locations[location->second].name;
+            if( record.hasName ) record.name = zone.name;
+            records.push_back( record );
+        }
+    }
+
+    uint32_t NativeBoundedScanVersion() const override { return NativeBoundedScanSchemaVersion; }
+    TraceReadView AcquireReadView() const override
+    {
+        return { TraceSourceKind::Snapshot, TraceSourceState::Ready, 9, 1000000, true };
+    }
+    std::vector<FrameSetDto> GetFrameSets() const override { return frameSets; }
+    std::vector<ThreadDto> GetThreads() const override { return threads; }
+    std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override { return Page( frames, range ); }
+    std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const override { return Page( zones, range ); }
+
+    const std::vector<CpuZoneScanThread>& CpuZoneScanThreads() const override { return scanThreads; }
+    const std::vector<CpuZoneScanLocation>& CpuZoneScanLocations() const override { return locations; }
+    void CpuZoneScanRef( uint64_t ordinal, std::string& ref ) const override { ref = zones[size_t( ordinal )].ref; }
+    std::unique_ptr<CpuZoneScanReader> OpenCpuZoneScanReader() const override { return std::make_unique<Reader>( *this ); }
+
+private:
+    class Reader final : public CpuZoneScanReader
+    {
+    public:
+        explicit Reader( const CompactCpuSource& source ) : m_source( source ) {}
+        void Seek( size_t thread, uint64_t ordinal ) override
+        {
+            m_end = m_source.scanThreads[thread].first + m_source.scanThreads[thread].count;
+            m_next = ordinal;
+        }
+        void Read( std::vector<CpuZoneScanRecord>& records, size_t limit ) override
+        {
+            records.clear();
+            while( records.size() < limit && m_next < m_end ) records.push_back( m_source.records[size_t( m_next++ )] );
+        }
+    private:
+        const CompactCpuSource& m_source;
+        uint64_t m_next = 0, m_end = 0;
+    };
+
+    template<typename T>
+    static std::vector<T> Page( const std::vector<T>& values, const ScanRange& range )
+    {
+        const auto begin = std::min( range.offset, values.size() );
+        const auto end = begin + std::min( range.limit, values.size() - begin );
+        return { values.begin() + begin, values.begin() + end };
+    }
+
+    std::vector<CpuZoneScanRecord> records;
+    std::vector<CpuZoneScanThread> scanThreads;
+    std::vector<CpuZoneScanLocation> locations;
+};
+
+void AddFrames( CompactCpuSource& source, uint64_t continuousFrames, int64_t length, uint64_t splitFrames )
+{
+    source.frameSets.push_back( { source.MakeEntityRef( "frame-set", 0 ), 0, "Player.Frame", true, continuousFrames, continuousFrames - 1 } );
+    for( uint64_t index = 0; index < continuousFrames; ++index )
+    {
+        const auto begin = int64_t( index ) * length;
+        const bool last = index + 1 == continuousFrames;
+        source.frames.push_back( { source.MakeEntityRef( "frame", index ), source.frameSets[0].ref, size_t( index ), begin,
+            last ? std::optional<int64_t>() : std::optional<int64_t>( begin + length ), {}, !last } );
+    }
+    source.frameSets.push_back( { source.MakeEntityRef( "frame-set", 1 ), 1, "Render.Frame", false, splitFrames, splitFrames } );
+    for( uint64_t index = 0; index < splitFrames; ++index )
+    {
+        const auto begin = int64_t( index ) * length * 5 / 2 + length / 3;
+        source.frames.push_back( { source.MakeEntityRef( "frame", 1000000 + index ), source.frameSets[1].ref, size_t( index ), begin,
+            begin + length * 3 / 2, {}, true } );
+    }
+}
+
+// Every zone-pass edge case: overlapping and escaping children, children of
+// invalid zones, dangling parents, renamed zones, zones across frames and
+// frame sets, unassigned zones, and zones still open at each thread's end.
+std::unique_ptr<CompactCpuSource> EdgeCaseSource()
+{
+    auto source = std::make_unique<CompactCpuSource>();
+    auto& s = *source;
+    AddFrames( s, 3, 100, 2 );
+    s.AddThread( 1, "Main" );
+    s.AddThread( 2, "Render Thread" );
+    s.AddThread( 3, "Job.Worker 0" );
+    const auto root0 = s.Add( 0, {}, "Root", 0, 70 );
+    s.Add( 0, root0, "Child", 10, 40 );
+    s.Add( 0, root0, "Child", 30, 60 );
+    auto parent = s.Add( 0, {}, "Deep", 70, 99 );
+    for( int depth = 1; depth <= 5; ++depth ) parent = s.Add( 0, parent, "Deep" + std::to_string( depth ), 70 + depth, 99 - depth );
+    const auto cross = s.Add( 0, {}, "Cross", 90, 150 );
+    s.Add( 0, cross, "Child", 95, 110 );
+    s.Add( 0, cross, "Child", 140, 145 );
+    const auto outside = s.Add( 0, {}, "Outside", 100, 160 );
+    s.Add( 0, outside, "Escaping", 150, 170 );
+    const auto invalid = s.Add( 0, outside, "InvalidChild", 155, 150 );
+    s.Add( 0, invalid, "Grand", 156, 158 );
+    const auto root1 = s.Add( 0, {}, "Root", 100, 200 );
+    s.Add( 0, root1, "Child", 110, 120 );
+    s.Add( 0, root1, "Child", 115, 130, "RenamedChild" );
+    s.Add( 0, {}, "OpenRoot", 190, std::nullopt );
+    const auto tail = s.Add( 0, {}, "Tail", 195, 199 );
+    s.Add( 0, tail, "TailChild", 196, 198 );
+    s.Add( 1, {}, "RenderWork", 10, 20 );
+    s.Add( 1, {}, "MissingEnd", 40, std::nullopt );
+    s.Add( 1, {}, "Negative", 60, 50 );
+    const auto clock = s.Add( 1, {}, "ClockInversion", 65, 66 );
+    s.zones.back().timingValid = false;
+    s.zones.back().timingInvalidReason = "clock_inversion";
+    (void)clock;
+    s.Add( 1, std::string( "not-present" ), "Orphan", 67, 68 );
+    s.Add( 1, {}, "OutsideFrames", 300, 310 );
+    const auto last = s.Add( 1, {}, "RenderLast", 180, 199 );
+    s.Add( 1, last, "RenderLastChild", 181, 185 );
+    s.Add( 2, {}, "WorkerWork", 20, 30 );
+    const auto renamed = s.Add( 2, {}, "WorkerWork", 130, 140, "WorkerWorkRenamed" );
+    s.Add( 2, renamed, "WorkerChild", 135, 136 );
+    s.Index();
+    return source;
+}
+
+// Random forests on twelve threads over both frame sets; unless well formed,
+// with escaping, reversed, unended and orphaned zones and overlapping siblings.
+std::unique_ptr<CompactCpuSource> GeneratedSource( uint32_t seed, bool wellFormed = false )
+{
+    auto source = std::make_unique<CompactCpuSource>();
+    auto& s = *source;
+    AddFrames( s, 40, 1000, 15 );
+    // Enough threads that the DTO pass's thread map does not iterate in
+    // thread order; each thread ends with zones still open.
+    s.AddThread( 11, "Main" );
+    s.AddThread( 12, "Render Thread" );
+    for( uint64_t worker = 0; worker < 10; ++worker ) s.AddThread( 13 + worker * 7, "Job.Worker " + std::to_string( worker ) );
+    uint64_t state = seed * 0x9E3779B97F4A7C15ull + 1;
+    const auto next = [&]( uint32_t bound ) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return uint32_t( ( state >> 33 ) % std::max<uint32_t>( bound, 1 ) );
+    };
+    const char* names[] = { "Update", "Render", "Physics", "Animate", "Wait", "Script", "Audio", "Cull", "Draw", "Present", "Jobs", "Idle" };
+    std::function<void( size_t, const std::string&, int64_t, int64_t, int )> children = [&]( size_t thread,
+        const std::string& parent, int64_t begin, int64_t end, int depth ) {
+        auto time = begin + int64_t( next( 20 ) );
+        while( depth < 6 && time + 10 < end && next( 4 ) != 0 )
+        {
+            const auto length = 5 + int64_t( next( uint32_t( std::max<int64_t>( 6, ( end - time ) / 2 ) ) ) );
+            int64_t childEnd = std::min( time + length, wellFormed ? end : std::numeric_limits<int64_t>::max() );
+            if( next( 30 ) == 0 && !wellFormed ) childEnd = end + 5 + int64_t( next( 50 ) );
+            std::optional<int64_t> recordedEnd = childEnd;
+            if( next( 60 ) == 0 && !wellFormed ) recordedEnd = time - 1 - int64_t( next( 5 ) );
+            if( next( 100 ) == 0 && !wellFormed ) recordedEnd.reset();
+            std::optional<std::string> parentRef = parent;
+            if( next( 150 ) == 0 && !wellFormed ) parentRef = "missing:" + std::to_string( s.zones.size() );
+            const auto name = names[next( 12 )];
+            const auto ref = s.Add( thread, parentRef, name, time, recordedEnd, next( 20 ) == 0 ? std::string( name ) + "Renamed" : std::string() );
+            if( next( 120 ) == 0 && !wellFormed )
+            {
+                s.zones.back().timingValid = false;
+                s.zones.back().timingInvalidReason = "clock_inversion";
+            }
+            children( thread, ref, time, childEnd, depth + 1 );
+            time = childEnd + int64_t( next( 10 ) );
+            if( next( 15 ) == 0 && !wellFormed ) time -= std::min<int64_t>( time - begin, 5 + int64_t( next( 10 ) ) );
+        }
+    };
+    for( size_t thread = 0; thread < s.threads.size(); ++thread )
+    {
+        int64_t time = int64_t( next( 500 ) );
+        while( time < 40500 )
+        {
+            const auto length = 50 + int64_t( next( 3000 ) );
+            const auto name = names[next( 12 )];
+            std::optional<int64_t> end = time + length;
+            if( next( 90 ) == 0 && !wellFormed ) end.reset();
+            const auto ref = s.Add( thread, {}, name, time, end );
+            children( thread, ref, time, time + length, 1 );
+            time += length + int64_t( next( 300 ) ) - ( wellFormed ? 0 : 100 );
+        }
+    }
+    s.Index();
+    return source;
+}
+
+// The sink calls and result of a scan, as text, for exact comparison.
+std::string RecordScan( const TraceSource& source, size_t workers, size_t chunk, bool view )
+{
+    std::ostringstream out;
+    CpuFrameScanOptions options;
+    options.includeLogicalSignatures = false;
+    options.zoneWorkers = workers;
+    options.zoneChunk = chunk;
+    options.completeFrameSink = [&]( const std::string& set, uint64_t index, int64_t begin, int64_t end ) {
+        out << "frame|" << set << '|' << index << '|' << begin << '|' << end << '\n';
+    };
+    if( view ) options.definitionSink = [&]( const CpuSignatureDefinition& d ) {
+        out << "def|" << d.signatureId << '|' << d.parentSignatureId << '|' << d.name << '|' << d.sourceLocationRef << '|' << d.function << '|'
+            << d.file << '|' << d.line << '|' << d.threadRef << '|' << d.threadRole << '|' << d.path << '|' << d.depth << '|'
+            << int( d.workClass ) << '|' << d.logical << '\n';
+        return true;
+    };
+    const auto runs = [&]( const CpuSignatureFrameRunView& r ) {
+        out << "run|" << r.signatureId << '|' << r.frameSetRef << '|' << r.frameRef << '|' << r.signatureOrdinal << '|' << r.frameSetOrdinal << '|'
+            << r.frameIndex << '|' << r.inclusiveNs << '|' << r.directChildUnionNs << '|' << r.exclusiveNs << '|' << r.occurrenceCount << '|'
+            << r.exact << '|' << r.representativeEventRef << '|' << int( r.workClass ) << '\n';
+        return true;
+    };
+    const auto result = view ? ExactFrameCpuScanner( source, 3 ).ScanView( runs, options ) : ExactFrameCpuScanner( source, 3 ).Scan( {}, options );
+    out << "counts|" << result.inputZoneCount << '|' << result.validZoneCount << '|' << result.invalidZoneCount << '|' << result.unassignedZoneCount << '|'
+        << result.completeFrameCount << '|' << result.incompleteFrameCount << '|' << result.maximumDepth << '|' << result.maximumBatchObserved << '|'
+        << result.frameBoundaryProbeCount << '|' << result.qualityComplete << '\n';
+    for( const auto& d : result.signatures )
+        out << "signature|" << d.signatureId << '|' << d.parentSignatureId << '|' << d.name << '|' << d.path << '|' << d.depth << '|' << d.threadRef << '\n';
+    for( const auto& r : result.runs )
+    {
+        out << "result-run|" << r.signatureId << '|' << r.frameRef << '|' << r.inclusiveNs << '|' << r.directChildUnionNs << '|' << r.exclusiveNs << '|'
+            << r.occurrenceCount << '|' << r.exact << '|' << int( r.workClass );
+        for( const auto& ref : r.representativeEventRefs ) out << '|' << ref;
+        out << '\n';
+    }
+    for( const auto& d : result.denominators )
+        out << "denominator|" << d.signatureId << '|' << d.frameSetRef << '|' << d.completeFrameDenominator << '|' << d.whenPresentDenominator << '\n';
+    for( const auto& d : result.frameSetDenominators ) out << "frame-set|" << d.frameSetRef << '|' << d.name << '|' << d.completeFrameCount << '\n';
+    for( const auto& f : result.qualityFindings )
+    {
+        out << "finding|" << f.code << '|' << f.message << '|' << f.count;
+        for( const auto& ref : f.representativeRefs ) out << '|' << ref;
+        out << '\n';
+    }
+    return out.str();
+}
+
+// The compact-record pass makes the DTO pass's sink calls in the same order
+// with the same values, for any worker count and chunk size.
+bool CompactRecordPassMatches()
+{
+    std::vector<std::pair<std::string, std::unique_ptr<CompactCpuSource>>> sources;
+    sources.emplace_back( "edge cases", EdgeCaseSource() );
+    for( uint32_t seed = 1; seed <= 6; ++seed ) sources.emplace_back( "generated " + std::to_string( seed ), GeneratedSource( seed ) );
+    for( const auto& [name, source] : sources )
+    {
+        for( const bool view : { true, false } )
+        {
+            const auto expected = RecordScan( *source, 0, 32768, view );
+            for( const auto& [workers, chunk] : std::vector<std::pair<size_t, size_t>> { { 1, 32768 }, { 1, 1 }, { 3, 1 }, { 4, 7 }, { 2, 64 } } )
+            {
+                const auto actual = RecordScan( *source, workers, chunk, view );
+                if( actual == expected ) continue;
+                size_t line = 0, offset = 0;
+                while( offset < std::min( actual.size(), expected.size() ) && actual[offset] == expected[offset] ) if( actual[offset++] == '\n' ) ++line;
+                std::cerr << "compact record pass differs: " << name << ( view ? " view" : " result" ) << " workers=" << workers
+                          << " chunk=" << chunk << " at line " << line << "\n  expected: "
+                          << expected.substr( expected.rfind( '\n', offset ) + 1, 200 ) << "\n  actual:   "
+                          << actual.substr( actual.rfind( '\n', offset ) + 1, 200 ) << '\n';
+                return false;
+            }
+        }
+        std::cout << "compact record pass matches the DTO pass: " << name << " (" << source->zones.size() << " zones)\n";
+    }
+    return true;
+}
+
+// The runs of a scan's frames, without the ordinals that depend on which
+// other signatures and frame sets the scan met, sorted.
+std::vector<std::string> FrameRuns( const std::string& record, const std::set<std::string>* frames )
+{
+    std::vector<std::string> result;
+    std::istringstream lines( record );
+    for( std::string line; std::getline( lines, line ); )
+    {
+        if( !line.starts_with( "run|" ) ) continue;
+        std::vector<std::string> fields;
+        for( size_t begin = 0;; )
+        {
+            const auto end = line.find( '|', begin );
+            fields.push_back( line.substr( begin, end == std::string::npos ? std::string::npos : end - begin ) );
+            if( end == std::string::npos ) break;
+            begin = end + 1;
+        }
+        if( frames && !frames->contains( fields[3] ) ) continue;
+        fields.erase( fields.begin() + 4, fields.begin() + 6 );
+        std::string text;
+        for( const auto& field : fields ) text += field + '|';
+        result.push_back( std::move( text ) );
+    }
+    std::sort( result.begin(), result.end() );
+    return result;
+}
+
+// A scan of windows through the windowed view: the compact-record pass makes
+// the DTO pass's sink calls for any worker count and chunk size, and on well
+// formed zones each frame inside a window gets exactly the runs the whole
+// scan gives it.
+bool WindowedScanMatches()
+{
+    const std::vector<AnalysisTimeWindow> windows = { { 3000, 9100 }, { 20500, 26000 }, { 38000, 39000 } };
+    for( const bool wellFormed : { false, true } )
+    {
+        for( uint32_t seed = 1; seed <= 4; ++seed )
+        {
+            const std::shared_ptr<TraceSource> source = GeneratedSource( seed, wellFormed );
+            const auto windowed = MakeWindowedTraceSource( source, windows );
+            const auto expected = RecordScan( *windowed, 0, 32768, true );
+            for( const auto& [workers, chunk] : std::vector<std::pair<size_t, size_t>> { { 1, 32768 }, { 1, 1 }, { 3, 1 }, { 4, 7 }, { 2, 64 } } )
+            {
+                const auto actual = RecordScan( *windowed, workers, chunk, true );
+                if( actual == expected ) continue;
+                size_t line = 0, offset = 0;
+                while( offset < std::min( actual.size(), expected.size() ) && actual[offset] == expected[offset] ) if( actual[offset++] == '\n' ) ++line;
+                std::cerr << "windowed compact pass differs: seed " << seed << " workers=" << workers << " chunk=" << chunk << " at line " << line
+                          << "\n  expected: " << expected.substr( expected.rfind( '\n', offset ) + 1, 200 )
+                          << "\n  actual:   " << actual.substr( actual.rfind( '\n', offset ) + 1, 200 ) << '\n';
+                return false;
+            }
+            if( !wellFormed ) continue;
+            std::set<std::string> inside;
+            for( const auto& frame : windowed->ScanFrames( { std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), 0, 1000000 } ) )
+                if( frame.endNs && std::any_of( windows.begin(), windows.end(), [&]( const auto& w ) { return w.startNs <= frame.beginNs && *frame.endNs <= w.endNs; } ) )
+                    inside.insert( frame.ref );
+            const auto whole = FrameRuns( RecordScan( *source, 0, 32768, true ), &inside );
+            const auto part = FrameRuns( expected, &inside );
+            if( inside.empty() || whole.empty() || whole != part )
+            {
+                std::cerr << "windowed runs differ from the whole scan's: seed " << seed << " frames=" << inside.size()
+                          << " whole=" << whole.size() << " windowed=" << part.size() << '\n';
+                return false;
+            }
+            std::cout << "windowed scan matches: seed " << seed << ", " << inside.size() << " frames, " << part.size() << " runs\n";
+        }
+    }
+    return true;
+}
+
 int main()
 {
+    if( !CompactRecordPassMatches() ) return 1;
+    if( !WindowedScanMatches() ) return 1;
     bool workspaceTestsPassed = true;
     for( const auto* domain : { "frame", "cpu" } )
     {

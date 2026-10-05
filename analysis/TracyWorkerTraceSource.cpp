@@ -384,9 +384,15 @@ public:
 
     std::string MakeRef( const char* kind, uint64_t id ) const
     {
-        std::ostringstream out;
-        out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
-        return out.str();
+        // tracy:v1:<fingerprint prefix>:<kind>:<lowercase hex id>
+        char digits[16];
+        const auto end = std::to_chars( digits, digits + sizeof( digits ), id, 16 ).ptr;
+        const auto prefix = std::string_view( fingerprint ).substr( 0, 16 );
+        const auto kindLength = std::strlen( kind );
+        std::string out;
+        out.reserve( 9 + prefix.size() + 1 + kindLength + 1 + size_t( end - digits ) );
+        out.append( "tracy:v1:" ).append( prefix ).append( 1, ':' ).append( kind, kindLength ).append( 1, ':' ).append( digits, end );
+        return out;
     }
 
     std::optional<uint64_t> ParseRef( std::string_view ref, std::string_view kind ) const
@@ -632,6 +638,18 @@ public:
 
     void BuildIndexes()
     {
+        // The Worker rebuilds each memory pool's plot on its own background
+        // thread and inserts it at the front when done, so the order of memory
+        // plots follows thread timing. Keep them in front of the other plots
+        // (whose order is the file's) but order them by name, so plot and
+        // plot-point refs are the same on every load.
+        for( const auto* plot : worker->GetPlots() ) plots.push_back( plot );
+        const auto memoryEnd = std::stable_partition( plots.begin(), plots.end(), []( const PlotData* plot ) { return plot->type == PlotType::Memory; } );
+        std::stable_sort( plots.begin(), memoryEnd, [this]( const PlotData* lhs, const PlotData* rhs ) {
+            const std::string a = lhs->name == 0 ? "Default allocator" : Safe( worker->GetString( lhs->name ) );
+            const std::string b = rhs->name == 0 ? "Default allocator" : Safe( worker->GetString( rhs->name ) );
+            return a != b ? a < b : lhs->name < rhs->name;
+        } );
         for( const auto& callsite : worker->GetJnTraceData().callsites )
         {
             callsitesByZone.emplace( CallsiteZoneKey( callsite.sourceLocation, callsite.callstack ), &callsite );
@@ -692,6 +710,7 @@ public:
     std::vector<uint64_t> symbols;
     std::unordered_map<uint64_t, const JnCallsiteData*> callsitesByZone;
     std::unordered_map<uint32_t, const JnCallsiteData*> callsitesById;
+    std::vector<const PlotData*> plots;
     mutable std::mutex readMutex;
 };
 
@@ -1771,7 +1790,7 @@ std::vector<PlotDto> WorkerTraceSource::GetPlotList() const
     std::lock_guard lock( m_impl->readMutex );
     std::vector<PlotDto> result;
     auto& worker = *m_impl->worker;
-    const auto& plots = worker.GetPlots();
+    const auto& plots = m_impl->plots;
     result.reserve( plots.size() );
     for( size_t i = 0; i < plots.size(); i++ )
     {
@@ -1975,7 +1994,7 @@ std::vector<PlotPointDto> WorkerTraceSource::ScanPlots( const ScanRange& range )
     std::lock_guard lock( m_impl->readMutex );
     std::vector<PlotPointDto> result;
     size_t skipped = 0;
-    const auto& plots = m_impl->worker->GetPlots();
+    const auto& plots = m_impl->plots;
     for( size_t plotIndex = 0; plotIndex < plots.size(); plotIndex++ )
     {
         const auto* plot = plots[plotIndex];
@@ -1992,6 +2011,26 @@ std::vector<PlotPointDto> WorkerTraceSource::ScanPlots( const ScanRange& range )
         }
     }
     return result;
+}
+
+void WorkerTraceSource::VisitTopLevelGpuZones( const std::function<void( size_t, int64_t, int64_t )>& visit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    for( const auto& entry : m_impl->gpuZones )
+    {
+        if( entry.parent ) continue;
+        const auto start = entry.zone->GpuStart();
+        const auto end = entry.zone->GpuEnd();
+        if( start >= 0 && end >= start ) visit( entry.context, start, end );
+    }
+}
+
+void WorkerTraceSource::VisitPlotPoints( std::string_view plotRef, const std::function<void( int64_t, double )>& visit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto index = m_impl->ParseRef( plotRef, "plot" );
+    if( !index || *index >= m_impl->plots.size() ) return;
+    for( const auto& point : m_impl->plots[size_t( *index )]->data ) visit( point.time.Val(), point.val );
 }
 
 std::vector<std::string> WorkerTraceSource::ScanLocks( const ScanRange& range ) const
@@ -2885,6 +2924,24 @@ std::vector<CallsiteDto> WorkerTraceSource::ScanCallsites( size_t offset, size_t
     return result;
 }
 
+std::vector<JnGpuReferencePassData> WorkerTraceSource::ScanGpuReferencePasses( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferencePasses;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU pass page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
+std::vector<JnGpuReferenceUseData> WorkerTraceSource::ScanGpuReferenceUses( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferenceUses;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU use page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
+std::vector<JnGpuReferenceEndData> WorkerTraceSource::ScanGpuReferenceEnds( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferenceEnds;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU end page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
 std::shared_ptr<const tracy::JnTraceData> WorkerTraceSource::GetGpuCatalogData() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -3217,7 +3274,7 @@ std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( 
             dto.startNs = event.Start();
             if( complete ) dto.endNs = end;
             dto.rawThreadIndex = event.Thread();
-            dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( event.Thread() ) );
+            dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThreadExternal( event.Thread() ) );
             dto.complete = complete;
             result.emplace_back( std::move( dto ) );
             if( result.size() >= range.limit ) return result;

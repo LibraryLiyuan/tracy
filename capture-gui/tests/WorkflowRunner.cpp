@@ -15,7 +15,7 @@ int wmain(int argc, wchar_t **argv)
         if (j.value("launch_only",false))
             c.Launch(s);
         else if (j.contains("recover"))
-            c.Recover(Wide(j.at("recover").get<std::string>()));
+            c.Recover(Wide(j.at("recover").get<std::string>()), &s);
         else
         {
             HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, j.at("target_pid").get<DWORD>());
@@ -27,10 +27,23 @@ int wmain(int argc, wchar_t **argv)
             c.Start(s, target);
         }
         std::string last;
+        bool manualStopSent = false;
+        bool cancellationSent = false;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
         for (;;)
         {
             auto v = c.Snapshot();
+            if (!cancellationSent && j.contains("cancel_file") && fs::exists(Wide(j.at("cancel_file").get<std::string>())))
+            {
+                c.ForceClose();
+                cancellationSent = true;
+            }
+            const auto manualStopAfter = j.value("manual_stop_after_ms", 0ull);
+            if (!manualStopSent && manualStopAfter && v.state == "recording" && v.elapsedMs >= manualStopAfter)
+            {
+                c.Stop();
+                manualStopSent = true;
+            }
             if (v.state != last)
             {
                 std::cout << v.state << ": " << v.message << std::endl;

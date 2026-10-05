@@ -150,6 +150,17 @@ struct CpuFrameScanOptions
     // result storage. Source pages are charged once returned; constructing a
     // native source DTO is not protected by an absolute allocator limit.
     std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    // When non-zero, a scan without logical signatures of a source that offers
+    // compact zone records (CpuZoneScanSource) processes them on this many
+    // threads and replays their effects in scan order: sinks receive the same
+    // calls in the same order, and the result is the same.
+    size_t zoneWorkers = 0;
+    // A worker's unit of work: at least this many zones of one thread, ending
+    // before a zone without a parent (or at the thread's end).
+    size_t zoneChunk = 32768;
+    // When false, ScanView passes no representative event ref (an empty view)
+    // to its sink, which then need not be formatted.
+    bool runRefs = true;
 };
 
 class ExactFrameCpuScanner

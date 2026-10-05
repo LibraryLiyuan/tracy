@@ -175,30 +175,24 @@ GpuQueueClass QueueClass( const GpuContextDto& context )
     return GpuQueueClass::Unknown;
 }
 
-void HashString( Sha256Builder& hash, std::string_view value )
-{
-    const auto size = uint64_t( value.size() );
-    hash.Update( &size, sizeof( size ) );
-    if( !value.empty() ) hash.Update( value.data(), value.size() );
-}
-
-std::string SignatureId( bool logical, std::string_view queueIdentity,
+// As the CPU signature ids: one SHA-256 per distinct preimage.
+std::string SignatureId( Sha256HexMemo& memo, bool& added, bool logical, std::string_view queueIdentity,
     std::string_view parent, const GpuZoneDto& zone, bool stableSite = false )
 {
-    Sha256Builder hash;
+    memo.Begin();
     const uint8_t kind = logical ? 1 : 0;
-    hash.Update( &kind, sizeof( kind ) );
-    HashString( hash, queueIdentity );
-    if( !stableSite ) HashString( hash, parent );
-    HashString( hash, zone.sourceLocationRef );
+    memo.Add( &kind, sizeof( kind ) );
+    memo.AddString( queueIdentity );
+    if( !stableSite ) memo.AddString( parent );
+    memo.AddString( zone.sourceLocationRef );
     if( !stableSite || zone.sourceLocationRef.empty() )
     {
-        HashString( hash, zone.name );
-        HashString( hash, zone.function );
-        HashString( hash, zone.file );
-        hash.Update( &zone.line, sizeof( zone.line ) );
+        memo.AddString( zone.name );
+        memo.AddString( zone.function );
+        memo.AddString( zone.file );
+        memo.Add( &zone.line, sizeof( zone.line ) );
     }
-    return std::string( logical ? "gpu-logical:" : "gpu-exact:" ) + hash.FinalHex();
+    return std::string( logical ? "gpu-logical:" : "gpu-exact:" ) + memo.Digest( added );
 }
 
 int64_t IntervalUnion( std::vector<std::pair<int64_t, int64_t>> intervals,
@@ -393,6 +387,14 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
 
     AnalysisDictionary dictionary( options.workspace );
     AnalysisWorkspaceReservation signatureWorkspace( options.workspace );
+    Sha256HexMemo signatureMemo;
+    const auto signatureId = [&]( bool logical, std::string_view identity, std::string_view parent,
+        const GpuZoneDto& zone, bool stableSite ) {
+        bool added = false;
+        auto id = SignatureId( signatureMemo, added, logical, identity, parent, zone, stableSite );
+        if( added ) signatureWorkspace.Add( 256 + 2ull * signatureMemo.PreimageBytes() + 2ull * id.size() );
+        return id;
+    };
     std::map<std::string_view, AnalysisDictionary::PathId, std::less<>> signatureIndex;
     std::unordered_map<std::string, WorkingGpuStack> stacks;
     std::unordered_map<std::string, uint64_t> nextL0Ordinal;
@@ -618,9 +620,9 @@ GpuJobManagedScanResult GpuJobManagedScanner::Scan( const GpuJobManagedScanOptio
         const auto parentLogical = options.includeLogicalGpuSignatures && !stableLogicalSite &&
             zone.parentRef && parentResolved ? stack.back().logicalSignature : std::string {};
         const auto signature = options.includeExactGpuSignatures ?
-            SignatureId( false, zone.contextRef, parentSignature, zone ) : std::string {};
+            signatureId( false, zone.contextRef, parentSignature, zone, false ) : std::string {};
         const auto logicalSignature = options.includeLogicalGpuSignatures ?
-            SignatureId( true, GpuQueueClassName( queueClass ), parentLogical, zone,
+            signatureId( true, GpuQueueClassName( queueClass ), parentLogical, zone,
                 stableLogicalSite ) : std::string {};
         const auto depth = zone.parentRef && parentResolved ? uint32_t( stack.size() ) : 0u;
         result.maximumGpuDepth = std::max( result.maximumGpuDepth, size_t( depth ) );

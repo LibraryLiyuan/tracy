@@ -16,7 +16,7 @@ if(!$RuntimeDirectory){
     if(Test-Path -LiteralPath $vswhere){$vsRoot=& $vswhere -latest -products '*' -property installationPath; $redist=Join-Path $vsRoot 'VC/Redist/MSVC'; if(Test-Path -LiteralPath $redist){$version=Get-ChildItem -LiteralPath $redist -Directory | Where-Object Name -match '^\d' | Sort-Object Name -Descending | Select-Object -First 1;$RuntimeDirectory=Get-ChildItem -LiteralPath (Join-Path $version.FullName 'x64') -Directory -Filter '*.CRT' | Select-Object -First 1 -ExpandProperty FullName}}
 }
 if(!$RuntimeDirectory -or !(Test-Path -LiteralPath $RuntimeDirectory)){throw 'Specify -RuntimeDirectory pointing to the redistributable x64 Microsoft Visual C++ CRT directory.'}
-foreach($entry in @(@{Source='capture-gui';Targets=@('tracy-capture-gui','capture-gui-core-tests')},@{Source='capture';Targets=@('tracy-capture','tracy-stream-convert')},@{Source='query';Targets=@('tracy-query')})){
+foreach($entry in @(@{Source='capture-gui';Targets=@('tracy-capture-gui','capture-gui-core-tests')},@{Source='capture';Targets=@('tracy-capture','tracy-stream-convert')},@{Source='stream';Targets=@('tracy-stream-export','tracy-stream-index')},@{Source='query';Targets=@('tracy-query')})){
     $build=Join-Path $BuildRoot $entry.Source
     $options=@('-S',(Join-Path $repository $entry.Source),'-B',$build,'-A','x64','-DNO_ISA_EXTENSIONS=ON','-DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF')
     if($DependencyCache){$options+=('-DCPM_SOURCE_CACHE='+$DependencyCache)}
@@ -29,7 +29,7 @@ foreach($entry in @(@{Source='capture-gui';Targets=@('tracy-capture-gui','captur
 & (Join-Path $BuildRoot 'capture-gui/Release/capture-gui-core-tests.exe')
 if($LASTEXITCODE -ne 0){throw 'Core tests failed'}
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
-foreach($file in @('capture-gui/Release/tracy-capture-gui.exe','capture/Release/tracy-capture.exe','capture/Release/tracy-stream-convert.exe','query/Release/tracy-query.exe')){
+foreach($file in @('capture-gui/Release/tracy-capture-gui.exe','capture/Release/tracy-capture.exe','capture/Release/tracy-stream-convert.exe','stream/Release/tracy-stream-export.exe','stream/Release/tracy-stream-index.exe','query/Release/tracy-query.exe')){
     Copy-Item -LiteralPath (Join-Path $BuildRoot $file) -Destination $OutputDirectory
 }
 Copy-Item -LiteralPath (Join-Path $repository 'capture-gui/README.md') -Destination $OutputDirectory

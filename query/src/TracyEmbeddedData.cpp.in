@@ -3,13 +3,13 @@
 namespace tracy::query
 {
 
-const char QuerySchemaJson[] = R"TRACY_SCHEMA(@TRACY_QUERY_SCHEMA_JSON@)TRACY_SCHEMA";
-const char QueryCoverageJson[] = R"TRACY_COVERAGE(@TRACY_QUERY_COVERAGE_JSON@)TRACY_COVERAGE";
-const char QueryFieldCoverageJson[] = R"TRACY_FIELDS(@TRACY_QUERY_FIELD_COVERAGE_JSON@)TRACY_FIELDS";
-const char QueryMcpCoverageJson[] = R"TRACY_MCP(@TRACY_QUERY_MCP_COVERAGE_JSON@)TRACY_MCP";
-const char AnalysisProfileSchemaJson[] = R"TRACY_PROFILE(@TRACY_ANALYSIS_PROFILE_SCHEMA_JSON@)TRACY_PROFILE";
-const char NeutralAggregateSchemaJson[] = R"TRACY_AGGREGATE(@TRACY_NEUTRAL_AGGREGATE_SCHEMA_JSON@)TRACY_AGGREGATE";
-const char CandidateManifestSchemaJson[] = R"TRACY_CANDIDATE(@TRACY_CANDIDATE_MANIFEST_SCHEMA_JSON@)TRACY_CANDIDATE";
-const char AnalysisScanApiSchemaJson[] = R"TRACY_SCAN_API(@TRACY_ANALYSIS_SCAN_API_SCHEMA_JSON@)TRACY_SCAN_API";
+const char QuerySchemaJson[] = @TRACY_QUERY_SCHEMA_CPP@;
+const char QueryCoverageJson[] = @TRACY_QUERY_COVERAGE_CPP@;
+const char QueryFieldCoverageJson[] = @TRACY_QUERY_FIELD_COVERAGE_CPP@;
+const char QueryMcpCoverageJson[] = @TRACY_QUERY_MCP_COVERAGE_CPP@;
+const char AnalysisProfileSchemaJson[] = @TRACY_ANALYSIS_PROFILE_SCHEMA_CPP@;
+const char NeutralAggregateSchemaJson[] = @TRACY_NEUTRAL_AGGREGATE_SCHEMA_CPP@;
+const char CandidateManifestSchemaJson[] = @TRACY_CANDIDATE_MANIFEST_SCHEMA_CPP@;
+const char AnalysisScanApiSchemaJson[] = @TRACY_ANALYSIS_SCAN_API_SCHEMA_CPP@;
 
 }

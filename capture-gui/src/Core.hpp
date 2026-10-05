@@ -19,6 +19,8 @@ void AtomicJson(const fs::path &path, const Json &data);
 Json ReadJson(const fs::path &path);
 bool ValidName(const std::string &name);
 bool CanPublish(bool validated, bool identityMatches, bool recoverable);
+bool CaptureConnectionTimedOut(bool receivedData, bool latestStatusHasData, uint64_t idleMs);
+void PreferBundledTools(struct Settings &settings, const fs::path &directory);
 fs::path NewTaskDirectory(const fs::path &root, const std::string &name);
 fs::path ExecutableDirectory();
 fs::path SettingsDirectory();
@@ -27,8 +29,11 @@ std::string ChoosePath(HWND owner, bool folder, const wchar_t *filter = L"All fi
 struct Settings
 {
     std::string player, workingDirectory, arguments, ini, output, toolDirectory, viewer, name, scene, note;
-    bool admin = true, existing = false, ready = false, timed = false, sound = true;
+    bool admin = true, existing = false, ready = false, timed = false, sound = true, customTools = false;
     int seconds = 60, port = 8086, drainSeconds = 30, hotkey = VK_F9;
+    // Recordings at least this many minutes long are published as their
+    // journal and event store instead of a .tracy file; 0 always does.
+    int storeMinutes = 5;
     unsigned hotkeyModifiers = MOD_CONTROL | MOD_SHIFT;
     uint64_t warnGiB = 50, stopGiB = 20, memoryMiB = 8192;
     DWORD targetPid = 0;

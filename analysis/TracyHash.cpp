@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -19,6 +20,59 @@ namespace tracy::analysis
 {
 namespace
 {
+#ifdef _WIN32
+// Windows' SHA-256 provider (hardware accelerated where the CPU supports it);
+// its algorithm handle is opened once per process and shared by every hash.
+BCRYPT_ALG_HANDLE Sha256Provider()
+{
+    static const BCRYPT_ALG_HANDLE provider = [] {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        if( BCryptOpenAlgorithmProvider( &handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0 ) != 0 )
+            throw std::runtime_error( "unable to open SHA-256 provider" );
+        return handle;
+    }();
+    return provider;
+}
+
+class Sha256
+{
+public:
+    Sha256()
+    {
+        if( BCryptCreateHash( Sha256Provider(), &m_hash, nullptr, 0, nullptr, 0, 0 ) != 0 )
+            throw std::runtime_error( "unable to create SHA-256 hash" );
+    }
+    ~Sha256()
+    {
+        if( m_hash ) BCryptDestroyHash( m_hash );
+    }
+    Sha256( const Sha256& ) = delete;
+    Sha256& operator=( const Sha256& ) = delete;
+
+    void Update( const uint8_t* data, size_t size )
+    {
+        while( size != 0 )
+        {
+            const auto chunk = ULONG( std::min<size_t>( size, 1u << 30 ) );
+            if( BCryptHashData( m_hash, const_cast<PUCHAR>( data ), chunk, 0 ) != 0 )
+                throw std::runtime_error( "unable to hash SHA-256 data" );
+            data += chunk;
+            size -= chunk;
+        }
+    }
+
+    std::array<uint8_t, 32> Final()
+    {
+        std::array<uint8_t, 32> result {};
+        if( BCryptFinishHash( m_hash, result.data(), ULONG( result.size() ), 0 ) != 0 )
+            throw std::runtime_error( "unable to finish SHA-256 hash" );
+        return result;
+    }
+
+private:
+    BCRYPT_HASH_HANDLE m_hash = nullptr;
+};
+#else
 
 constexpr std::array<uint32_t, 64> K = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -131,6 +185,7 @@ private:
     size_t m_blockSize = 0;
     uint64_t m_totalBytes = 0;
 };
+#endif
 
 }
 
@@ -138,6 +193,16 @@ struct Sha256Builder::Impl
 {
     Sha256 value;
     std::string finalHex;
+    // Small updates (callers often hash one record at a time) are gathered
+    // and hashed in blocks; the digest does not depend on the split.
+    std::array<uint8_t, 4096> pending;
+    size_t pendingBytes = 0;
+    void Flush()
+    {
+        if( pendingBytes == 0 ) return;
+        value.Update( pending.data(), pendingBytes );
+        pendingBytes = 0;
+    }
 };
 
 Sha256Builder::Sha256Builder()
@@ -151,19 +216,52 @@ Sha256Builder& Sha256Builder::operator=( Sha256Builder&& ) noexcept = default;
 void Sha256Builder::Update( const void* data, size_t size )
 {
     if( !m_impl || !m_impl->finalHex.empty() ) throw std::runtime_error( "sha256_builder_already_finalized" );
-    if( size != 0 ) m_impl->value.Update( static_cast<const uint8_t*>( data ), size );
+    if( size == 0 ) return;
+    auto& impl = *m_impl;
+    if( size >= impl.pending.size() )
+    {
+        impl.Flush();
+        impl.value.Update( static_cast<const uint8_t*>( data ), size );
+        return;
+    }
+    if( impl.pendingBytes + size > impl.pending.size() ) impl.Flush();
+    std::memcpy( impl.pending.data() + impl.pendingBytes, data, size );
+    impl.pendingBytes += size;
 }
 
 std::string Sha256Builder::FinalHex()
 {
     if( !m_impl ) throw std::runtime_error( "sha256_builder_moved" );
     if( !m_impl->finalHex.empty() ) return m_impl->finalHex;
+    m_impl->Flush();
     const auto digest = m_impl->value.Final();
-    std::ostringstream output;
-    output << std::hex << std::setfill( '0' );
-    for( const auto byte : digest ) output << std::setw( 2 ) << unsigned( byte );
-    m_impl->finalHex = output.str();
+    static constexpr char Digits[] = "0123456789abcdef";
+    std::string hex( digest.size() * 2, '0' );
+    for( size_t i = 0; i < digest.size(); i++ )
+    {
+        hex[i * 2] = Digits[digest[i] >> 4];
+        hex[i * 2 + 1] = Digits[digest[i] & 15];
+    }
+    m_impl->finalHex = std::move( hex );
     return m_impl->finalHex;
+}
+
+const std::string& Sha256HexMemo::Digest( bool& added )
+{
+    if( m_key.size() > MaxPreimage )
+    {
+        added = false;
+        Sha256Builder hash;
+        hash.Update( m_key.data(), m_key.size() );
+        m_last = hash.FinalHex();
+        return m_last;
+    }
+    const auto found = m_digests.find( m_key );
+    added = found == m_digests.end();
+    if( !added ) return found->second;
+    Sha256Builder hash;
+    hash.Update( m_key.data(), m_key.size() );
+    return m_digests.emplace( m_key, hash.FinalHex() ).first->second;
 }
 
 std::string Sha256File( const std::filesystem::path& path )

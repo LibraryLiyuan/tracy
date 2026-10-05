@@ -196,6 +196,13 @@ void TestCrc( TestContext& test )
     constexpr std::array<uint8_t, 9> Known = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
     test.Check( Crc32c( Known ) == 0xE3069283u, "CRC32C matches the standard 123456789 vector" );
     test.Check( Crc32c( std::span<const uint8_t>() ) == 0, "CRC32C of empty input is zero" );
+    std::vector<uint8_t> crcInput(1024+16);uint32_t seed=12345;
+    for(auto& byte:crcInput){seed=seed*1664525u+1013904223u;byte=uint8_t(seed>>24);}
+    for(size_t offset=0;offset<16;++offset)for(size_t length:{size_t(1),size_t(7),size_t(8),size_t(9),size_t(63),size_t(64),size_t(65),size_t(1024)})
+    {
+        uint32_t reference=0xFFFFFFFFu;for(size_t i=0;i<length;++i){reference^=crcInput[offset+i];for(int bit=0;bit<8;++bit)reference=(reference>>1)^((reference&1)?0x82F63B78u:0u);}
+        test.Check(Crc32c(std::span<const uint8_t>(crcInput.data()+offset,length))==~reference,"CRC32C matches portable bitwise reference across alignments and tails");
+    }
 }
 
 void TestEveryTruncation( TestContext& test, const std::vector<uint8_t>& valid, const std::vector<RecordInfo>& records )
@@ -626,6 +633,11 @@ void TestProtocolObserver( TestContext& test )
         test.Check( observer->OnProtocolClose( ProtocolCloseReason::CaptureComplete ), "protocol observer appends terminal record" );
         test.Check( observer->Finalized(), "protocol observer reports finalized" );
         test.Check( observer->DurableSize() == observer->CommittedSize(), "terminal record makes protocol journal durable" );
+        const auto status = observer->Status();
+        test.Check( status.finalized && !status.failed && status.closeReason == ProtocolCloseReason::CaptureComplete,
+            "status exposes the terminal reason and writer state" );
+        test.Check( status.committedSize == status.durableSize && status.clientBytes == 25 * 16 && status.serverBytes == 25 * 16,
+            "status returns coherent positions and directional counters" );
         test.Check( !observer->OnProtocolData( ProtocolDirection::ClientToServer, ProtocolChunk::Handshake, spans ), "finalized observer rejects later protocol bytes" );
         test.Check( observer->OnProtocolClose( ProtocolCloseReason::ObserverDestroyed ), "duplicate protocol close is idempotent" );
     }

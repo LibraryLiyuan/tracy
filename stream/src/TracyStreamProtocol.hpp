@@ -30,6 +30,14 @@ struct ProtocolJournalOptions
     uint64_t bufferBytes = 512ull * 1024;
 };
 
+struct ProtocolJournalStatus
+{
+    uint64_t clientBytes = 0, serverBytes = 0, committedSize = 0, durableSize = 0;
+    uint64_t backpressureWaitCount = 0, peakBufferedBytes = 0;
+    bool failed = false, finalized = false;
+    ProtocolCloseReason closeReason = ProtocolCloseReason::ObserverDestroyed;
+};
+
 class StreamProtocolObserver final : public ProtocolObserver
 {
 public:
@@ -53,6 +61,7 @@ public:
     uint64_t DurableSize() const;
     uint64_t BackpressureWaitCount() const;
     uint64_t PeakBufferedBytes() const;
+    ProtocolJournalStatus Status() const;
 
 private:
     struct PendingRecord

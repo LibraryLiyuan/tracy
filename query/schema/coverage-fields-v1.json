@@ -737,7 +737,7 @@
       "persisted_fields": ["Native Scan API schema", "Neutral Aggregate schema", "Policy Evaluation schema", "Candidate Manifest schema", "Analysis Profile schema"],
       "query_fields": ["trace_identity", "aggregate_identity", "policy_identity", "schema_identity", "state", "progress", "unavailable_reason"],
       "unmapped_fields": [],
-      "methods": ["analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume", "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get", "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close"],
+      "methods": ["analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume", "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get", "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close", "analysis.scan.triage"],
       "status": "complete"
     }
   ],

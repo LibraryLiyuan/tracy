@@ -1,6 +1,7 @@
 #include "TracyQueryService.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyAnalysisProfile.hpp"
+#include "TracyFrameTriage.hpp"
 #include "TracyHash.hpp"
 
 #include "TracyAnalysis.hpp"
@@ -40,7 +41,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume",
         "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get",
-        "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close",
+        "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close", "analysis.scan.triage",
         "capture.context", "capture.coverage", "trace.telemetry_cost", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "relation.search", "relation.get", "runtime.domain.states",
@@ -77,7 +78,7 @@ nlohmann::json RequiredParametersFor( const std::string& method )
     if( method.rfind( "analysis.scan.", 0 ) == 0 )
     {
         if( method == "analysis.scan.profile.validate" ) required.emplace_back( "profile" );
-        else if( method == "analysis.scan.start" )
+        else if( method == "analysis.scan.start" || method == "analysis.scan.triage" )
         {
             required.emplace_back( "trace_id" );
             required.emplace_back( "profile" );
@@ -206,6 +207,21 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["fields"] = ParameterSchemaFor( "fields" );
                 properties["filter"] = ParameterSchemaFor( "filter" );
             }
+            if( method == "analysis.scan.start" )
+            {
+                const json time = { { "type", json::array( { "string", "integer" } ) } };
+                properties["windows"] = { { "type", "array" }, { "minItems", 1 }, { "maxItems", analysis::MaximumAnalysisWindows },
+                    { "description", "Restrict the scan to these capture time windows, e.g. tracy_scan triage scan_windows." },
+                    { "items", { { "type", "object" }, { "required", json::array( { "start_ns", "end_ns" } ) },
+                        { "properties", { { "start_ns", time }, { "end_ns", time } } }, { "additionalProperties", false } } } };
+            }
+            if( method == "analysis.scan.triage" )
+            {
+                properties["frame_set"] = { { "type", "string" }, { "minLength", 1 }, { "maxLength", 256 } };
+                properties["segment_seconds"] = { { "type", "number" }, { "minimum", 0 }, { "maximum", 3600 } };
+                properties["window_seconds"] = { { "type", "number" }, { "minimum", 0.5 }, { "maximum", 60 } };
+                properties["max_windows"] = { { "type", "integer" }, { "minimum", 1 }, { "maximum", 32 } };
+            }
             json alternatives = json::array();
             if( method == "frame.get" )
             {
@@ -325,7 +341,7 @@ std::string QueryExecutableSha256()
 
 nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
 {
-    return {
+    nlohmann::json result = {
         { "scan_id", value.scanId }, { "state", analysis::ScanStateName( value.state ) },
         { "resumable", value.resumable }, { "completed", value.completed },
         { "closed", value.closed },
@@ -334,6 +350,14 @@ nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
             { "total", std::to_string( value.progressTotal ) }, { "stage", value.stage } } },
         { "error", value.error.empty() ? nlohmann::json( nullptr ) : nlohmann::json( value.error ) }
     };
+    if( !value.windows.empty() )
+    {
+        nlohmann::json windows = nlohmann::json::array();
+        for( const auto& window : value.windows )
+            windows.push_back( { { "start_ns", std::to_string( window.startNs ) }, { "end_ns", std::to_string( window.endNs ) } } );
+        result["windows"] = std::move( windows );
+    }
+    return result;
 }
 
 using nlohmann::json;
@@ -4634,6 +4658,61 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             } }
         } );
     }
+    if( method == "analysis.scan.triage" )
+    {
+        // Labels every frame by what limited it, from the threads' work and
+        // waits, GPU busy time and memory counters; needs no analysis cache.
+        const auto validation = analysis::ValidateAndNormalizeAnalysisProfile( params.at( "profile" ) );
+        if( !validation.valid )
+        {
+            json errors = json::array();
+            for( const auto& error : validation.errors ) errors.push_back( { { "path", error.path }, { "message", error.message } } );
+            throw QueryError( "INVALID_ANALYSIS_PROFILE", "analysis profile validation failed", false, { { "errors", std::move( errors ) } } );
+        }
+        const auto& profile = validation.normalized;
+        analysis::FrameTriageOptions options;
+        options.cancelled = [&] { return stopToken.stop_requested(); };
+        options.frameBudgetMs = profile.at( "frame_budget" ).at( "frame_ms" ).get<double>();
+        const auto& resources = profile.at( "resource_budgets" );
+        if( resources.contains( "gpu_memory_bytes" ) ) options.gpuMemoryBudgetBytes = resources.at( "gpu_memory_bytes" ).get<double>();
+        if( resources.contains( "cpu_memory_bytes" ) ) options.cpuMemoryBudgetBytes = resources.at( "cpu_memory_bytes" ).get<double>();
+        const auto number = [&]( const char* name, double fallback, double minimum, double maximum ) {
+            if( !params.contains( name ) ) return fallback;
+            if( !params[name].is_number() || params[name].get<double>() < minimum || params[name].get<double>() > maximum )
+                throw QueryError( "INVALID_PARAMS", std::string( name ) + " is out of range" );
+            return params[name].get<double>();
+        };
+        if( params.contains( "frame_set" ) )
+        {
+            if( !params["frame_set"].is_string() || params["frame_set"].get_ref<const std::string&>().empty() )
+                throw QueryError( "INVALID_PARAMS", "frame_set must be a frame set ref or name" );
+            options.frameSet = params["frame_set"].get<std::string>();
+        }
+        options.segmentSeconds = number( "segment_seconds", 0, 0, 3600 );
+        options.windowSeconds = number( "window_seconds", 5, 0.5, 60 );
+        if( params.contains( "max_windows" ) && !params["max_windows"].is_number_integer() ) throw QueryError( "INVALID_PARAMS", "max_windows must be an integer" );
+        options.maxWindows = size_t( number( "max_windows", 6, 1, 32 ) );
+        options.workers = DefaultAnalysisZoneWorkers();
+        const auto traceId = params.at( "trace_id" ).get<std::string>();
+        auto source = m_sessions.GetReadySource( traceId );
+        try
+        {
+            auto result = analysis::RunFrameTriage( *source, options );
+            result["trace_id"] = traceId;
+            result["profile_identity"] = validation.profileSha256;
+            return Success( id, std::move( result ) );
+        }
+        catch( const QueryError& ) { throw; }
+        catch( const std::invalid_argument& error ) { throw QueryError( "INVALID_PARAMS", error.what() ); }
+        catch( const std::exception& error )
+        {
+            if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+            const std::string message = error.what();
+            if( message == "frame_triage_no_frame_set" || message == "frame_triage_no_complete_frames" )
+                throw QueryError( "INCOMPLETE_DATA", message );
+            throw QueryError( "INTERNAL_ERROR", message );
+        }
+    }
     if( IsDeterministicScanMethod( method ) )
     {
         if( !m_scanManager ) throw QueryError( "ANALYSIS_PATHS_NOT_CONFIGURED",
@@ -4669,6 +4748,31 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 request.source = std::move( source );
                 request.normalizedProfile = validation.normalized;
                 request.profileIdentity = validation.profileSha256;
+                if( params.contains( "windows" ) )
+                {
+                    const auto& windows = params["windows"];
+                    if( !windows.is_array() || windows.empty() || windows.size() > analysis::MaximumAnalysisWindows )
+                        throw QueryError( "INVALID_PARAMS", "windows must be an array of 1 to 64 {start_ns, end_ns} objects" );
+                    const auto time = [&]( const json& value ) {
+                        int64_t result = 0;
+                        if( value.is_number_integer() ) return value.get<int64_t>();
+                        if( value.is_string() )
+                        {
+                            const auto& text = value.get_ref<const std::string&>();
+                            const auto parsed = std::from_chars( text.data(), text.data() + text.size(), result );
+                            if( parsed.ec == std::errc() && parsed.ptr == text.data() + text.size() && !text.empty() ) return result;
+                        }
+                        throw QueryError( "INVALID_PARAMS", "window times must be integers or decimal strings in ns" );
+                    };
+                    for( const auto& window : windows )
+                    {
+                        if( !window.is_object() || window.size() != 2 || !window.contains( "start_ns" ) || !window.contains( "end_ns" ) )
+                            throw QueryError( "INVALID_PARAMS", "each window must be {start_ns, end_ns}" );
+                        request.windows.push_back( { time( window["start_ns"] ), time( window["end_ns"] ) } );
+                    }
+                    try { request.windows = analysis::NormalizeAnalysisWindows( std::move( request.windows ) ); }
+                    catch( const std::invalid_argument& error ) { throw QueryError( "INVALID_PARAMS", error.what() ); }
+                }
                 return snapshot( m_scanManager->Start( request ) );
             }
             if( method == "analysis.scan.status" ) return snapshot( m_scanManager->Status( scanId ) );
@@ -11593,7 +11697,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         json findings = json::array();
         const auto metadata = info();
-        const auto addFinding = [&]( const char* severity, const char* code, std::string message, uint64_t count, json refs = json::array() ) {
+        const auto addFinding = [&]( const char* severity, const char* code, std::string message, uint64_t count, json refs = json() ) {
+            if( refs.is_null() ) refs = json::array();
             findings.push_back( { { "severity", severity }, { "code", code }, { "message", std::move( message ) },
                 { "count", Decimal( count ) }, { "refs", std::move( refs ) } } );
         };

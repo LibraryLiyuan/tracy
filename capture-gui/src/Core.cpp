@@ -80,10 +80,29 @@ std::string Timestamp()
 }
 Json ReadJson(const fs::path &p)
 {
-    std::ifstream f(p, std::ios::binary);
-    if (!f)
+    HANDLE file = CreateFileW(p.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
         throw std::runtime_error("Cannot read " + PathText(p));
-    return Json::parse(f);
+    struct CloseFile
+    {
+        HANDLE value;
+        ~CloseFile() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    } close{file};
+    std::string contents;
+    std::array<char, 4096> bytes;
+    for (;;)
+    {
+        DWORD read = 0;
+        if (!ReadFile(file, bytes.data(), DWORD(bytes.size()), &read, nullptr))
+            throw std::runtime_error("Cannot read " + PathText(p) + ": " + ErrorText());
+        if (!read) break;
+        contents.append(bytes.data(), read);
+    }
+    CloseHandle(close.value);
+    close.value = INVALID_HANDLE_VALUE;
+    return Json::parse(contents);
 }
 void AtomicJson(const fs::path &p, const Json &data)
 {
@@ -97,8 +116,15 @@ void AtomicJson(const fs::path &p, const Json &data)
         if (!f)
             throw std::runtime_error("Cannot write " + PathText(temp));
     }
-    if (!MoveFileExW(temp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        throw std::runtime_error(ErrorText());
+    DWORD error = ERROR_SUCCESS;
+    for (unsigned attempt = 0; attempt < 20; ++attempt)
+    {
+        if (MoveFileExW(temp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+        error = GetLastError();
+        if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) break;
+        Sleep(5);
+    }
+    throw std::runtime_error("Cannot publish " + PathText(p) + ": " + ErrorText(error));
 }
 std::string Sha256(const fs::path &path)
 {
@@ -160,6 +186,18 @@ bool ValidName(const std::string &n)
 bool CanPublish(bool a, bool b, bool c)
 {
     return a && b && c;
+}
+bool CaptureConnectionTimedOut(bool receivedData, bool latestStatusHasData, uint64_t idleMs)
+{
+    return !receivedData && !latestStatusHasData && idleMs > 60000;
+}
+void PreferBundledTools(Settings &settings, const fs::path &directory)
+{
+    if (settings.customTools) return;
+    std::error_code error;
+    for (auto name : {L"tracy-capture.exe", L"tracy-stream-export.exe", L"tracy-query.exe"})
+        if (!fs::is_regular_file(directory / name, error)) return;
+    settings.toolDirectory = PathText(fs::absolute(directory));
 }
 fs::path NewTaskDirectory(const fs::path &root, const std::string &name)
 {
@@ -244,6 +282,7 @@ Json Settings::ToJson() const
             {"ini", ini},
             {"output", output},
             {"tools", toolDirectory},
+            {"tools_custom", customTools},
             {"viewer", viewer},
             {"name", name},
             {"scene", scene},
@@ -254,6 +293,7 @@ Json Settings::ToJson() const
             {"seconds", seconds},
             {"port", port},
             {"drain_seconds", drainSeconds},
+            {"store_minutes", storeMinutes},
             {"warn_gib", warnGiB},
             {"stop_gib", stopGiB},
             {"memory_mib", memoryMiB},
@@ -271,6 +311,7 @@ Settings Settings::FromJson(const Json &j)
     s.ini = j.value("ini", "");
     s.output = j.value("output", PathText(SettingsDirectory() / L"Captures"));
     s.toolDirectory = j.value("tools", PathText(ExecutableDirectory()));
+    s.customTools = j.value("tools_custom", false);
     s.viewer = j.value("viewer", "");
     s.name = j.value("name", "Player_" + Timestamp());
     s.scene = j.value("scene", "");
@@ -281,6 +322,7 @@ Settings Settings::FromJson(const Json &j)
     s.seconds = j.value("seconds", 60);
     s.port = j.value("port", 8086);
     s.drainSeconds = j.value("drain_seconds", 30);
+    s.storeMinutes = j.value("store_minutes", 5);
     s.warnGiB = j.value("warn_gib", 50ull);
     s.stopGiB = j.value("stop_gib", 20ull);
     s.memoryMiB = j.value("memory_mib", 8192ull);
@@ -393,7 +435,7 @@ std::vector<std::string> PreflightErrors(const Settings &s, ProcessIdentity targ
     std::error_code ec;
     if (!fs::is_regular_file(Wide(s.ini), ec))
         errors.push_back("请选择存在的 INI 文件");
-    for (auto name : {L"tracy-capture.exe", L"tracy-stream-convert.exe", L"tracy-query.exe"})
+    for (auto name : {L"tracy-capture.exe", L"tracy-stream-export.exe", L"tracy-query.exe"})
         if (!fs::is_regular_file(fs::path(Wide(s.toolDirectory)) / name, ec))
             errors.push_back("缺少工具：" + Utf8(name));
     if (!ValidName(s.name))
