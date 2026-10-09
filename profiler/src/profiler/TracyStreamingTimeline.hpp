@@ -40,7 +40,7 @@ public:
     struct Stats
     {
         uint64_t draws = 0;
-        size_t lanes = 0, zones = 0, folded = 0, density = 0, frames = 0, vramLanes = 0, usageLanes = 0, fpsLanes = 0;
+        size_t lanes = 0, zones = 0, folded = 0, density = 0, frames = 0, vramLanes = 0, usageLanes = 0;
         // The range the plot lanes showed.
         int64_t plotBegin = 0, plotEnd = 0;
         // A read was drawn, and it covers the view at its resolution.
@@ -60,8 +60,9 @@ public:
     // frame count of the active frame set with a go-to-frame popup, the frame
     // set combo, then the view and capture spans.
     void DrawFrameNavigation();
-    // Tracy's frame time graph of the active frame set: a bar per frame, or
-    // per group of frames once scaled down, with the view's frames marked.
+    // The frame graph of the active frame set: a bar per frame, or per group
+    // of frames once scaled down, the average FPS line, the view's frames
+    // marked, and a summary of the frames shown above it.
     void DrawFrameGraph();
     // The Tracy options that apply to this timeline.
     void DrawOptions();
@@ -294,15 +295,14 @@ private:
     std::thread m_vramThread;
     std::optional<int64_t> m_vramClick;
     std::atomic<bool> m_vramLoading{ true };
-    bool m_drawVram = true, m_showVram = false, m_drawUsage = true, m_drawFps = true;
+    bool m_drawVram = true, m_showVram = false, m_drawUsage = true;
     int64_t m_begin = 0, m_end = 0;
     bool m_rangeChanged = false;
     // Lane keys: a thread's or GPU context's id * 2 + gpu, VramLaneKey -
     // segment for the GPU memory lanes, whose system memory lane starts
-    // collapsed, UsageLaneKey - lane for the usage lanes, and FpsLaneKey.
+    // collapsed, and UsageLaneKey - lane for the usage lanes.
     static constexpr uint64_t VramLaneKey = UINT64_MAX;
     static constexpr uint64_t UsageLaneKey = UINT64_MAX - 16;
-    static constexpr uint64_t FpsLaneKey = UINT64_MAX - 32;
     std::vector<uint64_t> m_collapsed { VramLaneKey - 1 };
 
     Range m_highlight, m_highlightZoom;
@@ -314,6 +314,19 @@ private:
     std::vector<std::pair<float, float>> m_frameTargetSpans;
     // Frame graph and options, as Tracy's view data.
     int m_frameScale = 0, m_frameStart = 0, m_frameTarget = 60;
+    // The first and last frame of the bar a drag in the frame graph started
+    // on, -1 without one, and the view the graph last kept in sight.
+    int m_frameDragFirst = -1, m_frameDragLast = -1;
+    int64_t m_frameGraphBegin = -1, m_frameGraphEnd = -1;
+    // The frame graph's summary of the frames it shows, and what it is of.
+    struct FrameSummary
+    {
+        size_t set = SIZE_MAX;
+        int first = -1, last = -1, total = 0, target = 0;
+        int64_t lastNs = 0;
+        double averageFps = 0, lowFps = 0;
+        int slow = 0;
+    } m_frameSummary;
     // The go-to popup's frame and time.
     int m_goToFrame = 0;
     std::array<char, 64> m_goToTime {};

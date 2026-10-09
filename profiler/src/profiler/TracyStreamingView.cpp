@@ -623,7 +623,7 @@ bool StreamingView::SmokeStepTimeline()
         m_timelineSmoke += std::string( name ) + "_zones=" + std::to_string( stats.zones ) + ' ' + name + "_folded=" + std::to_string( stats.folded ) + ' ' +
             name + "_density=" + std::to_string( stats.density ) + ' ' + name + "_frames=" + std::to_string( stats.frames ) + ' ' +
             name + "_lanes=" + std::to_string( stats.lanes ) + ' ' + name + "_vram_lanes=" + std::to_string( stats.vramLanes ) + ' ' +
-            name + "_usage_lanes=" + std::to_string( stats.usageLanes ) + ' ' + name + "_fps_lanes=" + std::to_string( stats.fpsLanes ) + ' ' + name + "_seconds=" +
+            name + "_usage_lanes=" + std::to_string( stats.usageLanes ) + ' ' + name + "_seconds=" +
             std::to_string( std::chrono::duration<double>( std::chrono::steady_clock::now() - m_timelineSmokeSince ).count() ) + ' ';
     };
     if( m_timelineSmokeStep > 0 && std::chrono::steady_clock::now() - m_timelineSmokeSince > std::chrono::minutes( 3 ) )

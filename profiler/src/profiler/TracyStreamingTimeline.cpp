@@ -1549,16 +1549,13 @@ void StreamingTimeline::DrawOptions()
     ImGui::Indent();
     ImGui::SetNextItemWidth( 90 * GetScale() );
     if( ImGui::InputInt( "Target FPS", &m_frameTarget ) ) m_frameTarget = std::clamp( m_frameTarget, 1, 10000 );
-    ImGui::TextDisabled( "Frame time graph colors and the timeline's frame shading follow the target." );
+    ImGui::TextDisabled( "The frame graph's colors, guide lines and FPS line, and the timeline's frame shading, follow the target." );
     ImGui::Unindent();
     ImGui::BeginDisabled( !Vram() );
     ImGui::Checkbox( ICON_FA_MICROCHIP " Draw GPU memory", &m_drawVram );
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextDisabled( Vram() ? "(video and system memory lanes, with the other plot lanes at the top)" : "(the capture has no GPU memory plots)" );
-    ImGui::Checkbox( ICON_FA_GAUGE " Draw FPS", &m_drawFps );
-    ImGui::SameLine();
-    ImGui::TextDisabled( "(the frame graph's frame set, against the target FPS above)" );
     ImGui::BeginDisabled( !Usage() );
     ImGui::Checkbox( ICON_FA_GAUGE_HIGH " Draw CPU, memory and GPU usage", &m_drawUsage );
     ImGui::EndDisabled();
@@ -1652,7 +1649,16 @@ void StreamingTimeline::DrawFrameNavigation()
     }
 }
 
-// As Tracy's DrawFrames: the frame time graph.
+// The frame graph of the active frame set: a bar per frame, or per group of
+// frames once scaled down, as tall as its frame time (a group's slowest), and
+// a line of the average FPS over the last second (over the group when that
+// is longer), on one scale with guide lines labelled in FPS and frame times.
+// Above it, the frames it shows with their average FPS, 1% low and frames
+// over twice the target. Zoomed out, it stops at the first scale at which
+// every frame fits and stretches the whole capture across its width; zoomed
+// in, the frame under the mouse stays put and the graph never scrolls before
+// the first frame or past the last. It keeps the view's frames in sight when
+// the view moves elsewhere; a click selects a frame, a drag a range of them.
 void StreamingTimeline::DrawFrameGraph()
 {
     const auto statics = CurrentStatics();
@@ -1664,24 +1670,70 @@ void StreamingTimeline::DrawFrameGraph()
     const auto lastNs = statics->lastNs;
     const auto frameWidth = []( int frameScale ) { return frameScale == 0 ? 4 : ( frameScale < 0 ? 6 : 1 ); };
     const auto frameGroup = []( int frameScale ) { return frameScale < 2 ? 1 : ( 1 << ( frameScale - 1 ) ); };
-    const auto frameColor = []( uint64_t time, uint64_t target ) {
-        return time > target * 2 ? 0xFF2222DD : time > target ? 0xFF22DDDD : time > target / 2 ? 0xFF22DD22 : 0xFFDD9900;
-    };
 
     const auto scale = GetScale();
-    const auto Height = 50 * scale;
-    constexpr uint64_t MaxFrameTime = 50 * 1000 * 1000;
-    const uint64_t frameTarget = 1000 * 1000 * 1000 / uint64_t( std::max( 1, m_frameTarget ) );
+    const auto Height = 70 * scale;
+    const auto ty = ImGui::GetTextLineHeight();
+    const int64_t frameTarget = 1000 * 1000 * 1000 / std::max( 1, m_frameTarget );
+    // 50 ms, or more so that twice the target fits.
+    const int64_t MaxFrameTime = std::max<int64_t>( 50 * 1000 * 1000, frameTarget * 5 / 2 );
+    const auto frameColor = [frameTarget]( int64_t time ) { return time > frameTarget * 2 ? 0xFF2222DD : time > frameTarget ? 0xFF22DDDD : 0xFF22DD22; };
     auto& io = ImGui::GetIO();
+    auto draw = ImGui::GetWindowDrawList();
+    const auto w = ImGui::GetContentRegionAvail().x;
+    // The summary row, written once the graph's frames are known.
+    const auto rowPos = ImGui::GetCursorScreenPos();
+    ImGui::Dummy( ImVec2( w, ty ) );
     const auto wpos = ImGui::GetCursorScreenPos();
     const auto dpos = wpos + ImVec2( 0.5f, 0.5f );
-    const auto w = ImGui::GetContentRegionAvail().x;
-    auto draw = ImGui::GetWindowDrawList();
+    // The guide lines' labels, in a column right of the bars.
+    char guides[2][64];
+    const auto guideText = []( char* out, size_t size, double fps, int64_t time ) {
+        snprintf( out, size, fps == std::floor( fps ) ? "%.0f FPS \xc2\xb7 %.1f ms" : "%.1f FPS \xc2\xb7 %.1f ms", fps, time / 1e6 );
+    };
+    guideText( guides[0], sizeof( guides[0] ), double( m_frameTarget ), frameTarget );
+    guideText( guides[1], sizeof( guides[1] ), m_frameTarget / 2.0, frameTarget * 2 );
+    const auto labelWidth = std::max( ImGui::CalcTextSize( guides[0] ).x, ImGui::CalcTextSize( guides[1] ).x ) + ty;
+    const int columns = std::max( 1, int( w - labelWidth - 2 ) );
+
+    // The widest view: the first scale at which every frame fits. It shows
+    // the whole capture in bars of whole frames and whole pixels across the
+    // graph, rather than squeezed into its left part.
+    int fitScale = -1;
+    while( fitScale < 10 && columns / frameWidth( fitScale ) * frameGroup( fitScale ) < total ) fitScale++;
+    const int bars = std::min( total, columns );
+    m_frameScale = std::min( m_frameScale, fitScale );
+    // The first frame and the frame count of the column at offset mo.
+    const auto columnFrames = [&]( float mo, int frameScale, int start ) {
+        if( frameScale >= fitScale )
+        {
+            const auto bar = std::clamp( int( mo * bars / columns ), 0, bars - 1 );
+            const auto first = int( int64_t( bar ) * total / bars );
+            return std::make_pair( first, int( int64_t( bar + 1 ) * total / bars ) - first );
+        }
+        const auto first = start + int( mo * frameGroup( frameScale ) / frameWidth( frameScale ) );
+        return std::make_pair( first, std::min( frameGroup( frameScale ), total - first ) );
+    };
+    // Tracy's initialization and missed frames, left out of the averages.
+    const int skip = frames.base ? ( statics->onDemand ? 2 : 1 ) : 0;
+    // Frames per second over the frames first to last, taken back to cover a
+    // second when they are shorter, and the time that covers.
+    const auto averageFps = [&]( int first, int last ) {
+        const auto end = FrameEnd( frames, last, lastNs );
+        auto from = std::min( first, int( std::lower_bound( frames.starts.begin(), frames.starts.end(), end - 1000 * 1000 * 1000 ) - frames.starts.begin() ) );
+        from = std::max( from, std::min( skip, first ) );
+        const auto span = end - frames.starts[from];
+        return std::make_pair( span > 0 ? 1e9 * ( last - from + 1 ) / double( span ) : 0.0, span );
+    };
+    const auto selectFrames = [&]( int first, int last ) {
+        SetRange( frames.starts[first], FrameEnd( frames, last, lastNs ) );
+        if( m_begin == m_end ) m_begin--;
+    };
 
     ImGui::InvisibleButton( "##frames", ImVec2( w, Height ) );
     const bool hover = ImGui::IsItemHovered();
     if( hover ) ImGui::SetItemKeyOwner( ImGuiKey_MouseWheelY );
-    draw->AddRectFilled( wpos, wpos + ImVec2( w, Height ), 0x33FFFFFF );
+    draw->AddRectFilled( wpos, wpos + ImVec2( columns + 2, Height ), 0x33FFFFFF );
     const auto wheel = io.MouseWheel;
     const auto prevScale = m_frameScale;
     if( hover )
@@ -1692,45 +1744,75 @@ void StreamingTimeline::DrawFrameGraph()
         }
         else if( wheel < 0 )
         {
-            if( m_frameScale < 10 ) m_frameScale++;
+            if( m_frameScale < fitScale ) m_frameScale++;
         }
     }
+    const bool fit = m_frameScale >= fitScale;
     const int fwidth = frameWidth( m_frameScale );
     const int group = frameGroup( m_frameScale );
-    const int onScreen = int( ( w - 2 ) / fwidth );
+    const int onScreen = columns / fwidth;
+    const auto clampStart = [&] { m_frameStart = fit ? 0 : std::clamp( m_frameStart, 0, std::max( 0, total - onScreen * group ) ); };
+    if( !ImGui::IsMouseDown( 0 ) ) m_frameDragFirst = -1;
+    // When the view moves elsewhere, the graph scrolls to show its frames.
+    if( ( m_begin != m_frameGraphBegin || m_end != m_frameGraphEnd ) && m_frameDragFirst < 0 && !( hover && IsMouseDragging( 1 ) ) )
+    {
+        m_frameGraphBegin = m_begin;
+        m_frameGraphEnd = m_end;
+        if( !fit )
+        {
+            const auto view = FrameRange( frames, m_begin, m_end );
+            const int first = int( view.first ), last = std::max( first + 1, int( view.second ) );
+            const int shown = onScreen * group;
+            if( first < m_frameStart || last > m_frameStart + shown ) m_frameStart = last - first <= shown ? ( first + last ) / 2 - shown / 2 : first;
+        }
+    }
+    float crosshair = -1;
     if( hover )
     {
-        if( IsMouseDragging( 1 ) )
+        if( !fit && IsMouseDragging( 1 ) )
         {
             const auto delta = GetMouseDragDelta( 1 ).x;
             if( std::abs( delta ) >= fwidth )
             {
                 const auto d = int( delta ) / fwidth;
-                m_frameStart = std::max( 0, m_frameStart - d * group );
+                m_frameStart -= d * group;
                 io.MouseClickedPos[1].x = io.MousePos.x + d * fwidth - delta;
             }
         }
         const auto mx = io.MousePos.x;
-        if( mx > wpos.x && mx < wpos.x + w - 1 )
+        if( mx > wpos.x && mx < wpos.x + columns + 1 )
         {
             const auto mo = mx - ( wpos.x + 1 );
-            const auto off = int( mo * group / fwidth );
-            const int sel = m_frameStart + off;
+            if( m_frameScale != prevScale ) m_frameStart = columnFrames( mo, prevScale, m_frameStart ).first - int( mo * group / fwidth );
+            clampStart();
+            const auto [sel, count] = columnFrames( mo, m_frameScale, m_frameStart );
             if( sel < total )
             {
+                const auto last = sel + count - 1;
+                crosshair = fit ? float( int64_t( std::clamp( int( mo * bars / columns ), 0, bars - 1 ) ) * columns / bars ) + 0.5f * columns / bars
+                                : float( ( sel - m_frameStart ) / group * fwidth ) + 0.5f * fwidth;
+                const auto [fps, span] = averageFps( sel, last );
                 ImGui::BeginTooltip();
-                if( group > 1 )
+                if( count > 1 )
                 {
-                    auto f = FrameTime( frames, sel, lastNs );
-                    const auto g = std::min( group, total - sel );
-                    for( int j = 1; j < g; j++ ) f = std::max( f, FrameTime( frames, sel + j, lastNs ) );
+                    int64_t slowest = 0;
+                    int over = 0;
+                    for( int j = sel; j <= last; j++ )
+                    {
+                        const auto time = FrameTime( frames, j, lastNs );
+                        slowest = std::max( slowest, time );
+                        if( time > frameTarget ) over++;
+                    }
                     TextDisabledUnformatted( "Frames:" );
                     ImGui::SameLine();
-                    ImGui::Text( "%s - %s (%s)", RealToString( sel ), RealToString( sel + g - 1 ), RealToString( g ) );
+                    ImGui::Text( "%s - %s (%s)", RealToString( FrameNumber( *statics, frames, sel ) ), RealToString( FrameNumber( *statics, frames, last ) ), RealToString( count ) );
                     ImGui::Separator();
-                    TextFocused( "Max frame time:", TimeToString( f ) );
+                    TextFocused( "Slowest frame:", TimeToString( slowest ) );
                     ImGui::SameLine();
-                    ImGui::TextDisabled( "(%.1f FPS)", 1000000000.0 / f );
+                    ImGui::TextDisabled( "(%.1f FPS)", 1000000000.0 / slowest );
+                    TextFocused( "Over the target:", RealToString( over ) );
+                    ImGui::SameLine();
+                    ImGui::TextDisabled( "of %s frames", RealToString( count ) );
                 }
                 else
                 {
@@ -1760,56 +1842,77 @@ void StreamingTimeline::DrawFrameGraph()
                         ImGui::TextDisabled( "(%.1f FPS)", 1000000000.0 / frameTime );
                     }
                 }
+                char average[32];
+                snprintf( average, sizeof( average ), "%.1f FPS", fps );
+                TextFocused( "Average:", average );
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(over %s)", TimeToString( span ) );
                 TextFocused( "Time from start of program:", TimeToStringExact( frames.starts[sel] ) );
                 ImGui::EndTooltip();
-                const auto last = std::min( total - 1, sel + group - 1 );
                 if( IsMouseClicked( 0 ) )
                 {
-                    SetRange( frames.starts[sel], FrameEnd( frames, last, lastNs ) );
-                    if( m_begin == m_end ) m_begin--;
+                    m_frameDragFirst = sel;
+                    m_frameDragLast = last;
+                    selectFrames( sel, last );
                 }
-                else if( IsMouseDragging( 0 ) )
+                else if( m_frameDragFirst >= 0 && IsMouseDragging( 0 ) )
                 {
-                    ZoomToRange( std::min( m_begin, frames.starts[sel] ), std::max( m_end, FrameEnd( frames, last, lastNs ) ) );
+                    selectFrames( std::min( m_frameDragFirst, sel ), std::max( m_frameDragLast, last ) );
                 }
             }
-            if( wheel != 0 )
-            {
-                const int pfwidth = frameWidth( prevScale );
-                const int pgroup = frameGroup( prevScale );
-                const auto oldoff = int( mo * pgroup / pfwidth );
-                m_frameStart = std::min( total, std::max( 0, m_frameStart - int( off - oldoff ) ) );
-            }
         }
     }
+    clampStart();
 
-    int i = 0, idx = 0;
-    while( i < onScreen && m_frameStart + idx < total )
-    {
-        auto f = FrameTime( frames, m_frameStart + idx, lastNs );
-        if( group > 1 )
-        {
-            const int g = std::min( group, total - ( m_frameStart + idx ) );
-            for( int j = 1; j < g; j++ ) f = std::max( f, FrameTime( frames, m_frameStart + idx + j, lastNs ) );
-        }
-        const auto h = std::max( 1.f, float( std::min<uint64_t>( MaxFrameTime, uint64_t( std::max<int64_t>( 0, f ) ) ) ) / MaxFrameTime * ( Height - 2 ) );
-        if( fwidth != 1 )
-            draw->AddRectFilled( wpos + ImVec2( 1 + i * fwidth, Height - 1 - h ), wpos + ImVec2( fwidth + i * fwidth, Height - 1 ), frameColor( f, frameTarget ) );
-        else
-            DrawLine( draw, dpos + ImVec2( 1 + i, Height - 2 - h ), dpos + ImVec2( 1 + i, Height - 2 ), frameColor( f, frameTarget ) );
-        i++;
-        idx += group;
-    }
-
+    // The view's frames: a band behind the bars with its edges above them,
+    // or a mark above them when it is narrow.
+    const auto frameX = [&]( size_t frame ) {
+        return fit ? int( int64_t( frame ) * columns / total ) : int( ( int64_t( frame ) - m_frameStart ) * fwidth / group );
+    };
     const auto zrange = FrameRange( frames, m_begin, m_end );
-    if( int( zrange.second ) > m_frameStart && int( zrange.first ) < m_frameStart + onScreen * group )
+    const bool viewShown = int( zrange.second ) > ( fit ? 0 : m_frameStart ) && int( zrange.first ) < ( fit ? total : m_frameStart + onScreen * group );
+    auto x1 = std::min( fit ? columns : onScreen * fwidth, frameX( zrange.second ) );
+    const auto x0 = std::max( 0, frameX( zrange.first ) );
+    if( x0 == x1 ) x1 = x0 + 1;
+    if( viewShown && x1 - x0 >= 3 ) draw->AddRectFilled( wpos + ImVec2( 2 + x0, 0 ), wpos + ImVec2( x1, Height ), 0x55DD22DD );
+
+    // The bars, each frame's time or a group's slowest, with a cap where it
+    // runs off the scale; the average FPS line through their middles.
+    std::vector<ImVec2> line;
+    const auto barY = [&]( int64_t time ) { return float( std::min( MaxFrameTime, std::max<int64_t>( 0, time ) ) ) / MaxFrameTime * ( Height - 2 ); };
+    const auto drawBar = [&]( int x, int width, int first, int count ) {
+        auto f = FrameTime( frames, first, lastNs );
+        for( int j = 1; j < count; j++ ) f = std::max( f, FrameTime( frames, first + j, lastNs ) );
+        const auto h = std::max( 1.f, barY( f ) );
+        if( width != 1 )
+            draw->AddRectFilled( wpos + ImVec2( 1 + x, Height - 1 - h ), wpos + ImVec2( x + width, Height - 1 ), frameColor( f ) );
+        else
+            DrawLine( draw, dpos + ImVec2( 1 + x, Height - 2 - h ), dpos + ImVec2( 1 + x, Height - 2 ), frameColor( f ) );
+        const auto cx = wpos.x + 1 + x + 0.5f * width;
+        if( f > MaxFrameTime ) draw->AddTriangleFilled( ImVec2( cx - 3 * scale, wpos.y + 1 + 5 * scale ), ImVec2( cx + 3 * scale, wpos.y + 1 + 5 * scale ), ImVec2( cx, wpos.y + 1 ), 0xFF8888FF );
+        const auto fps = averageFps( first, first + count - 1 ).first;
+        line.emplace_back( cx, wpos.y + Height - 1 - barY( fps > 0 ? int64_t( 1e9 / fps ) : MaxFrameTime ) );
+    };
+    if( fit )
     {
-        auto x1 = std::min( onScreen * fwidth, ( int( zrange.second ) - m_frameStart ) * fwidth / group );
-        auto x0 = std::max( 0, ( int( zrange.first ) - m_frameStart ) * fwidth / group );
-        if( x0 == x1 ) x1 = x0 + 1;
+        line.reserve( bars );
+        for( int bar = 0; bar < bars; bar++ )
+        {
+            const auto first = int( int64_t( bar ) * total / bars );
+            const auto x = int( int64_t( bar ) * columns / bars );
+            drawBar( x, int( int64_t( bar + 1 ) * columns / bars ) - x, first, int( int64_t( bar + 1 ) * total / bars ) - first );
+        }
+    }
+    else
+    {
+        line.reserve( onScreen );
+        for( int i = 0, idx = m_frameStart; i < onScreen && idx < total; i++, idx += group ) drawBar( i * fwidth, fwidth, idx, std::min( group, total - idx ) );
+    }
+
+    if( viewShown )
+    {
         if( x1 - x0 >= 3 )
         {
-            draw->AddRectFilled( wpos + ImVec2( 2 + x0, 0 ), wpos + ImVec2( x1, Height ), 0x55DD22DD );
             DrawLine( draw, dpos + ImVec2( 1 + x0, -1 ), dpos + ImVec2( 1 + x0, Height - 1 ), 0x55FF55FF );
             DrawLine( draw, dpos + ImVec2( x1, -1 ), dpos + ImVec2( x1, Height - 1 ), 0x55FF55FF );
         }
@@ -1819,9 +1922,43 @@ void StreamingTimeline::DrawFrameGraph()
         }
     }
 
-    if( frameTarget * 2 <= MaxFrameTime ) DrawLine( draw, dpos + ImVec2( 0, round( Height - Height * frameTarget * 2 / MaxFrameTime ) ), dpos + ImVec2( w, round( Height - Height * frameTarget * 2 / MaxFrameTime ) ), 0x442222DD );
-    if( frameTarget <= MaxFrameTime ) DrawLine( draw, dpos + ImVec2( 0, round( Height - Height * frameTarget / MaxFrameTime ) ), dpos + ImVec2( w, round( Height - Height * frameTarget / MaxFrameTime ) ), 0x4422DDDD );
-    if( frameTarget / 2 <= MaxFrameTime ) DrawLine( draw, dpos + ImVec2( 0, round( Height - Height * frameTarget / 2 / MaxFrameTime ) ), dpos + ImVec2( w, round( Height - Height * frameTarget / 2 / MaxFrameTime ) ), 0x4422DD22 );
+    // The target and twice the target, labelled in FPS and frame times.
+    const auto guide = [&]( int64_t time, uint32_t color, const char* label ) {
+        if( time > MaxFrameTime ) return;
+        const auto y = round( Height - Height * double( time ) / MaxFrameTime );
+        DrawLine( draw, dpos + ImVec2( 0, y ), dpos + ImVec2( columns + 1, y ), ( color & 0x00FFFFFF ) | 0x66000000 );
+        draw->AddText( wpos + ImVec2( columns + 2 + ty * 0.5f, std::clamp( float( y ) - ty * 0.5f, 0.f, Height - ty ) ), color, label );
+    };
+    guide( frameTarget * 2, 0xFF2222DD, guides[1] );
+    guide( frameTarget, 0xFF22DDDD, guides[0] );
+    if( line.size() > 1 ) draw->AddPolyline( line.data(), int( line.size() ), 0xDDFFFFFF, ImDrawFlags_None, 1.5f * scale );
+    if( crosshair >= 0 ) DrawLine( draw, dpos + ImVec2( 1 + crosshair, 0 ), dpos + ImVec2( 1 + crosshair, Height - 1 ), 0x88FFFFFF );
+
+    // The summary row: the frames shown, their average FPS, 1% low and frames
+    // over twice the target, kept while they stay the same.
+    const int shownFirst = fit ? 0 : m_frameStart;
+    const int shownLast = fit ? total - 1 : std::min( total, m_frameStart + onScreen * group ) - 1;
+    auto& summary = m_frameSummary;
+    if( summary.set != m_activeFrameSet || summary.first != shownFirst || summary.last != shownLast || summary.total != total || summary.target != m_frameTarget || summary.lastNs != lastNs )
+    {
+        summary = FrameSummary { m_activeFrameSet, shownFirst, shownLast, total, m_frameTarget, lastNs };
+        const int first = std::max( shownFirst, std::min( skip, shownLast ) );
+        std::vector<int64_t> times;
+        times.reserve( shownLast - first + 1 );
+        for( int i = first; i <= shownLast; i++ ) times.push_back( FrameTime( frames, i, lastNs ) );
+        summary.slow = int( std::count_if( times.begin(), times.end(), [&]( int64_t t ) { return t > frameTarget * 2; } ) );
+        const auto span = FrameEnd( frames, shownLast, lastNs ) - frames.starts[first];
+        summary.averageFps = span > 0 ? 1e9 * times.size() / double( span ) : 0;
+        const auto k = times.begin() + ( times.size() - 1 ) * 99 / 100;
+        std::nth_element( times.begin(), k, times.end() );
+        summary.lowFps = *k > 0 ? 1e9 / double( *k ) : 0;
+    }
+    char text[160];
+    snprintf( text, sizeof( text ), "Frames %s - %s%s%s", RealToString( FrameNumber( *statics, frames, shownFirst ) ), RealToString( FrameNumber( *statics, frames, shownLast ) ),
+              fit ? " \xc2\xb7 the whole capture" : group > 1 ? " \xc2\xb7 " : "", fit || group == 1 ? "" : ( std::to_string( group ) + " per bar" ).c_str() );
+    draw->AddText( rowPos, ImGui::GetColorU32( ImGuiCol_TextDisabled ), text );
+    snprintf( text, sizeof( text ), "Average %.1f FPS \xc2\xb7 1%% low %.1f FPS \xc2\xb7 %s over %.1f ms", summary.averageFps, summary.lowFps, RealToString( summary.slow ), frameTarget * 2 / 1e6 );
+    draw->AddText( ImVec2( rowPos.x + w - ImGui::CalcTextSize( text ).x, rowPos.y ), ImGui::GetColorU32( ImGuiCol_Text ), text );
 }
 
 // As Tracy's DrawTimelineFramesHeader.
@@ -2419,38 +2556,6 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         plotLaneHeader( yBegin, key, expanded, VramLaneLabel( segment ), [&] { VramLaneTooltip( *vram, segment ); } );
         y += 0.2f * ostep;
     };
-    // The FPS lane, from the frame graph's frame set and target.
-    const auto drawFpsLane = [&] {
-        if( m_drawFps && !statics->frameSets.empty() )
-        {
-            const auto& frameSet = statics->frameSets[std::min( m_activeFrameSet, statics->frameSets.size() - 1 )];
-            FrameTimes frames;
-            frames.starts = &frameSet.starts;
-            frames.ends = frameSet.continuous ? nullptr : &frameSet.ends;
-            frames.lastNs = statics->lastNs;
-            frames.firstNumber = frameSet.starts.empty() ? 0 : FrameNumber( *statics, frameSet, 0 );
-            frames.name = frameSet.name.empty() ? "Frames" : frameSet.name.c_str();
-            if( frames.Complete() > 0 )
-            {
-                const bool expanded = std::find( m_collapsed.begin(), m_collapsed.end(), FpsLaneKey ) == m_collapsed.end();
-                const auto yBegin = y;
-                y += ostep;
-                if( expanded )
-                {
-                    const auto height = FpsLaneHeight( plotHeight );
-                    const auto laneTop = wpos.y + y;
-                    if( laneTop < yMax && laneTop + height > yMin )
-                    {
-                        stats.fpsLanes++;
-                        drawOverview( laneTop, height, FpsLaneLabel(), [&]( const VramPlotArea& area ) { return DrawFpsLane( draw, area, frames, m_frameTarget ); } );
-                    }
-                    y += height;
-                }
-                plotLaneHeader( yBegin, FpsLaneKey, expanded, FpsLaneLabel(), [&] { FpsLaneTooltip( frames, m_frameTarget ); } );
-                y += 0.2f * ostep;
-            }
-        }
-    };
     // A GPU context's or a thread's lane.
     const auto drawTimelineLane = [&]( const Lane& lane ) {
         const auto key = lane.id * 2 + lane.gpu;
@@ -2631,9 +2736,10 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         }
         y += 0.2f * ostep;
     };
-    // The order: FPS, video memory, the direct GPU queue, the main and render
+    // The order: video memory, the direct GPU queue, the main and render
     // threads and the job workers first; then CPU, memory and GPU usage,
-    // system memory, the other GPU contexts and the other threads.
+    // system memory, the other GPU contexts and the other threads. FPS is in
+    // the frame graph.
     std::vector<size_t> front, rest;
     {
         const auto lower = []( std::string text ) {
@@ -2661,7 +2767,6 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         for( size_t i = 0; i < statics->lanes.size(); ++i )
             if( std::find( front.begin(), front.end(), i ) == front.end() ) rest.push_back( i );
     }
-    drawFpsLane();
     drawVramLane( 0 );
     for( const auto i : front ) drawTimelineLane( statics->lanes[i] );
     drawUsageLane( UsageLane::Cpu );
