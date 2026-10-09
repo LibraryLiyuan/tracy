@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifndef M_PI_2
 #define M_PI_2 1.57079632679489661923
@@ -41,6 +43,233 @@ constexpr double GpuZoneBudget = 300'000;
 uint32_t GetColorMuted( uint32_t color, bool active )
 {
     return active ? 0xFF000000 | color : 0x66000000 | color;
+}
+
+// A resource's records follow its creation on the thread that created it:
+// the first within microseconds, a rename mostly within milliseconds. Names
+// are read for runs of resources created close together on a thread, each
+// run's records once, from its first creation to this long after its last.
+// A run ends at a gap this long between creations, or when it spans this long.
+constexpr int64_t ResourceRecordSpan = 10'000'000;
+constexpr int64_t ResourceRunGap = 20'000'000;
+constexpr int64_t ResourceRunLength = 250'000'000;
+// The rare resource without a record in its run's span is looked for this
+// long after its creation.
+constexpr int64_t ResourceLateSpan = 250'000'000;
+// The list is published again at most this often while names are read.
+constexpr auto ResourcePublishInterval = std::chrono::milliseconds( 150 );
+
+// What a resource's latest record says about it.
+struct ResourceLabel
+{
+    std::string name;
+    int8_t category = -1;
+    int64_t time = INT64_MIN;
+};
+
+// The labels of the resources of the last list, by allocation id, with the
+// creation of the allocation they belong to.
+struct KnownLabel
+{
+    int64_t created = 0;
+    ResourceLabel label;
+};
+using KnownLabels = std::unordered_map<uint64_t, KnownLabel>;
+
+// Reads the records on `thread` in [begin, end), giving each to the label
+// `target` returns for its allocation and time, if any, when later than the
+// record the label holds.
+void ReadResourceRecords( const stream::EventStore& store, const std::vector<uint8_t>& marker, uint64_t thread, int64_t begin, int64_t end,
+    const std::function<ResourceLabel*( uint64_t allocation, int64_t time )>& target )
+{
+    struct Record
+    {
+        uint64_t zone;
+        int64_t start;
+        std::string name;
+    };
+    std::vector<Record> records;
+    store.VisitTimelineZones( thread, begin, end, [&]( const stream::StoreTimelineZone& zone, std::string_view name ) {
+        if( zone.start >= begin && zone.source < marker.size() && marker[zone.source] ) records.push_back( { zone.id, zone.start, std::string( name ) } );
+        return true;
+    } );
+    for( auto& record : records )
+    {
+        for( const auto& text : store.Text( record.zone, 0, 4 ).values )
+        {
+            const auto parsed = ParseVramResourceRecord( text.text );
+            if( !parsed ) continue;
+            if( const auto label = target( parsed->allocation, record.start ); label && record.start >= label->time )
+            {
+                label->name = std::move( record.name );
+                label->category = parsed->category;
+                label->time = record.start;
+            }
+            break;
+        }
+    }
+}
+
+// A frame of the timeline's frames: its number as Tracy shows it, and its span.
+struct FrameSpan
+{
+    uint64_t number = 0;
+    int64_t begin = 0, end = 0;
+};
+
+// A segment's resources live at a time: the number and bytes from the store's
+// allocations, and their names and categories from their records; with the
+// frame holding the time, which of them its GPU work referenced. Publishes
+// the list at once with the labels already known, then again as the records
+// are read; stops when superseded.
+void LoadResources( const stream::EventStore& store, const std::vector<uint8_t>& marker, KnownLabels& known, int segment, int64_t time,
+    const std::optional<FrameSpan>& frame, const std::function<void( std::shared_ptr<const VramResources> )>& publish,
+    const std::function<bool()>& superseded )
+{
+    VramResources list;
+    list.segment = segment;
+    list.time = time;
+    // The resources the frame's reference passes referenced, read from the
+    // store by time: a command list's set each at frame granularity.
+    std::unordered_set<uint64_t> referenced;
+    if( frame && store.Info().gpuReferencePasses != 0 )
+    {
+        for( uint64_t after = 0;; )
+        {
+            const auto page = store.GpuReferences( frame->begin, frame->end, std::nullopt, after, 4096 );
+            for( const auto& use : page.values ) if( use.resource != 0 ) referenced.emplace( use.resource );
+            if( !page.more || superseded() ) break;
+            after = page.next;
+        }
+        list.frameReferences = true;
+        list.frameNumber = frame->number;
+        list.frameBegin = frame->begin;
+        list.frameEnd = frame->end;
+        list.referenced = referenced.size();
+    }
+    std::vector<std::pair<uint64_t, char>> pools;
+    for( uint64_t after = 0;; )
+    {
+        const auto page = store.MemoryPools( after, 64 );
+        for( const auto& pool : page.values )
+            if( const auto kind = VramPoolKind( pool.name ) ) pools.emplace_back( pool.id, kind );
+        if( !page.more ) break;
+        after = page.next;
+    }
+    list.present = !pools.empty();
+    std::vector<std::pair<stream::StoreAllocation, char>> rows;
+    for( const auto& [pool, kind] : pools )
+    {
+        if( VramKindSegment( kind ) != segment ) continue;
+        auto live = store.LiveAllocations( time, pool );
+        list.live += live.count;
+        list.liveBytes += live.bytes;
+        for( auto& allocation : live.largest ) rows.emplace_back( std::move( allocation ), kind );
+    }
+    std::stable_sort( rows.begin(), rows.end(), []( const auto& a, const auto& b ) { return a.first.size > b.first.size; } );
+
+    std::vector<ResourceLabel> labels( rows.size() );
+    std::vector<size_t> pending;
+    list.resources.reserve( rows.size() );
+    for( size_t i = 0; i < rows.size(); ++i )
+    {
+        const auto& [allocation, kind] = rows[i];
+        VramResource resource;
+        resource.kind = kind;
+        resource.size = allocation.size;
+        resource.created = allocation.allocated;
+        resource.freed = allocation.freed;
+        resource.used = referenced.contains( allocation.address );
+        if( resource.used )
+        {
+            list.used++;
+            list.usedBytes += allocation.size;
+        }
+        if( const auto found = known.find( allocation.address ); found != known.end() && found->second.created == allocation.allocated )
+        {
+            labels[i] = found->second.label;
+            resource.name = labels[i].name;
+            resource.category = labels[i].category;
+        }
+        else
+        {
+            resource.pending = true;
+            pending.push_back( i );
+        }
+        list.resources.push_back( std::move( resource ) );
+    }
+    list.pending = pending.size();
+    publish( std::make_shared<VramResources>( list ) );
+
+    const auto label = [&]( size_t i ) {
+        auto& resource = list.resources[i];
+        if( !resource.pending ) return;
+        resource.name = labels[i].name;
+        resource.category = labels[i].category;
+        resource.pending = false;
+        list.pending--;
+    };
+    auto published = std::chrono::steady_clock::now();
+    const auto progress = [&] {
+        if( std::chrono::steady_clock::now() - published < ResourcePublishInterval ) return;
+        publish( std::make_shared<VramResources>( list ) );
+        published = std::chrono::steady_clock::now();
+    };
+    // Runs of resources created close together on a thread.
+    std::stable_sort( pending.begin(), pending.end(), [&]( size_t a, size_t b ) {
+        const auto& x = rows[a].first;
+        const auto& y = rows[b].first;
+        return x.allocationThread != y.allocationThread ? x.allocationThread < y.allocationThread : x.allocated < y.allocated; } );
+    std::vector<size_t> late;
+    std::unordered_map<uint64_t, size_t> run;
+    for( size_t begin = 0; begin < pending.size() && !superseded(); )
+    {
+        const auto& first = rows[pending[begin]].first;
+        size_t end = begin + 1;
+        while( end < pending.size() )
+        {
+            const auto& next = rows[pending[end]].first;
+            if( next.allocationThread != first.allocationThread || next.allocated - rows[pending[end - 1]].first.allocated > ResourceRunGap ||
+                next.allocated - first.allocated > ResourceRunLength ) break;
+            ++end;
+        }
+        if( first.allocationThread != 0 )
+        {
+            run.clear();
+            for( size_t n = begin; n < end; ++n ) run[rows[pending[n]].first.address] = pending[n];
+            ReadResourceRecords( store, marker, first.allocationThread, first.allocated, rows[pending[end - 1]].first.allocated + ResourceRecordSpan + 1,
+                [&]( uint64_t allocation, int64_t time ) -> ResourceLabel* {
+                    const auto found = run.find( allocation );
+                    if( found == run.end() ) return nullptr;
+                    const auto& row = rows[found->second].first;
+                    return time >= row.allocated && ( !row.freed || time <= *row.freed ) ? &labels[found->second] : nullptr;
+                } );
+        }
+        for( size_t n = begin; n < end; ++n )
+        {
+            if( labels[pending[n]].time == INT64_MIN && first.allocationThread != 0 ) late.push_back( pending[n] );
+            else label( pending[n] );
+        }
+        begin = end;
+        progress();
+    }
+    for( const auto i : late )
+    {
+        if( superseded() ) break;
+        const auto& row = rows[i].first;
+        auto end = row.allocated + ResourceLateSpan;
+        if( row.freed ) end = std::min( end, *row.freed );
+        ReadResourceRecords( store, marker, row.allocationThread, row.allocated, end + 1, [&]( uint64_t allocation, int64_t time ) -> ResourceLabel* {
+            return allocation == row.address && time >= row.allocated ? &labels[i] : nullptr; } );
+        label( i );
+        progress();
+    }
+    publish( std::make_shared<VramResources>( list ) );
+    // The labels known are those of this list, bounded by what one time holds.
+    KnownLabels next;
+    for( size_t i = 0; i < rows.size(); ++i )
+        if( !list.resources[i].pending ) next[rows[i].first.address] = { rows[i].first.allocated, labels[i] };
+    known = std::move( next );
 }
 
 // A time from the start of the program, as typed ("38:32.047", "2312.047")
@@ -110,9 +339,14 @@ StreamingTimeline::~StreamingTimeline()
         std::lock_guard lock( m_skeletonMutex );
         m_skeletonSignal.notify_all();
     }
+    {
+        std::lock_guard lock( m_vramMutex );
+        m_vramSignal.notify_all();
+    }
     if( m_thread.joinable() ) m_thread.join();
     if( m_rootsThread.joinable() ) m_rootsThread.join();
     if( m_skeletonThread.joinable() ) m_skeletonThread.join();
+    if( m_vramThread.joinable() ) m_vramThread.join();
 }
 
 std::optional<int64_t> StreamingTimeline::ParseTimeText( const std::string& text )
@@ -142,6 +376,153 @@ StreamingTimeline::Stats StreamingTimeline::LastStats() const
 {
     std::lock_guard lock( m_mutex );
     return m_stats;
+}
+
+std::shared_ptr<const VramData> StreamingTimeline::Vram() const
+{
+    std::lock_guard lock( m_vramMutex );
+    return m_vram;
+}
+
+std::shared_ptr<const UsageData> StreamingTimeline::Usage() const
+{
+    std::lock_guard lock( m_vramMutex );
+    return m_usage;
+}
+
+std::shared_ptr<const VramResources> StreamingTimeline::VramResourcesAt( int segment, int64_t time )
+{
+    std::lock_guard lock( m_vramMutex );
+    if( m_vramRequest.generation == 0 || m_vramRequest.segment != segment || m_vramRequest.time != time )
+    {
+        m_vramRequest = { segment, time, m_vramRequest.generation + 1 };
+        m_vramSignal.notify_all();
+    }
+    return m_vramResources;
+}
+
+void StreamingTimeline::ServeVramResources( stream::EventStore& store )
+{
+    std::vector<uint8_t> marker;
+    for( const auto& source : store.TimelineSources() ) marker.push_back( source.name == VramResourceMarker );
+    KnownLabels known;
+    uint64_t served = 0;
+    const auto publish = [this]( std::shared_ptr<const VramResources> list ) {
+        {
+            std::lock_guard lock( m_vramMutex );
+            m_vramResources = std::move( list );
+        }
+        m_published = true;
+    };
+    while( !m_stop )
+    {
+        VramRequest request;
+        {
+            std::unique_lock lock( m_vramMutex );
+            m_vramSignal.wait( lock, [&] { return m_stop.load() || m_vramRequest.generation != served; } );
+            if( m_stop ) return;
+            request = m_vramRequest;
+        }
+        served = request.generation;
+        // A newer request, as the view moves, stops the reading of records;
+        // the names read so far serve it.
+        const auto superseded = [&] {
+            std::lock_guard lock( m_vramMutex );
+            return m_stop.load() || m_vramRequest.generation != served;
+        };
+        // The frame of Tracy's unnamed frame set, or the first set, that holds
+        // the time.
+        std::optional<FrameSpan> frame;
+        if( const auto statics = CurrentStatics(); statics && !statics->frameSets.empty() )
+        {
+            const auto base = std::find_if( statics->frameSets.begin(), statics->frameSets.end(), []( const FrameSet& set ) { return set.base; } );
+            const auto& frames = base != statics->frameSets.end() ? *base : statics->frameSets.front();
+            const auto next = std::upper_bound( frames.starts.begin(), frames.starts.end(), request.time );
+            if( next != frames.starts.begin() )
+            {
+                const auto i = size_t( next - frames.starts.begin() ) - 1;
+                const auto end = FrameEnd( frames, i, statics->lastNs );
+                if( request.time < end ) frame = FrameSpan { FrameNumber( *statics, frames, i ), frames.starts[i], end };
+            }
+        }
+        try
+        {
+            LoadResources( store, marker, known, request.segment, request.time, frame, publish, superseded );
+        }
+        catch( const std::exception& )
+        {
+            auto absent = std::make_shared<VramResources>();
+            absent->present = false;
+            absent->segment = request.segment;
+            absent->time = request.time;
+            publish( std::move( absent ) );
+        }
+    }
+}
+
+std::optional<int64_t> StreamingTimeline::TakeVramClick()
+{
+    const auto click = m_vramClick;
+    m_vramClick.reset();
+    return click;
+}
+
+void StreamingTimeline::ShowVram()
+{
+    const auto vram = Vram();
+    if( !vram ) return;
+    m_drawVram = true;
+    m_showVram = true;
+    // The video memory lane, or the system memory lane of a capture without one.
+    const auto key = VramLaneKey - ( vram->HasSegment( 0 ) ? 0 : 1 );
+    m_collapsed.erase( std::remove( m_collapsed.begin(), m_collapsed.end(), key ), m_collapsed.end() );
+}
+
+void StreamingTimeline::LoadVram( stream::EventStore& store )
+{
+    auto data = std::make_shared<VramData>();
+    data->lastTime = store.Info().lastNs;
+    auto usage = std::make_shared<UsageData>();
+    usage->lastTime = store.Info().lastNs;
+    std::vector<std::pair<uint64_t, VramSeries*>> plots;
+    for( uint64_t after = 0;; )
+    {
+        const auto page = store.Plots( after, 256 );
+        for( const auto& plot : page.values )
+        {
+            if( const auto series = data->Find( plot.name ) ) plots.emplace_back( plot.id, series );
+            else if( const auto series = usage->Find( plot.name ) ) plots.emplace_back( plot.id, series );
+        }
+        if( !page.more ) break;
+        after = page.next;
+    }
+    for( const auto& [plot, series] : plots )
+    {
+        for( uint64_t after = 0;; )
+        {
+            if( m_stop ) return;
+            const auto page = store.PlotPoints( INT64_MIN, INT64_MAX, plot, after, 4096 );
+            for( const auto& point : page.values ) series->Add( point.time, point.value );
+            if( !page.more ) break;
+            after = page.next;
+        }
+    }
+    // The processor description is an app info message.
+    for( uint64_t after = 0;; )
+    {
+        const auto page = store.Messages( INT64_MIN, INT64_MAX, std::nullopt, after, 256, true );
+        for( const auto& message : page.values ) usage->ParseAppInfo( message.text );
+        if( !page.more ) break;
+        after = page.next;
+    }
+    data->Finish();
+    usage->Finish();
+    {
+        std::lock_guard lock( m_vramMutex );
+        if( !data->Empty() ) m_vram = std::move( data );
+        if( !usage->Empty() ) m_usage = std::move( usage );
+    }
+    m_published = true;
 }
 
 void StreamingTimeline::SetView( int64_t begin, int64_t end )
@@ -331,6 +712,33 @@ void StreamingTimeline::Run()
             }
             m_skeletonThread = std::thread( [this, decoders = std::move( decoders ), statics]() mutable { BuildSkeletons( std::move( decoders ), statics ); } );
         }
+        // The GPU memory plots load whole, on a handle of their own.
+        {
+            auto vramOptions = options;
+            vramOptions.cacheBytes = 8ull << 20;
+            vramOptions.resultBytes = 16ull << 20;
+            std::shared_ptr<stream::EventStore> vramStore = store->OpenSibling( vramOptions );
+            m_vramThread = std::thread( [this, vramStore] {
+                try
+                {
+                    LoadVram( *vramStore );
+                }
+                catch( const std::exception& )
+                {
+                    // The timeline shows no GPU memory lanes.
+                }
+                m_vramLoading = false;
+                m_published = true;
+                try
+                {
+                    ServeVramResources( *vramStore );
+                }
+                catch( const std::exception& )
+                {
+                    // The panel lists no resources.
+                }
+            } );
+        }
         uint64_t consumed = 0;
         while( !m_stop )
         {
@@ -359,6 +767,7 @@ void StreamingTimeline::Run()
         m_busy = false;
         m_published = true;
     }
+    if( !m_vramThread.joinable() ) m_vramLoading = false;
 }
 
 const char* StreamingTimeline::ThreadName( const Statics& statics, uint64_t thread ) const
@@ -1142,6 +1551,20 @@ void StreamingTimeline::DrawOptions()
     if( ImGui::InputInt( "Target FPS", &m_frameTarget ) ) m_frameTarget = std::clamp( m_frameTarget, 1, 10000 );
     ImGui::TextDisabled( "Frame time graph colors and the timeline's frame shading follow the target." );
     ImGui::Unindent();
+    ImGui::BeginDisabled( !Vram() );
+    ImGui::Checkbox( ICON_FA_MICROCHIP " Draw GPU memory", &m_drawVram );
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled( Vram() ? "(video and system memory lanes, with the other plot lanes at the top)" : "(the capture has no GPU memory plots)" );
+    ImGui::Checkbox( ICON_FA_GAUGE " Draw FPS", &m_drawFps );
+    ImGui::SameLine();
+    ImGui::TextDisabled( "(the frame graph's frame set, against the target FPS above)" );
+    ImGui::BeginDisabled( !Usage() );
+    ImGui::Checkbox( ICON_FA_GAUGE_HIGH " Draw CPU, memory and GPU usage", &m_drawUsage );
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled( Usage() ? "(CPU, memory and GPU usage lanes at the top)" : "(the capture has no usage plots)" );
+    ImGui::TextDisabled( "The plot lanes zoom with the view: zoomed out, each pixel averages the samples it covers; zoomed in, lines join the samples. The dashed line marks the view's middle." );
 }
 
 void StreamingTimeline::DrawFrameNavigation()
@@ -1904,8 +2327,132 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
     stats.frames = framesDrawn;
     uint32_t sourceHover = 0;
     float y = 0;
-    for( const auto& lane : statics->lanes )
-    {
+    // Tracy's plot height and header colors, for the GPU memory and usage
+    // lanes, which draw as Tracy draws plots.
+    const auto plotHeight = 100 * GetScale();
+    constexpr uint32_t plotColor = 0xFF44DDDD, plotColorInactive = 0xFF226E6E;
+    // A plot lane's header at yBegin: its fold arrow, label and tooltip; a
+    // click folds or unfolds the lane.
+    // The plot lanes show the view, as the threads do.
+    stats.plotBegin = m_begin;
+    stats.plotEnd = m_end;
+    const auto plotLaneHeader = [&]( float yBegin, uint64_t key, bool expanded, const char* label, const std::function<void()>& tooltip ) {
+        const auto hy = wpos.y + yBegin;
+        if( hy + ty < yMin || hy > yMax ) return;
+        DrawTextContrast( draw, ImVec2( wpos.x, hy ), expanded ? plotColor : plotColorInactive, expanded ? ICON_FA_CARET_DOWN : ICON_FA_CARET_RIGHT );
+        const auto labelWidth = ImGui::CalcTextSize( label ).x;
+        DrawTextContrast( draw, ImVec2( wpos.x + ty, hy ), expanded ? plotColor : plotColorInactive, label );
+        if( expanded ) DrawLine( draw, dpos + ImVec2( 0, yBegin + ty - 1 ), dpos + ImVec2( w, yBegin + ty - 1 ), 0x8844DDDD );
+        if( hover && ImGui::IsMouseHoveringRect( ImVec2( wpos.x, hy ), ImVec2( wpos.x + ty + labelWidth, hy + ty ) ) )
+        {
+            tooltip();
+            if( IsMouseClicked( 0 ) )
+            {
+                if( expanded ) m_collapsed.push_back( key );
+                else m_collapsed.erase( std::find( m_collapsed.begin(), m_collapsed.end(), key ) );
+            }
+        }
+    };
+    // A plot lane's area at laneTop, over the view, on an opaque background,
+    // with the current frame marked. Returns the time under the mouse.
+    const auto drawOverview = [&]( float laneTop, float height, const char* label, const std::function<std::optional<int64_t>( const VramPlotArea& )>& drawLane ) {
+        auto area = OverviewArea( ImVec2( wpos.x, laneTop ), w, height, m_begin, m_end );
+        area.hover = hover;
+        area.legendMinX = wpos.x + ty * 2 + ImGui::CalcTextSize( label ).x;
+        // Opaque from the header row to the gap after the lane: the frame
+        // lines and target spans drawn under the lanes are in the view's time.
+        auto background = area;
+        background.pos.y -= ostep;
+        background.height += 1.2f * ostep;
+        return DrawPlotLane( draw, area, background, drawLane );
+    };
+    // The usage lanes: CPU and memory above all others, GPU usage above the
+    // GPU memory lanes.
+    const auto usage = m_drawUsage ? Usage() : nullptr;
+    const auto drawUsageLane = [&]( UsageLane which ) {
+        if( !usage || !UsageLanePresent( *usage, which ) ) return;
+        const auto key = UsageLaneKey - uint64_t( which );
+        const bool expanded = std::find( m_collapsed.begin(), m_collapsed.end(), key ) == m_collapsed.end();
+        const auto yBegin = y;
+        const auto label = UsageLaneLabel( which );
+        y += ostep;
+        if( expanded )
+        {
+            const auto height = UsageLaneHeight( *usage, which, plotHeight );
+            const auto laneTop = wpos.y + y;
+            if( laneTop < yMax && laneTop + height > yMin )
+            {
+                stats.usageLanes++;
+                drawOverview( laneTop, height, label, [&]( const VramPlotArea& area ) { return DrawUsageLane( draw, area, *usage, which, plotHeight ); } );
+            }
+            y += height;
+        }
+        plotLaneHeader( yBegin, key, expanded, label, [&] { UsageLaneTooltip( *usage, which ); } );
+        y += 0.2f * ostep;
+    };
+    // A GPU memory lane: video (Local) or system (NonLocal) memory.
+    const auto vram = m_drawVram ? Vram() : nullptr;
+    const auto drawVramLane = [&]( int segment ) {
+        if( !vram || !vram->HasSegment( segment ) ) return;
+        const auto key = VramLaneKey - uint64_t( segment );
+        const bool expanded = std::find( m_collapsed.begin(), m_collapsed.end(), key ) == m_collapsed.end();
+        const auto yBegin = y;
+        if( m_showVram && segment == ( vram->HasSegment( 0 ) ? 0 : 1 ) )
+        {
+            // Mouse input on the lanes hands the scroll back to the user.
+            const auto& mouse = ImGui::GetIO();
+            if( hover && ( mouse.MouseWheel != 0 || ImGui::IsAnyMouseDown() ) ) m_showVram = false;
+            else ImGui::SetScrollY( yBegin );
+        }
+        y += ostep;
+        if( expanded )
+        {
+            const auto laneTop = wpos.y + y;
+            if( laneTop < yMax && laneTop + plotHeight > yMin )
+            {
+                stats.vramLanes++;
+                const auto time = drawOverview( laneTop, plotHeight, VramLaneLabel( segment ), [&]( const VramPlotArea& area ) { return DrawVramPlot( draw, area, *vram, segment ); } );
+                if( time && IsMouseClickReleased( ImGuiMouseButton_Left ) ) m_vramClick = *time;
+            }
+            y += plotHeight;
+        }
+        plotLaneHeader( yBegin, key, expanded, VramLaneLabel( segment ), [&] { VramLaneTooltip( *vram, segment ); } );
+        y += 0.2f * ostep;
+    };
+    // The FPS lane, from the frame graph's frame set and target.
+    const auto drawFpsLane = [&] {
+        if( m_drawFps && !statics->frameSets.empty() )
+        {
+            const auto& frameSet = statics->frameSets[std::min( m_activeFrameSet, statics->frameSets.size() - 1 )];
+            FrameTimes frames;
+            frames.starts = &frameSet.starts;
+            frames.ends = frameSet.continuous ? nullptr : &frameSet.ends;
+            frames.lastNs = statics->lastNs;
+            frames.firstNumber = frameSet.starts.empty() ? 0 : FrameNumber( *statics, frameSet, 0 );
+            frames.name = frameSet.name.empty() ? "Frames" : frameSet.name.c_str();
+            if( frames.Complete() > 0 )
+            {
+                const bool expanded = std::find( m_collapsed.begin(), m_collapsed.end(), FpsLaneKey ) == m_collapsed.end();
+                const auto yBegin = y;
+                y += ostep;
+                if( expanded )
+                {
+                    const auto height = FpsLaneHeight( plotHeight );
+                    const auto laneTop = wpos.y + y;
+                    if( laneTop < yMax && laneTop + height > yMin )
+                    {
+                        stats.fpsLanes++;
+                        drawOverview( laneTop, height, FpsLaneLabel(), [&]( const VramPlotArea& area ) { return DrawFpsLane( draw, area, frames, m_frameTarget ); } );
+                    }
+                    y += height;
+                }
+                plotLaneHeader( yBegin, FpsLaneKey, expanded, FpsLaneLabel(), [&] { FpsLaneTooltip( frames, m_frameTarget ); } );
+                y += 0.2f * ostep;
+            }
+        }
+    };
+    // A GPU context's or a thread's lane.
+    const auto drawTimelineLane = [&]( const Lane& lane ) {
         const auto key = lane.id * 2 + lane.gpu;
         const auto collapsed = std::find( m_collapsed.begin(), m_collapsed.end(), key );
         const bool expanded = collapsed == m_collapsed.end();
@@ -2083,7 +2630,45 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
             }
         }
         y += 0.2f * ostep;
+    };
+    // The order: FPS, video memory, the direct GPU queue, the main and render
+    // threads and the job workers first; then CPU, memory and GPU usage,
+    // system memory, the other GPU contexts and the other threads.
+    std::vector<size_t> front, rest;
+    {
+        const auto lower = []( std::string text ) {
+            std::transform( text.begin(), text.end(), text.begin(), []( unsigned char c ) { return char( std::tolower( c ) ); } );
+            return text;
+        };
+        size_t direct = SIZE_MAX, mainThread = SIZE_MAX, renderThread = SIZE_MAX;
+        std::vector<std::pair<long, size_t>> workers;
+        for( size_t i = 0; i < statics->lanes.size(); ++i )
+        {
+            const auto& lane = statics->lanes[i];
+            const auto name = lower( lane.name.empty() ? lane.detail : lane.name );
+            if( lane.gpu )
+            {
+                if( direct == SIZE_MAX && name.find( "direct" ) != std::string::npos ) direct = i;
+            }
+            else if( mainThread == SIZE_MAX && ( name == "main thread" || name == "main" ) ) mainThread = i;
+            else if( renderThread == SIZE_MAX && name == "render thread" ) renderThread = i;
+            else if( name.rfind( "job.worker ", 0 ) == 0 ) workers.emplace_back( strtol( name.c_str() + 11, nullptr, 10 ), i );
+        }
+        std::stable_sort( workers.begin(), workers.end() );
+        for( const auto i : { direct, mainThread, renderThread } )
+            if( i != SIZE_MAX ) front.push_back( i );
+        for( const auto& worker : workers ) front.push_back( worker.second );
+        for( size_t i = 0; i < statics->lanes.size(); ++i )
+            if( std::find( front.begin(), front.end(), i ) == front.end() ) rest.push_back( i );
     }
+    drawFpsLane();
+    drawVramLane( 0 );
+    for( const auto i : front ) drawTimelineLane( statics->lanes[i] );
+    drawUsageLane( UsageLane::Cpu );
+    drawUsageLane( UsageLane::Memory );
+    drawUsageLane( UsageLane::Gpu );
+    drawVramLane( 1 );
+    for( const auto i : rest ) drawTimelineLane( statics->lanes[i] );
     m_lanesHeight = y;
     m_sourceHighlight = sourceHover;
     DrawRanges( draw, wpos, yMin, yMax, pxns, mouseOver, mouseOver );
@@ -2105,6 +2690,7 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
     }
     stats.drawn = snapshot != nullptr;
     stats.current = RequestIfNeeded( *statics, snapshot.get(), w );
+    if( m_showVram && stats.vramLanes > 0 && stats.current && !Busy() ) m_showVram = false;
     stats.draws = ++m_draws;
     {
         std::lock_guard lock( m_mutex );

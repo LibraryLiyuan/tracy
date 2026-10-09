@@ -7,6 +7,8 @@
 #include "TracyTimelineItemCpuData.hpp"
 #include "TracyTimelineItemGpu.hpp"
 #include "TracyTimelineItemPlot.hpp"
+#include "TracyTimelineItemUsage.hpp"
+#include "TracyTimelineItemVram.hpp"
 #include "TracyTimelineItemThread.hpp"
 #include "TracyView.hpp"
 #include "../Fonts.hpp"
@@ -364,6 +366,30 @@ void View::DrawTimeline()
     const auto to = 9.f;
     const auto th = ( ty - to ) * sqrt( 3 ) * 0.5;
 
+    // The plot lanes come first: FPS, CPU, memory and GPU usage, then GPU
+    // memory, which stacks the per-category plots. The plots they draw have
+    // no lanes of their own.
+    if( m_vd.drawPlots )
+    {
+        UpdateFps();
+        if( GetFpsFrames().Complete() > 0 ) m_tc.AddItem<TimelineItemFps>( &m_fpsLane );
+        UpdateUsage();
+        if( m_usage )
+        {
+            for( auto& lane : m_usageLanes )
+            {
+                if( UsageLanePresent( *m_usage, lane ) ) m_tc.AddItem<TimelineItemUsage>( &lane );
+            }
+        }
+        UpdateVram();
+        if( m_vram )
+        {
+            for( auto& segment : m_vramLanes )
+            {
+                if( m_vram->HasSegment( segment ) ) m_tc.AddItem<TimelineItemVram>( &segment );
+            }
+        }
+    }
     if( m_vd.drawGpuZones )
     {
         for( auto& v : m_worker.GetGpuData() )

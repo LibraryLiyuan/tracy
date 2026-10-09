@@ -1,5 +1,7 @@
 #pragma once
 #include "../../../stream/src/TracyEventStore.hpp"
+#include "TracyUsage.hpp"
+#include "TracyVram.hpp"
 #include "imgui.h"
 #include <array>
 #include <atomic>
@@ -17,7 +19,9 @@ namespace tracy
 {
 // A timeline of a long capture drawn as Tracy draws its timeline: the time
 // ruler, a row per frame set, then GPU contexts and threads with their zones
-// by depth, with Tracy's colors, folding, tooltips and mouse controls.
+// by depth, with Tracy's colors, folding, tooltips and mouse controls. Between
+// the GPU contexts and the threads, a lane per GPU memory segment stacks the
+// engine's memory by category.
 // Background threads read the zones of the view and half a view width on each
 // side from the event store, at the view's resolution: zones under three
 // pixels are folded as Tracy folds them. A thread with more zones than the
@@ -36,7 +40,9 @@ public:
     struct Stats
     {
         uint64_t draws = 0;
-        size_t lanes = 0, zones = 0, folded = 0, density = 0, frames = 0;
+        size_t lanes = 0, zones = 0, folded = 0, density = 0, frames = 0, vramLanes = 0, usageLanes = 0, fpsLanes = 0;
+        // The range the plot lanes showed.
+        int64_t plotBegin = 0, plotEnd = 0;
         // A read was drawn, and it covers the view at its resolution.
         bool drawn = false, current = false;
     };
@@ -65,6 +71,7 @@ public:
     void SetRange( int64_t begin, int64_t end );
     // Moves the view to the range with Tracy's zoom animation.
     void ZoomToRange( int64_t begin, int64_t end );
+
     int64_t Begin() const { return m_begin; }
     int64_t End() const { return m_end; }
     // Tracy's first and last time of the capture: for an on-demand capture
@@ -83,6 +90,23 @@ public:
     Stats LastStats() const;
     // True while skeletons are queued or building.
     bool Indexing();
+    // The GPU memory plots, loaded once in the background; null until then
+    // and for captures without them.
+    std::shared_ptr<const VramData> Vram() const;
+    bool VramLoading() const { return m_vramLoading.load(); }
+    // The CPU, memory and GPU usage plots, loaded with the GPU memory plots.
+    std::shared_ptr<const UsageData> Usage() const;
+    // The resources of a segment live at a time, which the GPU memory thread
+    // loads after the plots, the latest asked for first: the last list loaded,
+    // null before the first.
+    std::shared_ptr<const VramResources> VramResourcesAt( int segment, int64_t time );
+    // The time of the last click on a GPU memory lane, once.
+    std::optional<int64_t> TakeVramClick();
+    // Expands the video memory lane and scrolls the lanes to it, following it
+    // while reads change the heights of the lanes above, until it shows in a
+    // settled view or the user takes over.
+    void ShowVram();
+    bool ShowingVram() const { return m_showVram; }
 
 private:
     enum class Kind : uint8_t { Zone, Folded, Density };
@@ -225,6 +249,9 @@ private:
     void ZoneTooltip( const Statics& statics, const LaneData& lane, const Item& item ) const;
     void LaneTooltip( const Statics& statics, const Lane& lane ) const;
     const char* ThreadName( const Statics& statics, uint64_t thread ) const;
+    void LoadVram( stream::EventStore& store );
+    // Serves the requests of VramResourcesAt until the timeline stops.
+    void ServeVramResources( stream::EventStore& store );
 
     std::filesystem::path m_journal;
     mutable std::mutex m_mutex;
@@ -251,9 +278,33 @@ private:
     std::atomic<uint64_t> m_skeletonVersion{ 0 }, m_skeletonLane{ 0 };
     std::atomic<float> m_skeletonProgress{ 0 };
     std::thread m_skeletonThread;
+    // The GPU memory plots, loaded on a handle of their own, then the
+    // resources live at the times the panel asks for.
+    mutable std::mutex m_vramMutex;
+    std::condition_variable m_vramSignal;
+    std::shared_ptr<const VramData> m_vram;
+    std::shared_ptr<const UsageData> m_usage;
+    std::shared_ptr<const VramResources> m_vramResources;
+    struct VramRequest
+    {
+        int segment = 0;
+        int64_t time = 0;
+        uint64_t generation = 0;
+    } m_vramRequest;
+    std::thread m_vramThread;
+    std::optional<int64_t> m_vramClick;
+    std::atomic<bool> m_vramLoading{ true };
+    bool m_drawVram = true, m_showVram = false, m_drawUsage = true, m_drawFps = true;
     int64_t m_begin = 0, m_end = 0;
     bool m_rangeChanged = false;
-    std::vector<uint64_t> m_collapsed;
+    // Lane keys: a thread's or GPU context's id * 2 + gpu, VramLaneKey -
+    // segment for the GPU memory lanes, whose system memory lane starts
+    // collapsed, UsageLaneKey - lane for the usage lanes, and FpsLaneKey.
+    static constexpr uint64_t VramLaneKey = UINT64_MAX;
+    static constexpr uint64_t UsageLaneKey = UINT64_MAX - 16;
+    static constexpr uint64_t FpsLaneKey = UINT64_MAX - 32;
+    std::vector<uint64_t> m_collapsed { VramLaneKey - 1 };
+
     Range m_highlight, m_highlightZoom;
     ZoomAnimation m_zoomAnim;
     size_t m_activeFrameSet = 0;

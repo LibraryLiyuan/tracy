@@ -12,7 +12,7 @@ RUNNER, TOOLS, PRODUCER, OUTPUT = map(lambda x: pathlib.Path(x).resolve(), sys.a
 del sys.argv[1:5]
 
 class WorkflowTests(unittest.TestCase):
-    def test_timer_capture_publishes_only_validated_snapshot(self):
+    def test_short_capture_publishes_journal_and_event_store(self):
         OUTPUT.mkdir(parents=True, exist_ok=True)
         ini = OUTPUT / 'requested.ini'
         ini.write_text('[Config]\nPreset=HighEvidence\n', encoding='utf-8')
@@ -32,19 +32,20 @@ class WorkflowTests(unittest.TestCase):
                 task=json.loads((OUTPUT/settings['name']/'task.json').read_text(encoding='utf-8'))
                 self.assertEqual(task['state'],'complete')
                 self.assertEqual(task['stop_reason'],'timer')
-                self.assertEqual(task['conversion_backend'], 'bounded-export')
-                converter = next(p for p in task['processes'] if p['role'] == 'converter')
-                self.assertEqual(pathlib.Path(converter['exe']).name, 'tracy-stream-export.exe')
+                # The recording tools' core placement is part of the task record.
+                self.assertIn(task['capture_cores']['mode'], ('efficiency', 'any'))
+                self.assertEqual(task['capture_cores']['mode'] == 'any', not task['capture_cores']['logical'])
+                # A short recording is published like a long one: its journal
+                # and the event store that followed it, without a .tracy.
+                self.assertEqual(task['output_kind'], 'store')
+                self.assertEqual(task['final'], task['stream'])
+                self.assertNotIn('conversion_backend', task)
+                self.assertNotIn('converter', [p['role'] for p in task['processes']])
                 self.assertTrue(pathlib.Path(task['stream']).is_file())
-                self.assertTrue(pathlib.Path(task['final']).is_file())
+                self.assertFalse(pathlib.Path(task['stream']).with_suffix('.tracy').exists())
                 self.assertFalse(pathlib.Path(task['candidate']).exists())
-                self.assertTrue(pathlib.Path(task['validation_evidence']).is_file())
-                self.assertEqual(task['candidate_sha256'],task['validated_sha256'])
-                # The store followed the recording and the export reused it.
                 self.assertEqual(task['store_follow_exit_code'], 0)
                 self.assertTrue((pathlib.Path(task['stream'] + '.store') / 'manifest.json').is_file())
-                mapping=pathlib.Path(task['stream']+'.snapshot-map').read_text(encoding='utf-8')
-                self.assertIn('snapshot="'+pathlib.Path(task['final']).name+'"',mapping)
                 self.assertIsNone(producer.poll(),'normal stop must not terminate target')
                 task['settings']['tools'] = str(OUTPUT / 'removed-custom-toolchain')
                 task['settings']['tools_custom'] = True
@@ -62,7 +63,7 @@ class WorkflowTests(unittest.TestCase):
                     producer.terminate()
                 producer.wait(timeout=10)
 
-    def test_long_capture_publishes_journal_and_event_store(self):
+    def test_published_event_store_verifies_and_recovers(self):
         OUTPUT.mkdir(parents=True, exist_ok=True)
         with socket.socket() as port_probe:
             port_probe.bind(('127.0.0.1', 0))
@@ -70,9 +71,8 @@ class WorkflowTests(unittest.TestCase):
         name = 'store-mode-' + str(time.time_ns())
         ini = OUTPUT / (name + '.ini')
         ini.write_text('[Config]\nPreset=HighEvidence\n', encoding='utf-8')
-        # store_minutes 0 publishes every recording the way long ones are.
         settings = {'output': str(OUTPUT), 'tools': str(TOOLS), 'ini': str(ini), 'name': name,
-                    'timed': True, 'seconds': 3, 'store_minutes': 0, 'sound': False, 'port': port}
+                    'timed': True, 'seconds': 3, 'sound': False, 'port': port}
         with (OUTPUT / (name + '-producer.log')).open('wb') as log:
             producer = subprocess.Popen([str(PRODUCER), '--duration-seconds', '120'], stdout=log, stderr=log,
                                         env={**os.environ, 'TRACY_PORT': str(port)})
@@ -196,7 +196,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(task['state'], 'complete')
                 self.assertEqual(task['stop_reason'], 'user')
                 self.assertGreaterEqual(task['elapsed_ms'], 75000)
-                self.assertEqual(task['conversion_backend'], 'bounded-export')
+                self.assertEqual(task['output_kind'], 'store')
                 for process in task['processes']:
                     self.assertEqual(pathlib.Path(process['exe']).parent, TOOLS)
                 self.assertTrue(pathlib.Path(task['final']).is_file())

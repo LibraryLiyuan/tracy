@@ -1575,18 +1575,24 @@ void SnapshotExport::Jn()
     CountVector( "SELECT time,pass,frame,thread,taxonomy,level,flags FROM gpu_ref_passes ORDER BY id", [&]( auto q ) {
         Put( JnGpuReferencePassData{ Val( q, 0 ), uint64_t( Val( q, 1 ) ), uint64_t( Val( q, 2 ) ), uint64_t( Val( q, 3 ) ), uint32_t( Val( q, 4 ) ), uint8_t( Val( q, 5 ) ), uint8_t( Val( q, 6 ) ) } );
     } );
-    Require( info.gpuReferenceUses <= JnTraceMaxRecordsPerDomain, "Expanded references exceed snapshot domain limit" );
-    U64( info.gpuReferenceUses );
-    Each( "SELECT pass,time,thread,setid,resource,mask,count,flags,encoding FROM gpu_ref_packets ORDER BY id", [&]( auto q ) {
-        const uint64_t pass = Val( q, 0 ), thread = Val( q, 2 );
-        const I time = Val( q, 1 );
-        const uint32_t set = uint32_t( Val( q, 3 ) );
-        const auto flags = uint8_t( Val( q, 7 ) ), encoding = uint8_t( Val( q, 8 ) );
-        if( encoding == 1 ) Put( JnGpuReferenceUseData{ time, pass, uint64_t( Val( q, 4 ) ), thread, uint32_t( Val( q, 5 ) ), 0, flags, encoding } );
-        else Each( "SELECT resource,mask FROM gpu_ref_entries WHERE setid=" + std::to_string( set ) + " ORDER BY ordinal", [&]( auto entry ) {
-            Put( JnGpuReferenceUseData{ time, pass, uint64_t( Val( entry, 0 ) ), thread, uint32_t( Val( entry, 1 ) ), set, flags, encoding } );
+    // A skeleton leaves out references the snapshot cannot hold expanded:
+    // its readers find them in the store by time.
+    if( options.skeleton && info.gpuReferenceUses > JnTraceMaxRecordsPerDomain ) U64( 0 );
+    else
+    {
+        Require( info.gpuReferenceUses <= JnTraceMaxRecordsPerDomain, "Expanded references exceed snapshot domain limit" );
+        U64( info.gpuReferenceUses );
+        Each( "SELECT pass,time,thread,setid,resource,mask,count,flags,encoding FROM gpu_ref_packets ORDER BY id", [&]( auto q ) {
+            const uint64_t pass = Val( q, 0 ), thread = Val( q, 2 );
+            const I time = Val( q, 1 );
+            const uint32_t set = uint32_t( Val( q, 3 ) );
+            const auto flags = uint8_t( Val( q, 7 ) ), encoding = uint8_t( Val( q, 8 ) );
+            if( encoding == 1 ) Put( JnGpuReferenceUseData{ time, pass, uint64_t( Val( q, 4 ) ), thread, uint32_t( Val( q, 5 ) ), 0, flags, encoding } );
+            else Each( "SELECT resource,mask FROM gpu_ref_entries WHERE setid=" + std::to_string( set ) + " ORDER BY ordinal", [&]( auto entry ) {
+                Put( JnGpuReferenceUseData{ time, pass, uint64_t( Val( entry, 0 ) ), thread, uint32_t( Val( entry, 1 ) ), set, flags, encoding } );
+            } );
         } );
-    } );
+    }
     CountVector( "SELECT time,pass,command_list,thread,total,dropped,flags FROM gpu_ref_ends ORDER BY id", [&]( auto q ) {
         Put( JnGpuReferenceEndData{ Val( q, 0 ), uint64_t( Val( q, 1 ) ), uint64_t( Val( q, 2 ) ), uint64_t( Val( q, 3 ) ), uint32_t( Val( q, 4 ) ), uint16_t( Val( q, 5 ) ), uint8_t( Val( q, 6 ) ) } );
     } );

@@ -183,6 +183,7 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
+    std::optional<GpuReferenceRange> ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const override;
     GpuMemoryAttribution GetGpuMemoryAttributionFromExternalZones(
         const std::vector<GpuMemoryCpuZoneInput>& cpuInputs,
         const std::vector<GpuMemoryGpuZoneInput>& gpuInputs ) const;

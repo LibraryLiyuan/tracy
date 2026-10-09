@@ -7,6 +7,8 @@ namespace capturegui
 struct ViewState
 {
     std::string state = "ready", message = "准备好场景后开始录制", directory, stage, quality, actualConfig;
+    // The current step of the stage, shown with its progress.
+    std::string progressText;
     bool busy = false, gameMayClose = false;
     uint64_t elapsedMs = 0, streamBytes = 0, memoryBytes = 0, freeBytes = 0;
     double percent = -1;

@@ -72,6 +72,16 @@ void Muted(const std::string &s)
     Text(s);
     ImGui::PopStyleColor();
 }
+// The preset named `name` in the folder of `exe`, if listed; a running
+// game or editor reads JNTracy.ini from its own folder.
+std::string IniBeside(const std::vector<std::string> &presets, const std::string &exe, const char *name)
+{
+    auto wanted = PathText(fs::path(Wide(exe)).parent_path() / name);
+    for (auto &p : presets)
+        if (p == wanted)
+            return p;
+    return "";
+}
 void Heading(const char *title)
 {
     ImGui::Spacing();
@@ -92,7 +102,7 @@ void ProcessingPanel(const ViewState &view)
     Text(description.detail);
     if (description.step >= 0 && ImGui::BeginTable("processing-steps", 3, ImGuiTableFlags_SizingStretchSame))
     {
-        const char *labels[] = {"转换文件", "建立索引", "校验与保存"};
+        const char *labels[] = {"保存录制", "完成索引", "可以打开"};
         for (int i = 0; i < 3; ++i)
         {
             ImGui::TableNextColumn();
@@ -109,7 +119,7 @@ void ProcessingPanel(const ViewState &view)
     }
     if (view.percent >= 0)
     {
-        Text("当前阶段进度");
+        Text(view.progressText.empty() ? "当前阶段进度" : view.progressText);
         ImGui::ProgressBar(float(view.percent / 100), ImVec2(-1, 0));
     }
     else
@@ -173,6 +183,10 @@ void ResultActions(const Json &task, const Settings &settings, std::string &noti
     auto final = fs::path(Wide(task.value("final", "")));
     if (Finished(task.value("state", "")))
     {
+        // Recordings are .tracy-stream; earlier versions saved short ones as .tracy.
+        const bool store = task.value("output_kind", "") == "store";
+        Text("文件：" + PathText(final.filename()) + "（" + Size(task.value(store ? "stream_bytes" : "final_bytes", 0ull)) + "）" +
+             (store ? "，索引在同名 .store 文件夹" : "，旧版本保存的 .tracy"));
         if (ImGui::Button("用 Tracy Viewer 打开"))
         {
             if (settings.viewer.empty())
@@ -448,6 +462,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                                     settings.player = path;
                                     settings.ready = false;
                                     presets = IniFiles(settings);
+                                    if (auto own = IniBeside(presets, path, "JNTracy.ini"); !own.empty())
+                                        settings.ini = own;
                                 }
                             }
                             ImGui::EndCombo();
@@ -462,14 +478,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                                           : PathText(fs::path(Wide(settings.ini)).filename());
                     if (ImGui::BeginCombo("##preset", presetName.c_str()))
                     {
+                        // The same file name can exist in several folders, so
+                        // each entry is identified by its full path and shows
+                        // its folder.
                         for (auto &p : presets)
-                            if (ImGui::Selectable(PathText(fs::path(Wide(p)).filename()).c_str(),
-                                                  p == settings.ini))
+                        {
+                            ImGui::PushID(p.c_str());
+                            auto file = fs::path(Wide(p));
+                            if (ImGui::Selectable(PathText(file.filename()).c_str(), p == settings.ini))
                                 settings.ini = p;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", p.c_str());
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("%s\\", PathText(file.parent_path().filename()).c_str());
+                            ImGui::PopID();
+                        }
                         ImGui::EndCombo();
                     }
                     PathField("INI 文件", settings.ini, false, L"INI files\0*.ini\0");
-                    Muted(settings.existing ? "所选配置用于核对；目标实际生效配置将在校验时读取。"
+                    Muted(settings.existing ? "已运行的 Editor / Player 读取自身目录下的 JNTracy.ini（或其 -jn-tracy-config 指定的文件）；"
+                                              "这里的选择不会改变它，只作为核对记录写入录制文件。"
                           : selected.pid    ? "更改配置将在下次启动时使用；不会热切换当前游戏。"
                                             : "启动时使用所选 INI；不会覆盖游戏原配置。");
                     if (!settings.existing)
@@ -494,6 +522,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##note", &settings.note);
                     PathField("保存位置", settings.output, true);
+                    Muted("保存为 " + settings.name + ".tracy-stream（旁边同名的 .store 文件夹是它的索引）。Tracy 和 AI 都直接打开它，不再另存 .tracy。");
                     ImGui::Checkbox("定时停止", &settings.timed);
                     if (settings.timed)
                     {
@@ -630,8 +659,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                                                  StageName(t.value("state", "failed")))
                                                     .c_str()))
                     {
-                        Text(t.value("created", "") + " · 录制时长 " + RecordingDuration(t) + " · " +
-                             Size(t.value("final_bytes", 0ull)));
+                        Text(t.value("created", "") + " · 录制时长 " + RecordingDuration(t));
                         Text(t.value("message", ""));
                         ResultActions(t, settings, notice);
                         if (!Finished(t.value("state", "")))

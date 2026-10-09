@@ -1008,6 +1008,7 @@ TRACY_SEGMENT_FORWARD0( analysis::GpuMemoryAttribution, GetGpuMemoryAttribution 
 TRACY_SEGMENT_FORWARD0( analysis::GpuMemoryAttribution, GetGpuMemorySummaryAttribution )
 TRACY_SEGMENT_FORWARD5( std::optional<analysis::GpuMemoryPassPage>, ScanGpuMemoryPasses, size_t, offset, size_t, limit, std::optional<uint64_t>, requestedPassId, size_t, useOffset, size_t, useLimit )
 TRACY_SEGMENT_FORWARD3( std::optional<analysis::GpuMemoryUseReferencePage>, ScanGpuMemoryUsesByResource, uint64_t, resourceId, size_t, offset, size_t, limit )
+TRACY_SEGMENT_FORWARD3( std::optional<analysis::GpuReferenceRange>, ScanGpuReferencesInRange, int64_t, begin, int64_t, end, size_t, maxUses )
 TRACY_SEGMENT_FORWARD2( std::optional<analysis::GpuMemoryRequestScopePage>, ScanGpuMemoryRequestScopes, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD5( std::optional<analysis::GpuMemoryAllocationPage>, ScanGpuMemoryAllocations, size_t, offset, size_t, limit, std::optional<uint64_t>, allocationId, const std::string&, poolRef, const std::string&, relationState )
 TRACY_SEGMENT_FORWARD2( analysis::GpuMemoryEvidenceSlice, GetGpuMemoryEvidence, const std::vector<uint64_t>&, passIds, size_t, maxUses )

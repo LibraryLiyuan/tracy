@@ -349,6 +349,14 @@ struct StoreAllocation
     int64_t allocated = 0;
     std::optional<int64_t> freed;
 };
+// The allocations of a pool live at a time: how many, their bytes, and all
+// of them, the largest first, as rows without the zones enclosing their
+// events.
+struct StoreLiveAllocations
+{
+    uint64_t count = 0, bytes = 0;
+    std::vector<StoreAllocation> largest;
+};
 struct StoreGpuReferencePass
 {
     uint64_t id = 0, pass = 0, frame = 0, thread = 0;
@@ -810,6 +818,9 @@ public:
     StorePage<StoreJob> Jobs( int64_t begin, int64_t end, uint64_t after = 0, size_t limit = 128 ) const;
     StorePage<StoreAllocation> Allocations( int64_t begin, int64_t end, std::optional<uint64_t> pool = {}, uint64_t after = 0, size_t limit = 256 ) const;
     std::optional<StoreAllocation> Allocation( uint64_t id ) const;
+    // The allocations of `pool` live at `time`; at most the memory's
+    // resources at one time, not the capture's.
+    StoreLiveAllocations LiveAllocations( int64_t time, uint64_t pool ) const;
     StorePage<StoreMemoryPool> MemoryPools( uint64_t after = 0, size_t limit = 64 ) const;
     StorePage<StoreGpuReferencePass> GpuReferencePasses( int64_t begin, int64_t end, uint64_t after = 0, size_t limit = 128 ) const;
     StorePage<StoreGpuReference> GpuReferences( int64_t begin, int64_t end, std::optional<uint64_t> pass = {}, uint64_t after = 0, size_t limit = 256 ) const;

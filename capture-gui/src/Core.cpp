@@ -183,13 +183,62 @@ bool ValidName(const std::string &n)
         return false;
     return true;
 }
-bool CanPublish(bool a, bool b, bool c)
-{
-    return a && b && c;
-}
 bool CaptureConnectionTimedOut(bool receivedData, bool latestStatusHasData, uint64_t idleMs)
 {
     return !receivedData && !latestStatusHasData && idleMs > 60000;
+}
+std::vector<CpuSet> EfficiencyCpuSets(const std::vector<CpuSet> &all)
+{
+    if (all.empty())
+        return {};
+    uint8_t lowest = 255, highest = 0;
+    for (auto &set : all)
+    {
+        lowest = (std::min)(lowest, set.efficiencyClass);
+        highest = (std::max)(highest, set.efficiencyClass);
+    }
+    std::vector<CpuSet> result;
+    if (lowest < highest)
+        for (auto &set : all)
+            if (set.efficiencyClass == lowest)
+                result.push_back(set);
+    return result;
+}
+std::vector<CpuSet> SystemCpuSets()
+{
+    using GetInfo = BOOL(WINAPI *)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    const auto getInfo = reinterpret_cast<GetInfo>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation"));
+    if (!getInfo)
+        return {};
+    ULONG size = 0;
+    getInfo(nullptr, 0, &size, GetCurrentProcess(), 0);
+    if (!size)
+        return {};
+    std::vector<uint8_t> buffer(size);
+    if (!getInfo(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), size, &size, GetCurrentProcess(), 0))
+        return {};
+    std::vector<CpuSet> result;
+    for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= size;)
+    {
+        const auto *info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(buffer.data() + offset);
+        if (!info->Size)
+            break;
+        if (info->Type == CpuSetInformation)
+            result.push_back({info->CpuSet.Id, info->CpuSet.EfficiencyClass, info->CpuSet.LogicalProcessorIndex});
+        offset += info->Size;
+    }
+    return result;
+}
+bool SetProcessCpuSets(HANDLE process, const std::vector<CpuSet> &sets)
+{
+    using SetSets = BOOL(WINAPI *)(HANDLE, const ULONG *, ULONG);
+    const auto setSets = reinterpret_cast<SetSets>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessDefaultCpuSets"));
+    if (!setSets || !process)
+        return false;
+    std::vector<ULONG> ids;
+    for (auto &set : sets)
+        ids.push_back(set.id);
+    return setSets(process, ids.empty() ? nullptr : ids.data(), ULONG(ids.size())) != FALSE;
 }
 void PreferBundledTools(Settings &settings, const fs::path &directory)
 {
@@ -293,7 +342,6 @@ Json Settings::ToJson() const
             {"seconds", seconds},
             {"port", port},
             {"drain_seconds", drainSeconds},
-            {"store_minutes", storeMinutes},
             {"warn_gib", warnGiB},
             {"stop_gib", stopGiB},
             {"memory_mib", memoryMiB},
@@ -322,7 +370,6 @@ Settings Settings::FromJson(const Json &j)
     s.seconds = j.value("seconds", 60);
     s.port = j.value("port", 8086);
     s.drainSeconds = j.value("drain_seconds", 30);
-    s.storeMinutes = j.value("store_minutes", 5);
     s.warnGiB = j.value("warn_gib", 50ull);
     s.stopGiB = j.value("stop_gib", 20ull);
     s.memoryMiB = j.value("memory_mib", 8192ull);

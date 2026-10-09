@@ -18,6 +18,13 @@ TimelineItemPlot::TimelineItemPlot( View& view, Worker& worker, PlotData* plot )
     : TimelineItem( view, worker, plot, true )
     , m_plot( plot )
 {
+    // The GPU memory lanes draw the JN engine's per-category plots stacked,
+    // and the usage lanes draw the usage plots.
+    if( plot->type == PlotType::User )
+    {
+        const auto name = worker.GetString( plot->name );
+        if( IsVramCategoryPlot( name ) || IsUsagePlot( name ) ) m_visible = false;
+    }
 }
 
 bool TimelineItemPlot::IsEmpty() const

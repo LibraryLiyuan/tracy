@@ -296,6 +296,9 @@ struct GpuMemoryLogicalResource
     char kind = 'U';
     char segment = 'L';
     std::string name;
+    // The engine's GPU memory category (TracyJnVram.hpp), empty in records
+    // that predate it.
+    std::string category;
 };
 
 struct GpuMemoryOwnerRollup
@@ -410,6 +413,32 @@ struct GpuMemoryRequestScopePage
 {
     uint64_t totalScopes = 0;
     std::vector<GpuMemoryRequestScope> scopes;
+};
+
+// The reference passes that began in a time range and the resources they
+// referenced, read by time. A set's resources carry the time its pass began.
+struct GpuReferenceRangePass
+{
+    uint64_t passId = 0;
+    int64_t time = 0;
+    uint32_t taxonomyId = 0;
+    uint8_t taxonomyLevel = 0;
+};
+
+struct GpuReferenceRangeUse
+{
+    uint64_t resourceId = 0;
+    uint64_t passId = 0;
+    int64_t time = 0;
+    uint32_t usageMask = 0;
+};
+
+struct GpuReferenceRange
+{
+    std::vector<GpuReferenceRangePass> passes;
+    std::vector<GpuReferenceRangeUse> uses;
+    // More uses began in the range than the read kept.
+    bool truncated = false;
 };
 
 struct GpuMemoryAllocationPageItem

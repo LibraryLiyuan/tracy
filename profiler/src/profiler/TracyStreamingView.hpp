@@ -265,6 +265,8 @@ private:
     std::atomic<uint64_t> m_analysisProgress{ 0 }, m_analysisTotal{ 0 };
     // The Tracy-like timeline; the panels below follow its view once it rests.
     std::unique_ptr<StreamingTimeline> m_timeline;
+    // The GPU memory panel of the GPU Resources window.
+    VramPanelState m_vramPanel;
     std::chrono::steady_clock::time_point m_timelineMoved;
     bool m_timelinePending = false;
     bool m_showPages = false;

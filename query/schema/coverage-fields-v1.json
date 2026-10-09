@@ -597,6 +597,33 @@
       "status": "complete"
     },
     {
+      "entity": "gpu.vram.plots",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["GPU.DXGI.<Segment>.UsageBytes", "GPU.DXGI.<Segment>.BudgetBytes", "GPU.VRAM.EngineKnownPhysical.<Segment>Bytes", "GPU.VRAM.Logical.<Segment>Bytes", "GPU.VRAM.<Segment>.<Physical|Logical|Resources>.<Category>", "GPU.VRAM.Residency.EvictedBytes"],
+      "query_fields": ["present", "categories_present", "categories_reason", "range", "segments", "series_present", "dxgi", "at_peak", "at_end", "at_time", "engine_physical_peak", "category_growth", "series", "eviction", "semantics"],
+      "unmapped_fields": [],
+      "methods": ["gpu.vram.summary"],
+      "status": "complete"
+    },
+    {
+      "entity": "gpu.vram.resources",
+      "classification": "derived_semantic",
+      "persisted_fields": ["GTMEM1 RESOURCE record: allocation, kind, segment, category (engines that record categories)", "GTMEM Request Scope zone name: the resource name", "GPU D3D12 Logical pool alloc/free time and size", "GTMEM2 ORIGIN record: pre_capture, replayed"],
+      "query_fields": ["present", "reason", "segment", "time_ns", "time_source", "filter", "live_resources", "live_bytes", "categories_recorded", "by_type", "matched_resources", "matched_bytes", "named_bytes", "resources", "resources_truncated", "by_name", "by_name_truncated", "begin_ns", "end_ns", "at_begin", "at_end", "delta_bytes", "grew", "shrank", "most_created", "semantics", "trust"],
+      "unmapped_fields": [],
+      "methods": ["gpu.vram.resources", "gpu.vram.resource_growth"],
+      "status": "complete"
+    },
+    {
+      "entity": "gpu.frame.resources",
+      "classification": "derived_semantic",
+      "persisted_fields": ["GPU reference pass time, taxonomy level", "GPU reference set entries and uses: resource, usage mask", "GTMEM1 RESOURCE record: allocation, kind, segment, category (engines that record categories)", "GTMEM Request Scope zone name: the resource name", "GPU D3D12 Logical pool alloc/free time and size"],
+      "query_fields": ["present", "reason", "frame", "range", "granularity", "reference_passes", "command_list_sets", "references_truncated", "referenced_resources", "resolved_resources", "unresolved_resources", "resolved_bytes", "categories_recorded", "by_type", "by_segment", "filter", "matched_resources", "matched_bytes", "resources", "resources_truncated", "by_name", "by_name_truncated", "semantics", "trust"],
+      "unmapped_fields": [],
+      "methods": ["gpu.frame.resources"],
+      "status": "complete"
+    },
+    {
       "entity": "frame.identity_and_correlation",
       "classification": "persisted_semantic",
       "persisted_fields": ["frame_id", "domain_index", "time", "thread", "domain", "phase", "flags", "job_origin_frame_sequence", "gfx_dispatch_frame_id", "typed_dependency_and_gfx_links"],

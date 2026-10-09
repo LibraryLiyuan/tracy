@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -443,10 +444,237 @@ bool ExportEvidencePage( const std::filesystem::path& cacheFile, const analysis:
 
 }
 
+void View::UpdateVram()
+{
+    const auto& plots = m_worker.GetPlots();
+    if( plots.size() != m_vramPlotCount )
+    {
+        m_vramPlotCount = plots.size();
+        m_vramPlots.clear();
+        VramData names;
+        for( const auto& plot : plots )
+        {
+            if( plot->type == PlotType::User && names.Find( m_worker.GetString( plot->name ) ) ) m_vramPlots.push_back( plot );
+        }
+        m_vramPoints = SIZE_MAX;
+    }
+    size_t points = 0;
+    for( const auto& plot : m_vramPlots ) points += plot->data.size();
+    if( points == m_vramPoints ) return;
+    m_vramPoints = points;
+    auto data = std::make_unique<VramData>();
+    data->lastTime = m_worker.GetLastTime();
+    for( const auto& plot : m_vramPlots )
+    {
+        auto series = data->Find( m_worker.GetString( plot->name ) );
+        series->time.reserve( plot->data.size() );
+        series->value.reserve( plot->data.size() );
+        for( const auto& item : plot->data ) series->Add( item.time.Val(), item.val );
+    }
+    data->Finish();
+    if( data->Empty() ) data.reset();
+    m_vram = std::move( data );
+    m_vramPanel.summarized = nullptr;
+}
+
+void View::UpdateUsage()
+{
+    const auto& plots = m_worker.GetPlots();
+    const auto& appInfo = m_worker.GetAppInfo();
+    if( plots.size() != m_usagePlotCount || appInfo.size() != m_usageAppInfo )
+    {
+        m_usagePlotCount = plots.size();
+        m_usageAppInfo = appInfo.size();
+        m_usagePlots.clear();
+        UsageData names;
+        for( const auto& plot : plots )
+        {
+            if( plot->type == PlotType::SysTime || ( plot->type == PlotType::User && names.Find( m_worker.GetString( plot->name ) ) ) )
+                m_usagePlots.push_back( plot );
+        }
+        m_usagePoints = SIZE_MAX;
+    }
+    size_t points = 0;
+    for( const auto& plot : m_usagePlots ) points += plot->data.size();
+    if( points == m_usagePoints ) return;
+    m_usagePoints = points;
+    auto data = std::make_unique<UsageData>();
+    data->lastTime = m_worker.GetLastTime();
+    for( const auto& plot : m_usagePlots )
+    {
+        auto series = plot->type == PlotType::SysTime ? &data->tracyCpu : data->Find( m_worker.GetString( plot->name ) );
+        series->time.reserve( plot->data.size() );
+        series->value.reserve( plot->data.size() );
+        for( const auto& item : plot->data ) series->Add( item.time.Val(), item.val );
+    }
+    for( const auto& info : appInfo ) data->ParseAppInfo( m_worker.GetString( info ) );
+    data->Finish();
+    if( data->Empty() ) data.reset();
+    m_usage = std::move( data );
+}
+
+void View::UpdateFps()
+{
+    const auto fd = m_worker.GetFramesBase();
+    const auto count = fd ? m_worker.GetFrameCount( *fd ) : 0;
+    if( fd != m_fpsData || count < m_fpsStarts.size() )
+    {
+        m_fpsData = fd;
+        m_fpsStarts.clear();
+        m_fpsEnds.clear();
+    }
+    if( !fd ) return;
+    // The last frame copied may have ended since.
+    const auto from = m_fpsStarts.empty() ? size_t( 0 ) : m_fpsStarts.size() - 1;
+    m_fpsStarts.resize( from );
+    m_fpsEnds.resize( fd->continuous ? 0 : from );
+    for( size_t i = from; i < count; ++i )
+    {
+        m_fpsStarts.push_back( fd->frames[i].start );
+        if( !fd->continuous ) m_fpsEnds.push_back( fd->frames[i].end );
+    }
+}
+
+FrameTimes View::GetFpsFrames() const
+{
+    FrameTimes frames;
+    frames.starts = &m_fpsStarts;
+    frames.ends = !m_fpsData || m_fpsData->continuous ? nullptr : &m_fpsEnds;
+    frames.lastNs = m_worker.GetLastTime();
+    frames.firstNumber = m_worker.GetFrameOffset() == 0 ? 0 : m_worker.GetFrameOffset() - 1;
+    frames.name = "Frames";
+    return frames;
+}
+
+void View::ShowVramAt( int64_t time )
+{
+    m_vramPanel.time = time;
+    m_vramPanel.follow = false;
+    m_showJnGpuResources = true;
+}
+
+void View::UpdateVramNames()
+{
+    if( !m_worker.AreSourceLocationZonesReady() ) return;
+    const auto& zonesBySource = m_worker.GetSourceLocationZones();
+    std::vector<int16_t> sources;
+    size_t records = 0;
+    for( const auto& [id, zones] : zonesBySource )
+    {
+        const auto marker = m_worker.GetZoneName( m_worker.GetSourceLocation( id ) );
+        if( !marker || strcmp( marker, VramResourceMarker ) != 0 ) continue;
+        sources.push_back( id );
+        records += zones.zones.size();
+    }
+    if( records == m_vramRecords ) return;
+    // A live capture keeps adding records; read them again at most twice a second.
+    const auto now = ImGui::GetTime();
+    if( m_vramRecords != SIZE_MAX && now < m_vramNamesTime + 0.5 ) return;
+    m_vramRecords = records;
+    m_vramNamesTime = now;
+    m_vramNames.clear();
+    for( const auto source : sources )
+    {
+        const auto zones = zonesBySource.find( source );
+        if( zones == zonesBySource.end() ) continue;
+        for( const auto& zoneThread : zones->second.zones )
+        {
+            const auto zone = zoneThread.Zone();
+            if( !zone || !m_worker.HasZoneExtra( *zone ) ) continue;
+            const auto& extra = m_worker.GetZoneExtra( *zone );
+            if( !extra.text.Active() ) continue;
+            const auto text = m_worker.GetString( extra.text );
+            const auto record = text ? ParseVramResourceRecord( text ) : std::nullopt;
+            if( record ) m_vramNames[record->allocation].push_back( { zone->Start(), m_worker.GetZoneName( *zone ), record->category } );
+        }
+    }
+    for( auto& [allocation, names] : m_vramNames )
+        std::stable_sort( names.begin(), names.end(), []( const auto& a, const auto& b ) { return a.time < b.time; } );
+    m_vramResources.reset();
+}
+
+std::shared_ptr<const VramResources> View::VramResourcesAt( int segment, int64_t time )
+{
+    UpdateVramNames();
+    std::vector<std::pair<const MemData*, char>> pools;
+    size_t events = 0;
+    for( const auto& [pool, memory] : m_worker.GetMemNameMap() )
+    {
+        if( pool == 0 ) continue;
+        const auto name = m_worker.GetString( pool );
+        const auto kind = name ? VramPoolKind( name ) : 0;
+        if( !kind ) continue;
+        pools.emplace_back( memory, kind );
+        events += memory->data.size();
+    }
+    // The last list holds until the time, the segment or the data change; a
+    // time that keeps changing, as the view scrolls, is listed ten times a
+    // second.
+    if( m_vramResources && m_vramResources->segment == segment && m_vramResourceEvents == events &&
+        ( m_vramResources->time == time || ImGui::GetTime() < m_vramResourcesTime + 0.1 ) ) return m_vramResources;
+    m_vramResourceEvents = events;
+    m_vramResourcesTime = ImGui::GetTime();
+    auto list = std::make_shared<VramResources>();
+    list->present = !pools.empty();
+    list->segment = segment;
+    list->time = time;
+    std::vector<std::pair<const MemEvent*, char>> live;
+    for( const auto& [memory, kind] : pools )
+    {
+        if( VramKindSegment( kind ) != segment ) continue;
+        for( const auto& event : memory->data )
+        {
+            if( event.Ptr() == 0 || event.TimeAlloc() > time || ( event.TimeFree() >= 0 && event.TimeFree() <= time ) ) continue;
+            list->live++;
+            list->liveBytes += event.Size();
+            live.emplace_back( &event, kind );
+        }
+    }
+    std::stable_sort( live.begin(), live.end(), []( const auto& a, const auto& b ) { return a.first->Size() > b.first->Size(); } );
+    list->resources.reserve( live.size() );
+    for( const auto& [event, kind] : live )
+    {
+        VramResource resource;
+        resource.kind = kind;
+        resource.size = event->Size();
+        resource.created = event->TimeAlloc();
+        if( event->TimeFree() >= 0 ) resource.freed = event->TimeFree();
+        // The last record of this allocation names it.
+        if( const auto found = m_vramNames.find( event->Ptr() ); found != m_vramNames.end() )
+        {
+            for( auto it = found->second.rbegin(); it != found->second.rend(); ++it )
+            {
+                if( it->time < resource.created ) break;
+                if( resource.freed && it->time > *resource.freed ) continue;
+                if( it->name ) resource.name = it->name;
+                resource.category = it->category;
+                break;
+            }
+        }
+        list->resources.push_back( std::move( resource ) );
+    }
+    m_vramResources = list;
+    return list;
+}
+
 void View::DrawJnGpuResources()
 {
     ImGui::SetNextWindowSize( ImVec2( 1200 * GetScale(), 760 * GetScale() ), ImGuiCond_FirstUseEver );
     if( !ImGui::Begin( ICON_FA_MICROCHIP " GPU Memory & Resources", &m_showJnGpuResources ) ) { ImGui::End(); return; }
+    // The engine's GPU memory plots need no GPU Catalog.
+    UpdateVram();
+    if( m_vram && ImGui::CollapsingHeader( "GPU memory", ImGuiTreeNodeFlags_DefaultOpen ) )
+    {
+        VramPanelActions actions;
+        actions.zoomTo = [this]( int64_t begin, int64_t end ) { ZoomToRange( begin, end ); };
+        actions.showLanes = [this] {
+            m_vd.drawPlots = true;
+            m_tc.ScrollToItem( &m_vramLanes[m_vram && !m_vram->HasSegment( 0 ) ? 1 : 0] );
+        };
+        actions.resources = [this]( int segment, int64_t time ) { return VramResourcesAt( segment, time ); };
+        DrawVramPanel( *m_vram, m_vramPanel, m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2, actions );
+        ImGui::Spacing();
+    }
     if( m_gpuAnalysis )
     {
         const auto status = m_gpuAnalysis->Status();
@@ -548,8 +776,20 @@ void View::DrawJnGpuResources()
         ImGui::ProgressBar( float( std::min( ratio, 1.0 ) ), ImVec2( -1, 0 ), ratio > 1 ? "OverProjectBudget" : "Project budget" );
         ImGui::SeparatorText( "Capture summary" );
         ImGui::Text( "Resources %zu / Allocations %zu / Passes %zu / Residency intervals %zu", snapshot->resources.size(), snapshot->allocations.size(), snapshot->passes.size(), snapshot->residency.size() );
-        ImGui::Text( "DXGI Local Usage/Budget: Unavailable in this snapshot" );
-        ImGui::Text( "Untracked DXGI Delta: Unavailable (not coerced to zero)" );
+        // DXGI at the engine's physical peak, from the GPU memory plots.
+        const auto peakTime = snapshot->engineKnownPhysicalPeakTimeNs;
+        const auto usage = m_vram ? m_vram->usage[0].At( peakTime ) : std::nullopt;
+        const auto budget = m_vram ? m_vram->budget[0].At( peakTime ) : std::nullopt;
+        if( usage && budget && *budget > 0 )
+            ImGui::Text( "DXGI Local Usage/Budget at the physical peak: %s / %s (%.1f%%)", ByteText( uint64_t( *usage ), m_jnGpuUi.decimalUnits ).c_str(),
+                ByteText( uint64_t( *budget ), m_jnGpuUi.decimalUnits ).c_str(), *usage / *budget * 100 );
+        else ImGui::Text( "DXGI Local Usage/Budget: Unavailable in this snapshot" );
+        if( usage )
+        {
+            const auto delta = int64_t( *usage ) - int64_t( snapshot->engineKnownPhysicalPeakBytes );
+            ImGui::Text( "Untracked DXGI Delta at the physical peak: %s%s", delta < 0 ? "-" : "", ByteText( uint64_t( delta < 0 ? -delta : delta ), m_jnGpuUi.decimalUnits ).c_str() );
+        }
+        else ImGui::Text( "Untracked DXGI Delta: Unavailable (not coerced to zero)" );
         ImGui::TextDisabled( "Peak time: %lld ns", static_cast<long long>( snapshot->engineKnownPhysicalPeakTimeNs ) );
     }
     else if( m_jnGpuUi.tab == 1 )

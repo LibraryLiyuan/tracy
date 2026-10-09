@@ -642,8 +642,38 @@ public:
             const auto child = structuredReferenceById.find( value.sourceId );
             if( child != structuredReferenceById.end() ) structuredReferencePasses[child->second].parentPassId = value.targetId;
         } );
-        return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, m_worker->GetGpuMemoryAllocationInputs(), submittedCommandLists,
+        auto attribution = BuildGpuMemoryAttribution( cpuInputs, gpuInputs, m_worker->GetGpuMemoryAllocationInputs(), submittedCommandLists,
             gpuSegmentReferenceTokens, structuredReferencePasses, m_worker->GetTraceInfo().lastTimeNs );
+        if( m_events->Info().gpuReferenceUses > 0 && m_worker->ScanGpuReferenceUses( 0, 1 ).empty() )
+            attribution.warnings.push_back( std::to_string( m_events->Info().gpuReferenceUses ) +
+                " resource references are more than a snapshot holds and are left out here; gpu.frame.resources reads them from the store frame by frame" );
+        return attribution;
+    }
+
+    // From the store's time indexes: a range's passes and their resources,
+    // without the skeleton, which may leave the references out.
+    std::optional<GpuReferenceRange> ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const override
+    {
+        std::lock_guard lock( m_mutex );
+        if( m_events->Info().gpuReferencePasses == 0 ) return std::nullopt;
+        GpuReferenceRange result;
+        for( uint64_t after = 0;; )
+        {
+            const auto page = m_events->GpuReferencePasses( begin, end, after, 4096 );
+            for( const auto& pass : page.values ) result.passes.push_back( { pass.pass, pass.time, pass.taxonomy, pass.level } );
+            if( !page.more ) break;
+            after = page.next;
+        }
+        for( uint64_t after = 0; result.uses.size() < maxUses; )
+        {
+            const auto page = m_events->GpuReferences( begin, end, std::nullopt, after, std::min<size_t>( 4096, maxUses - result.uses.size() ) );
+            for( const auto& use : page.values )
+                if( use.resource != 0 ) result.uses.push_back( { use.resource, use.pass, use.time, use.mask } );
+            if( !page.more ) return result;
+            after = page.next;
+        }
+        result.truncated = true;
+        return result;
     }
 
     // Jobs are assembled from their raw schedule, config, dependency and stage

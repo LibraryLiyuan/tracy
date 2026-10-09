@@ -92,6 +92,8 @@ set(SERVER_FILES
     TracyTimelineItemGpu.cpp
     TracyTimelineItemPlot.cpp
     TracyTimelineItemThread.cpp
+    TracyTimelineItemUsage.cpp
+    TracyTimelineItemVram.cpp
     TracyUserData.cpp
     TracyUtility.cpp
     TracyView.cpp
@@ -130,6 +132,8 @@ set(SERVER_FILES
     TracyView_Utility.cpp
     TracyView_ZoneInfo.cpp
     TracyView_ZoneTimeline.cpp
+    TracyUsage.cpp
+    TracyVram.cpp
     TracyWeb.cpp
 )
 

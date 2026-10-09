@@ -1393,6 +1393,9 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto info = GetTraceInfo();
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
+    const auto plots = GetPlotList();
+    const bool hasVramPlots = std::any_of( plots.begin(), plots.end(), []( const auto& plot ) {
+        return plot.name.rfind( "GPU.DXGI.", 0 ) == 0 || plot.name.rfind( "GPU.VRAM.", 0 ) == 0; } );
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
     const auto& jnTrace = m_impl->worker->GetJnTraceData();
     const bool hasIo = jnTrace.schemaVersion >= 3 && ( !jnTrace.ioRequests.empty() || !jnTrace.ioStages.empty() );
@@ -1473,6 +1476,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             hasStructuredGc ? "" : "trace predates or did not emit JNGC1" ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
+        capability( "gpu.vram", hasVramPlots, true, { "gpu.vram.summary", "gpu.vram.resources", "gpu.vram.resource_growth", "gpu.frame.resources" },
+            hasVramPlots ? "DXGI and engine GPU memory plots are present" : "trace contains no GPU.DXGI or GPU.VRAM plots" ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
         capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "job.gfx", hasJnTrace, true, { "job.gfx.statistics", "job.gfx_chain" }, hasJnTrace ? "JN Graphics Jobs schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
@@ -2942,6 +2947,25 @@ std::vector<JnGpuReferenceEndData> WorkerTraceSource::ScanGpuReferenceEnds( size
     if( limit > 4096 ) throw std::invalid_argument( "GPU end page limit exceeded" );
     if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
 }
+std::optional<GpuReferenceRange> WorkerTraceSource::ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& jn = m_impl->worker->GetJnTraceData();
+    if( jn.gpuReferencePasses.empty() ) return std::nullopt;
+    GpuReferenceRange result;
+    for( const auto& pass : jn.gpuReferencePasses )
+        if( pass.time >= begin && pass.time < end ) result.passes.push_back( { pass.passId, pass.time, pass.taxonomyId, pass.taxonomyLevel } );
+    // A set's resources carry the time its pass began, so they are in range
+    // exactly when their pass is.
+    for( const auto& use : jn.gpuReferenceUses )
+    {
+        if( use.time < begin || use.time >= end || use.resourceId == 0 ) continue;
+        if( result.uses.size() == maxUses ) { result.truncated = true; break; }
+        result.uses.push_back( { use.resourceId, use.passId, use.time, use.usageMask } );
+    }
+    return result;
+}
+
 std::shared_ptr<const tracy::JnTraceData> WorkerTraceSource::GetGpuCatalogData() const
 {
     std::lock_guard lock( m_impl->readMutex );

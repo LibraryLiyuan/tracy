@@ -596,8 +596,9 @@ bool StreamingView::SmokeStep()
     return SmokeStepTimeline();
 }
 // The timeline reads the whole capture, then a minute, two seconds and 20 ms
-// around a zone, and draws them; with TRACY_STREAM_SCREENSHOT=<prefix> it
-// saves <prefix>-<name>.png of each.
+// around a zone, and draws them, then the whole capture again scrolled to the
+// GPU memory lanes; with TRACY_STREAM_SCREENSHOT=<prefix> it saves
+// <prefix>-<name>.png of each.
 bool StreamingView::SmokeStepTimeline()
 {
     if( m_liveMode ) return true;
@@ -617,20 +618,24 @@ bool StreamingView::SmokeStepTimeline()
     const char* screenshot = getenv( "TRACY_STREAM_SCREENSHOT" );
     // A draw after the range was set showed a read of that range; the extra
     // draws let the scroll to the timeline take effect before a screenshot.
-    const auto settled = [&] { return stats.draws > m_timelineSmokeDraws + 2 && stats.drawn && stats.current && !m_timeline->Busy() && !m_timeline->Indexing(); };
+    const auto settled = [&] { return stats.draws > m_timelineSmokeDraws + 2 && stats.drawn && stats.current && !m_timeline->Busy() && !m_timeline->Indexing() && !m_timeline->VramLoading() && !m_timeline->ShowingVram(); };
     const auto describe = [&]( const char* name ) {
         m_timelineSmoke += std::string( name ) + "_zones=" + std::to_string( stats.zones ) + ' ' + name + "_folded=" + std::to_string( stats.folded ) + ' ' +
             name + "_density=" + std::to_string( stats.density ) + ' ' + name + "_frames=" + std::to_string( stats.frames ) + ' ' +
-            name + "_lanes=" + std::to_string( stats.lanes ) + ' ' + name + "_seconds=" +
+            name + "_lanes=" + std::to_string( stats.lanes ) + ' ' + name + "_vram_lanes=" + std::to_string( stats.vramLanes ) + ' ' +
+            name + "_usage_lanes=" + std::to_string( stats.usageLanes ) + ' ' + name + "_fps_lanes=" + std::to_string( stats.fpsLanes ) + ' ' + name + "_seconds=" +
             std::to_string( std::chrono::duration<double>( std::chrono::steady_clock::now() - m_timelineSmokeSince ).count() ) + ' ';
     };
     if( m_timelineSmokeStep > 0 && std::chrono::steady_clock::now() - m_timelineSmokeSince > std::chrono::minutes( 3 ) )
         throw std::runtime_error( "Timeline step " + std::to_string( m_timelineSmokeStep ) + " did not settle: draws=" + std::to_string( stats.draws ) +
                                   " drawn=" + std::to_string( stats.drawn ) + " current=" + std::to_string( stats.current ) + " busy=" + std::to_string( m_timeline->Busy() ) );
-    // The last stage keeps the zoom and opens Tracy's Statistics and Zone info windows.
-    constexpr const char* names[] = { "whole", "minute", "seconds", "zoom", "windows" };
-    constexpr int64_t spans[] = { 0, 60'000'000'000, 2'000'000'000, 20'000'000, 20'000'000 };
-    constexpr unsigned stages = std::size( names );
+    // The windows stage keeps the zoom and opens Tracy's Statistics and Zone
+    // info windows; the vram stage shows the whole capture again, scrolled to
+    // the GPU memory lanes, with the GPU Resources window open, and the
+    // vram_names stage its resources grouped by name.
+    constexpr const char* names[] = { "whole", "minute", "seconds", "zoom", "windows", "vram", "vram_names" };
+    constexpr int64_t spans[] = { 0, 60'000'000'000, 2'000'000'000, 20'000'000, 20'000'000, 0, 0 };
+    constexpr unsigned stages = std::size( names ), Zoom = 3, Windows = 4, Vram = 5, VramNames = 6;
     const auto setRange = [&]( int64_t begin, int64_t end ) {
         m_timelineSmokeDraws = stats.draws;
         m_timelineSmokeSince = std::chrono::steady_clock::now();
@@ -651,9 +656,52 @@ bool StreamingView::SmokeStepTimeline()
     if( m_timelineSmokeStep > stages ) return true;
     if( !settled() ) return false;
     const auto stage = m_timelineSmokeStep - 1;
+    // The vram stage also waits for the GPU memory panel's resources at the
+    // middle of the view, which it follows, until every name is read.
+    std::shared_ptr<const VramResources> resources;
+    if( ( stage == Vram || stage == VramNames ) && m_timeline->Vram() )
+    {
+        const auto center = m_timeline->Begin() + ( m_timeline->End() - m_timeline->Begin() ) / 2;
+        resources = m_timeline->VramResourcesAt( m_vramPanel.segment, center );
+        if( !resources || resources->time != center || resources->segment != m_vramPanel.segment || resources->pending != 0 ) return false;
+        // The grouped list is drawn.
+        if( stage == VramNames && !resources->resources.empty() && ( m_vramPanel.listed != resources.get() || !m_vramPanel.listedGroups || m_vramPanel.groups.empty() ) ) return false;
+    }
     describe( names[stage] );
+    if( stage == VramNames && resources && !m_vramPanel.groups.empty() )
+    {
+        const auto& group = m_vramPanel.groups.front();
+        m_timelineSmoke += "vram_name_groups=" + std::to_string( m_vramPanel.groups.size() ) + " vram_name_largest=" +
+            resources->resources[m_vramPanel.rows[group.first]].name + 'x' + std::to_string( group.count ) + ' ';
+        resources.reset();
+    }
+    if( resources )
+    {
+        size_t named = 0;
+        std::string top;
+        std::array<size_t, VramResourceTypes> types {};
+        for( const auto& resource : resources->resources )
+        {
+            types[int( VramResourceTypeOf( resource.kind, resource.category ) )]++;
+            if( resource.name.empty() ) continue;
+            if( named++ < 3 ) top += resource.name + '|';
+        }
+        m_timelineSmoke += "vram_resources=" + std::to_string( resources->live ) + " vram_resource_rows=" + std::to_string( resources->resources.size() ) +
+            " vram_resource_named=" + std::to_string( named ) + " vram_resource_top=" + top + " vram_resource_types=";
+        for( int type = 0; type < VramResourceTypes; ++type )
+            if( types[type] ) m_timelineSmoke += std::string( VramResourceTypeNames[type] ) + ':' + std::to_string( types[type] ) + ',';
+        m_timelineSmoke += ' ';
+        if( resources->frameReferences )
+            m_timelineSmoke += "vram_frame=" + std::to_string( resources->frameNumber ) + " vram_frame_referenced=" + std::to_string( resources->referenced ) +
+                " vram_frame_used=" + std::to_string( resources->used ) + ' ';
+        if( resources->present && !resources->resources.empty() && named == 0 ) throw std::runtime_error( "The GPU memory panel found no resource names" );
+    }
     if( stage == 0 && stats.zones + stats.folded + stats.density == 0 && m_result.info.cpuZones ) throw std::runtime_error( "Timeline drew nothing for the whole capture" );
-    if( stage + 2 == stages && stats.zones == 0 && m_result.info.cpuZones ) throw std::runtime_error( "Timeline drew no zones in a 20 ms window" );
+    if( stage == Zoom && stats.zones == 0 && m_result.info.cpuZones ) throw std::runtime_error( "Timeline drew no zones in a 20 ms window" );
+    // The plot lanes zoom with the view.
+    if( stats.plotEnd > stats.plotBegin && ( stats.plotBegin != m_timeline->Begin() || stats.plotEnd != m_timeline->End() ) )
+        throw std::runtime_error( std::string( "The plot lanes do not follow the view in the " ) + names[stage] + " stage" );
+    if( stage == Vram && m_timeline->Vram() && stats.vramLanes == 0 ) throw std::runtime_error( "Timeline drew no GPU memory lanes" );
     if( screenshot ) RequestStreamingScreenshot( ( std::string( screenshot ) + '-' + names[stage] + ".png" ).c_str() );
     if( stage == 0 )
     {
@@ -663,17 +711,29 @@ bool StreamingView::SmokeStepTimeline()
         const auto& zones = m_result.zones->values;
         if( !zones.empty() ) m_timelineSmokeCenter = zones[zones.size() / 2].start;
     }
-    if( stage + 2 == stages )
+    if( stage == Zoom )
     {
         m_showStatistics = true;
         m_showZoneInfo = m_selected != 0;
     }
+    if( stage == Windows )
+    {
+        m_showStatistics = m_showZoneInfo = false;
+        if( m_timeline->Vram() )
+        {
+            m_showGpuResources = true;
+            m_timeline->ShowVram();
+        }
+    }
+    if( stage == Vram ) m_vramPanel.resourceGroups = true;
     if( stage + 1 < stages )
     {
         const auto half = spans[stage + 1] / 2;
-        setRange( std::max<int64_t>( 0, m_timelineSmokeCenter - half ), m_timelineSmokeCenter + half );
+        if( half ) setRange( std::max<int64_t>( 0, m_timelineSmokeCenter - half ), m_timelineSmokeCenter + half );
+        else setRange( m_timeline->CaptureBegin(), lastNs );
         return false;
     }
+    m_timelineSmoke += "plot_follow=ok ";
     // TRACY_STREAM_SMOKE_OUTPUT=<file> keeps the result out of the capture's folder.
     auto path = m_journal;
     path += ".stream-smoke-timeline.txt";
@@ -2038,6 +2098,13 @@ bool StreamingView::Draw()
                 m_showZoneInfo = true;
                 request = true;
             }
+            // A click on a GPU memory lane shows its time in the GPU memory panel.
+            if( const auto time = m_timeline->TakeVramClick() )
+            {
+                m_vramPanel.time = *time;
+                m_vramPanel.follow = false;
+                m_showGpuResources = true;
+            }
             // The panels below follow the timeline once its view rests.
             const auto now = std::chrono::steady_clock::now();
             if( m_timeline->TakeRangeChanged() )
@@ -2140,6 +2207,13 @@ bool StreamingView::Draw()
         if( PanelWindow panel( "Hardware samples and code", "", m_showHardware, r.info.schema >= 12, m_liveMode ); panel ) request |= DrawHardwareCode( r );
         if( PanelWindow panel( "JN Overview", "", m_showJn, r.info.schema >= 11, m_liveMode ); panel ) request |= DrawAuxiliary( r );
         if( PanelWindow panel( "Playback", "", m_showPlayback, r.info.schema >= 10, m_liveMode ); panel ) request |= DrawImages( r );
+        if( const auto vram = m_timeline ? m_timeline->Vram() : nullptr )
+        {
+            if( PanelWindow panel( "GPU Resources", "GPU memory", m_showGpuResources, true, false ); panel )
+                DrawVramPanel( *vram, m_vramPanel, m_timeline->Begin() + ( m_timeline->End() - m_timeline->Begin() ) / 2,
+                    { [this]( int64_t begin, int64_t end ) { m_timeline->ZoomToRange( begin, end ); }, [this] { m_timeline->ShowVram(); },
+                      [this]( int segment, int64_t time ) { return m_timeline->VramResourcesAt( segment, time ); } } );
+        }
         if( PanelWindow panel( "GPU Resources", "", m_showGpuResources, r.info.schema >= 9, m_liveMode ); panel ) request |= DrawCatalog( r );
         if( PanelWindow panel( "GPU Resources", "GPU resource references", m_showGpuResources, r.info.schema >= 8, m_liveMode ); panel )
         {

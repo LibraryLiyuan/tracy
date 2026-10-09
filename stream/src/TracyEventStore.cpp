@@ -6025,6 +6025,45 @@ StorePage<StoreAllocation> EventStore::Allocations( I begin, I end, std::optiona
     sqlite3_reset( s );
     return page;
 }
+StoreLiveAllocations EventStore::LiveAllocations( I time, uint64_t pool ) const
+{
+    StoreLiveAllocations live;
+    auto& d = m_impl->db;
+    const char* const filter = "WHERE id IN(SELECT id FROM allocation_range WHERE mint<=?1 AND maxt>=?2) AND allocated<?3 AND (freed IS NULL OR freed>?4 OR (freed=allocated AND freed>=?4)) AND pool=?5";
+    const auto bind = [&]( sqlite3_stmt* s ) {
+        Int( s, 1, uint64_t( Bucket( time ) ) );
+        Int( s, 2, uint64_t( Bucket( time ) ) );
+        Int( s, 3, uint64_t( time + 1 ) );
+        Int( s, 4, uint64_t( time ) );
+        Int( s, 5, pool );
+    };
+    auto s = d.Prep( std::string( "SELECT COUNT(*),TOTAL(size) FROM allocations " ) + filter );
+    bind( s );
+    if( d.Step( s ) )
+    {
+        live.count = sqlite3_column_int64( s, 0 );
+        live.bytes = uint64_t( sqlite3_column_double( s, 1 ) );
+    }
+    sqlite3_reset( s );
+    if( !live.count ) return live;
+    live.largest.reserve( live.count );
+    s = d.Prep( std::string( "SELECT id,pool,address,size,allocated,freed,allocation_thread FROM allocations " ) + filter + " ORDER BY size DESC,id" );
+    bind( s );
+    while( d.Step( s ) )
+    {
+        StoreAllocation a;
+        a.id = sqlite3_column_int64( s, 0 );
+        a.pool = sqlite3_column_int64( s, 1 );
+        a.address = sqlite3_column_int64( s, 2 );
+        a.size = sqlite3_column_int64( s, 3 );
+        a.allocated = sqlite3_column_int64( s, 4 );
+        if( sqlite3_column_type( s, 5 ) != SQLITE_NULL ) a.freed = sqlite3_column_int64( s, 5 );
+        a.allocationThread = sqlite3_column_int64( s, 6 );
+        live.largest.push_back( a );
+    }
+    sqlite3_reset( s );
+    return live;
+}
 std::optional<StoreAllocation> EventStore::Allocation( uint64_t id ) const
 {
     auto& d = m_impl->db;

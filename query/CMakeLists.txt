@@ -86,6 +86,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracySegmentTraceSource.hpp
     src/TracyEventStoreTraceSource.cpp
     src/TracyEventStoreTraceSource.hpp
+    src/TracyQueryVram.cpp
+    src/TracyQueryVram.hpp
     src/TracySessionManager.cpp
     src/TracySessionManager.hpp
     src/TracyEmbeddedData.hpp
@@ -261,6 +263,11 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)
     tracy_query_enable_assertions(tracy-gpu-analysis-tests)
     add_test(NAME tracy-gpu-analysis COMMAND tracy-gpu-analysis-tests)
+
+    add_executable(tracy-query-vram-tests tests/VramSummaryTests.cpp)
+    target_link_libraries(tracy-query-vram-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-vram-tests)
+    add_test(NAME tracy-query-vram COMMAND tracy-query-vram-tests)
 
     add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)

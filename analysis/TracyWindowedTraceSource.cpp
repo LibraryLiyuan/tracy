@@ -401,6 +401,7 @@ public:
     GpuMemoryAttribution GetGpuMemorySummaryAttribution() const override { return m_inner->GetGpuMemorySummaryAttribution(); }
     std::optional<GpuMemoryPassPage> ScanGpuMemoryPasses( size_t a, size_t b, std::optional<uint64_t> c, size_t d, size_t e ) const override { return m_inner->ScanGpuMemoryPasses( a, b, c, d, e ); }
     std::optional<GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t a, size_t b, size_t c ) const override { return m_inner->ScanGpuMemoryUsesByResource( a, b, c ); }
+    std::optional<GpuReferenceRange> ScanGpuReferencesInRange( int64_t a, int64_t b, size_t c ) const override { return m_inner->ScanGpuReferencesInRange( a, b, c ); }
     std::optional<GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t a, size_t b ) const override { return m_inner->ScanGpuMemoryRequestScopes( a, b ); }
     std::optional<GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t a, size_t b, std::optional<uint64_t> c, const std::string& d, const std::string& e ) const override { return m_inner->ScanGpuMemoryAllocations( a, b, c, d, e ); }
     GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const override { return m_inner->GetGpuMemoryEvidence( passIds, maxUses ); }
