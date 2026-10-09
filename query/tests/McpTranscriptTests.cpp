@@ -67,7 +67,7 @@ int main()
         return tool["name"] == "tracy_scan";
     } );
     assert( scan != tools["result"]["tools"].end() );
-    assert( ( *scan )["inputSchema"]["properties"]["operation"]["enum"].size() == 12 );
+    assert( ( *scan )["inputSchema"]["properties"]["operation"]["enum"].size() == 13 );
     const auto scanWithoutPaths = server.HandleRequest( Request( 21, "tools/call", {
         { "name", "tracy_scan" }, { "arguments", { { "operation", "status" }, { "scan_id", "missing" } } }
     } ) );

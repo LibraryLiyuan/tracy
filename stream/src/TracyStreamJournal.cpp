@@ -5,17 +5,24 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #ifdef _WIN32
 #  include <Windows.h>
+#  include <bcrypt.h>
 #  include <fcntl.h>
 #  include <io.h>
+#  if defined( _M_X64 )
+#    include <intrin.h>
+#    include <nmmintrin.h>
+#  endif
 #else
 #  include <fcntl.h>
 #  include <sys/stat.h>
@@ -49,12 +56,38 @@ constexpr std::array<uint32_t, 256> MakeCrc32cTable()
 }
 
 constexpr auto Crc32cTable = MakeCrc32cTable();
+bool HasFastCrc32c()
+{
+#if defined(_WIN32) && defined(_M_X64)
+    static const bool available=[] {
+        int info[4];__cpuid(info,1);return (info[2]&(1<<20))!=0;
+    }();
+    return available;
+#else
+    return false;
+#endif
+}
 
 class Crc32cState
 {
 public:
+    Crc32cState() = default;
+    explicit Crc32cState( uint32_t finished )
+        : m_value( ~finished )
+    {
+    }
     void Update( const uint8_t* data, size_t size )
     {
+#if defined(_WIN32) && defined(_M_X64)
+        if(HasFastCrc32c())
+        {
+            uint64_t value=m_value;
+            while(size>=8){uint64_t word;memcpy(&word,data,8);value=_mm_crc32_u64(value,word);data+=8;size-=8;}
+            m_value=uint32_t(value);
+            while(size--){m_value=_mm_crc32_u8(m_value,*data++);}
+            return;
+        }
+#endif
         for( size_t i = 0; i < size; i++ )
         {
             m_value = Crc32cTable[( m_value ^ data[i] ) & 0xFFu] ^ ( m_value >> 8 );
@@ -563,8 +596,169 @@ private:
     uint64_t m_size = 0;
 };
 
-ScanResult Scan( ScanSource& source, const ScanOptions& options )
+class LimitedScanSource final : public ScanSource
 {
+public:
+    LimitedScanSource( ScanSource& source, uint64_t size )
+        : m_source( source )
+        , m_size( size )
+    {
+    }
+    uint64_t Size() const override { return m_size; }
+    bool Read( uint64_t offset, uint8_t* output, size_t size, std::string& error ) override
+    {
+        if( offset > m_size || size > m_size - offset )
+        {
+            error = "read exceeds committed snapshot";
+            return false;
+        }
+        return m_source.Read( offset, output, size, error );
+    }
+
+private:
+    ScanSource& m_source;
+    uint64_t m_size;
+};
+
+#ifdef _WIN32
+struct JournalFileIdentity
+{
+    DWORD volume = 0, high = 0, low = 0;
+    bool operator==( const JournalFileIdentity& ) const = default;
+};
+class TailFileSource final : public ScanSource
+{
+public:
+    TailFileSource( const std::filesystem::path& path, uint64_t& reads )
+        : m_reads( reads )
+    {
+        m_handle = CreateFileW( path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+        if( m_handle == INVALID_HANDLE_VALUE ) throw std::runtime_error( WindowsErrorMessage( "Open live journal" ) );
+        BY_HANDLE_FILE_INFORMATION info{};
+        LARGE_INTEGER size{};
+        if( !GetFileInformationByHandle( m_handle, &info ) || !GetFileSizeEx( m_handle, &size ) || size.QuadPart < 0 )
+        {
+            const auto error = WindowsErrorMessage( "Read live journal identity" );
+            CloseHandle( m_handle );
+            m_handle = INVALID_HANDLE_VALUE;
+            throw std::runtime_error( error );
+        }
+        m_identity = { info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow };
+        m_size = uint64_t( size.QuadPart );
+    }
+    ~TailFileSource() override
+    {
+        if( m_handle != INVALID_HANDLE_VALUE ) CloseHandle( m_handle );
+    }
+    uint64_t Size() const override { return m_size; }
+    JournalFileIdentity Identity() const { return m_identity; }
+    bool Read( uint64_t offset, uint8_t* output, size_t size, std::string& error ) override
+    {
+        if( offset > m_size || size > m_size - offset || offset > INT64_MAX || size > MAXDWORD )
+        {
+            error = "live journal read exceeds snapshot range";
+            return false;
+        }
+        LARGE_INTEGER position;
+        position.QuadPart = int64_t( offset );
+        DWORD received = 0;
+        if( !SetFilePointerEx( m_handle, position, nullptr, FILE_BEGIN ) || !ReadFile( m_handle, output, DWORD( size ), &received, nullptr ) || received != size )
+        {
+            error = WindowsErrorMessage( "Read live journal bytes" );
+            return false;
+        }
+        m_reads += size;
+        return true;
+    }
+
+private:
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
+    JournalFileIdentity m_identity;
+    uint64_t m_size = 0;
+    uint64_t& m_reads;
+};
+std::array<uint8_t, 32> JournalDigest( ScanSource& source, uint64_t size, const std::function<bool()>& cancelled )
+{
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    struct Guard
+    {
+        BCRYPT_ALG_HANDLE& algorithm;
+        BCRYPT_HASH_HANDLE& hash;
+        ~Guard()
+        {
+            if( hash ) BCryptDestroyHash( hash );
+            if( algorithm ) BCryptCloseAlgorithmProvider( algorithm, 0 );
+        }
+    } guard{ algorithm, hash };
+    if( BCryptOpenAlgorithmProvider( &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0 ) != 0 || BCryptCreateHash( algorithm, &hash, nullptr, 0, nullptr, 0, 0 ) != 0 ) throw std::runtime_error( "Initialize live journal SHA256" );
+    std::array<uint8_t, ScanChunkSize> buffer;
+    std::string error;
+    for( uint64_t offset = 0; offset < size; )
+    {
+        if( cancelled && cancelled() ) throw std::runtime_error( "Cancelled" );
+        const auto count = size_t( std::min<uint64_t>( buffer.size(), size - offset ) );
+        if( !source.Read( offset, buffer.data(), count, error ) ) throw std::runtime_error( error );
+        if( BCryptHashData( hash, buffer.data(), ULONG( count ), 0 ) != 0 ) throw std::runtime_error( "Hash live journal prefix" );
+        offset += count;
+    }
+    std::array<uint8_t, 32> result;
+    if( BCryptFinishHash( hash, result.data(), ULONG( result.size() ), 0 ) != 0 ) throw std::runtime_error( "Finish live journal SHA256" );
+    return result;
+}
+// A duplicate is a transaction checkpoint: cancellation or a failed consumer
+// must leave the hash, just like the accepted scan cursor, unchanged.
+class IncrementalJournalHash
+{
+    struct Algorithm
+    {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        Algorithm()
+        {
+            if( BCryptOpenAlgorithmProvider( &handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0 ) != 0 ) throw std::runtime_error( "Initialize incremental journal SHA256" );
+        }
+        ~Algorithm() { if( handle ) BCryptCloseAlgorithmProvider( handle, 0 ); }
+    };
+    std::shared_ptr<Algorithm> algorithm;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+public:
+    IncrementalJournalHash() : algorithm( std::make_shared<Algorithm>() )
+    {
+        if( BCryptCreateHash( algorithm->handle, &hash, nullptr, 0, nullptr, 0, 0 ) != 0 ) throw std::runtime_error( "Create incremental journal SHA256" );
+    }
+    IncrementalJournalHash( const IncrementalJournalHash& other ) : algorithm( other.algorithm )
+    {
+        if( BCryptDuplicateHash( other.hash, &hash, nullptr, 0, 0 ) != 0 ) throw std::runtime_error( "Checkpoint incremental journal SHA256" );
+    }
+    ~IncrementalJournalHash() { if( hash ) BCryptDestroyHash( hash ); }
+    IncrementalJournalHash& operator=( const IncrementalJournalHash& ) = delete;
+    void Append( ScanSource& source, uint64_t begin, uint64_t end, const std::function<bool()>& cancelled, IncrementalJournalHash* batch = nullptr )
+    {
+        std::array<uint8_t, ScanChunkSize> buffer;
+        std::string error;
+        for( uint64_t offset = begin; offset < end; )
+        {
+            if( cancelled && cancelled() ) throw std::runtime_error( "Cancelled" );
+            const auto count = size_t( std::min<uint64_t>( buffer.size(), end - offset ) );
+            if( !source.Read( offset, buffer.data(), count, error ) ) throw std::runtime_error( error );
+            if( BCryptHashData( hash, buffer.data(), ULONG( count ), 0 ) != 0 ) throw std::runtime_error( "Hash appended journal bytes" );
+            if( batch && BCryptHashData( batch->hash, buffer.data(), ULONG( count ), 0 ) != 0 ) throw std::runtime_error( "Hash journal batch" );
+            offset += count;
+        }
+    }
+    std::array<uint8_t, 32> Digest() const
+    {
+        IncrementalJournalHash copy( *this );
+        std::array<uint8_t, 32> result;
+        if( BCryptFinishHash( copy.hash, result.data(), ULONG( result.size() ), 0 ) != 0 ) throw std::runtime_error( "Finish incremental journal SHA256" );
+        return result;
+    }
+};
+#endif
+
+ScanResult Scan( ScanSource& source, const ScanOptions& options, const ScanResult* prefix = nullptr )
+{
+    if( options.cancelled && options.cancelled() ) throw std::runtime_error( "Cancelled" );
     ScanResult result;
     result.fileSize = source.Size();
 
@@ -597,6 +791,26 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
     uint64_t expectedSequence = 1;
     uint64_t previousTimestamp = 0;
     bool ended = false;
+    if( prefix )
+    {
+        if( prefix->validSize > result.fileSize || EncodeFileHeader( prefix->header ) != fileHeaderBytes )
+        {
+            result.code = ScanCode::CorruptTail;
+            result.message = "journal prefix identity or length changed";
+            return result;
+        }
+        result.validSize = prefix->validSize;
+        result.recordCount = prefix->recordCount;
+        result.lastSequence = prefix->lastSequence;
+        result.lastMonotonicNs = prefix->lastMonotonicNs;
+        result.complete = prefix->complete;
+        result.prefixCrc32c = prefix->prefixCrc32c;
+        prefixState = Crc32cState( prefix->prefixCrc32c );
+        offset = prefix->validSize;
+        expectedSequence = prefix->lastSequence + 1;
+        previousTimestamp = prefix->lastMonotonicNs;
+        ended = prefix->complete;
+    }
     std::array<uint8_t, RecordHeaderSize> headerBytes = {};
     std::array<uint8_t, RecordTrailerSize> trailerBytes = {};
     std::array<uint8_t, ScanChunkSize> payloadBuffer = {};
@@ -607,9 +821,11 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         return result;
     };
 
-    while( offset < result.fileSize )
+    uint64_t newRecords = 0;
+    while( offset < result.fileSize && newRecords < options.maxNewRecords )
     {
         if(options.check)options.check();
+        if( options.cancelled && options.cancelled() ) throw std::runtime_error( "Cancelled" );
         if( ended )
         {
             return tailFailure( ScanCode::CorruptTail, "bytes follow the terminal SessionEnd record" );
@@ -677,6 +893,7 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         while( payloadRemaining != 0 )
         {
             if(options.check)options.check();
+            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "Cancelled" );
             const size_t chunk = size_t( std::min<uint64_t>( payloadRemaining, payloadBuffer.size() ) );
             if( !source.Read( payloadOffset, payloadBuffer.data(), chunk, result.message ) )
             {
@@ -729,6 +946,8 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         candidatePrefixState.Update( trailerBytes.data(), trailerBytes.size() );
 
         const auto type = RecordType( Get16( headerBytes.data(), 6 ) );
+        if( options.recordVisitor ) options.recordVisitor( RecordInfo {
+            offset, sequence, monotonicNs, payloadSize, Get32( headerBytes.data(), 8 ), type } );
         if( result.records.size() < options.maxCollectedRecords )
         {
             result.records.emplace_back( RecordInfo {
@@ -740,6 +959,7 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
                 type } );
         }
         result.recordCount++;
+        newRecords++;
         result.lastSequence = sequence;
         result.lastMonotonicNs = monotonicNs;
         result.validSize = offset + totalRecordSize;
@@ -755,7 +975,6 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
     result.message = result.complete ? "journal is complete" : "journal has a valid incomplete session";
     return result;
 }
-
 }
 
 uint32_t Crc32c( std::span<const uint8_t> bytes )
@@ -1046,6 +1265,118 @@ bool ScanResult::HasValidHeader() const
 bool ScanResult::HasRecoverablePrefix() const
 {
     return ( code == ScanCode::Ok || code == ScanCode::TruncatedTail || code == ScanCode::CorruptTail ) && validSize >= FileHeaderSize;
+}
+
+struct JournalTailReader::Impl
+{
+    std::filesystem::path path;
+    PrefixValidation validation = PrefixValidation::EveryPoll;
+    ScanResult snapshot;
+    uint64_t verifiedBytes = 0, observedSize = 0;
+    bool initialized = false, failed = false;
+#ifdef _WIN32
+    JournalFileIdentity identity;
+    std::array<uint8_t, 32> digest{};
+    std::unique_ptr<IncrementalJournalHash> hash;
+#endif
+};
+JournalTailReader::JournalTailReader( std::filesystem::path path, PrefixValidation validation )
+    : m_impl( std::make_unique<Impl>() )
+{
+    m_impl->path = std::move( path );
+    m_impl->validation = validation;
+}
+JournalTailReader::~JournalTailReader() = default;
+ScanResult JournalTailReader::Poll( const ScanOptions& options )
+{
+#ifdef _WIN32
+    auto& state = *m_impl;
+    if( options.cancelled && options.cancelled() ) throw std::runtime_error( "Cancelled" );
+    if( state.failed ) throw std::runtime_error( "Live journal identity failed; rebuild with a new reader" );
+    const auto fail = [&]( const std::string& error ) { state.failed = true; throw std::runtime_error( error ); };
+    state.verifiedBytes = 0;
+    TailFileSource source( state.path, state.verifiedBytes );
+    if( state.initialized )
+    {
+        if( source.Identity() != state.identity ) fail( "Live journal was replaced" );
+        if( source.Size() < state.observedSize ) fail( "Live journal was truncated" );
+        if( state.validation == PrefixValidation::EveryPoll && JournalDigest( source, state.snapshot.validSize, options.cancelled ) != state.digest ) fail( "Committed journal prefix was modified" );
+    }
+    ScanOptions validation = options;
+    validation.recordVisitor = {};
+    validation.maxCollectedRecords = 0;
+    const auto previous = state.initialized ? &state.snapshot : nullptr;
+    auto validated = Scan( source, validation, previous );
+    if( !state.initialized && validated.code == ScanCode::TruncatedFileHeader ) return validated;
+    if( validated.code != ScanCode::Ok && validated.code != ScanCode::TruncatedTail ) fail( validated.message );
+    const uint64_t begin = state.initialized ? state.snapshot.validSize : 0;
+    std::unique_ptr<IncrementalJournalHash> hash;
+    std::array<uint8_t, 32> digest, tailDigest;
+    if( state.validation == PrefixValidation::Deferred )
+    {
+        hash = state.hash ? std::make_unique<IncrementalJournalHash>( *state.hash ) : std::make_unique<IncrementalJournalHash>();
+        IncrementalJournalHash tail;
+        hash->Append( source, begin, validated.validSize, options.cancelled, &tail );
+        digest = hash->Digest();
+        tailDigest = tail.Digest();
+    }
+    else digest = JournalDigest( source, validated.validSize, options.cancelled );
+    uint64_t identityReads = 0;
+    if( TailFileSource( state.path, identityReads ).Identity() != source.Identity() ) fail( "Live journal path changed during validation" );
+    // Only the new tail is delivered. Deferred readers retain their unpublished
+    // transaction until the incremental prefix is checked against the source.
+    LimitedScanSource committed( source, validated.validSize );
+    auto delivered = Scan( committed, options, previous );
+    if( delivered.code != ScanCode::Ok || delivered.prefixCrc32c != validated.prefixCrc32c ) fail( "Live journal changed during tail delivery" );
+    if( state.validation == PrefixValidation::Deferred )
+    {
+        IncrementalJournalHash tail;
+        tail.Append( source, begin, validated.validSize, options.cancelled );
+        if( tail.Digest() != tailDigest ) fail( "Live journal changed during tail delivery" );
+    }
+    else if( JournalDigest( source, validated.validSize, options.cancelled ) != digest ) fail( "Live journal changed during publication" );
+    if( TailFileSource( state.path, identityReads ).Identity() != source.Identity() ) fail( "Live journal changed during publication" );
+    validated.records = std::move( delivered.records );
+    state.snapshot = validated;
+    state.snapshot.records.clear();
+    state.digest = digest;
+    state.hash = std::move( hash );
+    state.identity = source.Identity();
+    state.observedSize = source.Size();
+    state.initialized = true;
+    return validated;
+#else
+    (void)options;
+    throw std::runtime_error( "Live journal identity currently requires Windows" );
+#endif
+}
+const ScanResult& JournalTailReader::Snapshot() const { return m_impl->snapshot; }
+uint64_t JournalTailReader::VerifiedBytes() const { return m_impl->verifiedBytes; }
+std::array<uint8_t, 32> JournalTailReader::PrefixDigest() const
+{
+#ifdef _WIN32
+    return m_impl->digest;
+#else
+    return {};
+#endif
+}
+void JournalTailReader::VerifyPrefix( const std::function<bool()>& cancelled )
+{
+#ifdef _WIN32
+    auto& state = *m_impl;
+    if( cancelled && cancelled() ) throw std::runtime_error( "Cancelled" );
+    if( !state.initialized || state.failed ) throw std::runtime_error( "Live journal has no accepted prefix to verify" );
+    const auto fail = [&]( const char* error ) { state.failed = true; throw std::runtime_error( error ); };
+    TailFileSource source( state.path, state.verifiedBytes );
+    if( source.Identity() != state.identity ) fail( "Live journal was replaced" );
+    if( source.Size() < state.observedSize ) fail( "Live journal was truncated" );
+    if( JournalDigest( source, state.snapshot.validSize, cancelled ) != state.digest ) fail( "Committed journal prefix was modified" );
+    uint64_t reads = 0;
+    if( TailFileSource( state.path, reads ).Identity() != state.identity ) fail( "Live journal path changed during verification" );
+#else
+    (void)cancelled;
+    throw std::runtime_error( "Live journal identity currently requires Windows" );
+#endif
 }
 
 ScanResult ScanJournal( const std::filesystem::path& path, const ScanOptions& options )

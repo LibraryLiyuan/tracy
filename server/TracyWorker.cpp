@@ -1667,6 +1667,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             {
                 s_loadProgress.subProgress.store( i, std::memory_order_relaxed );
                 auto fi = m_slab.Alloc<FrameImage>();
+                fi->frameRef = UINT32_MAX; // Old snapshots cannot recover unassociated image indices.
                 f.Read3( fi->w, fi->h, fi->flip );
                 const auto sz = size_t( fi->w * fi->h / 2 );
 
@@ -2178,6 +2179,48 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 jn.gpuCatalogValid = false;
                 for( auto& generation : jn.gpuCatalogGenerations ) generation.valid = 0;
             }
+        }
+    }
+
+    bool readImageRefs=false,readParameters=false;
+    while( fileVer >= FileVersion( 0, 13, 2 ) && f.HasData() )
+    {
+        uint32_t magic;
+        uint16_t version;
+        uint64_t count;
+        f.Read3( magic, version, count );
+        if( count > JnTraceMaxRecordsPerDomain ) throw LoadFailure("Invalid optional JN footer count.");
+        if(magic==JnParametersMagic)
+        {
+            if(readParameters || version!=JnParametersVersion)throw LoadFailure("Invalid parameter footer.");
+            readParameters=true;
+            for(uint64_t n=0;n<count;++n)
+            {
+                uint32_t index;StringRef name;uint8_t flags,isBool;int32_t value;
+                f.Read5(index,name.str,flags,isBool,value);
+                if(flags>3 || isBool>1 || ((flags&3)==3 && name.str>=m_data.stringData.size()) || ((flags&3)==2 && !m_data.strings.contains(name.str)))throw LoadFailure("Invalid parameter definition.");
+                name.__data=flags;m_params.push_back(Parameter{index,name,bool(isBool),value});
+            }
+            continue;
+        }
+        if( readImageRefs || magic != JnFrameImageRefsMagic || version != JnFrameImageRefsVersion )
+            throw LoadFailure( "Invalid Frame Image reference footer." );
+        readImageRefs=true;
+        uint64_t previous = 0;
+        for( uint64_t n = 0; n < count; ++n )
+        {
+            uint64_t image;
+            uint32_t frame;
+            f.Read2( image, frame );
+            if( ( n && image <= previous ) || frame < m_data.framesBase->frames.size() )
+                throw LoadFailure( "Invalid unassociated Frame Image reference." );
+            if( eventMask & EventType::FrameImages )
+            {
+                if( image >= m_data.frameImage.size() || m_data.frameImage[image]->frameRef != UINT32_MAX )
+                    throw LoadFailure( "Frame Image footer conflicts with the frame timeline." );
+                m_data.frameImage[image]->frameRef = frame;
+            }
+            previous = image;
         }
     }
 
@@ -5146,24 +5189,28 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
         }
         break;
     case QueueType::JnJobStage:
-        RecorderCheckCurrentThread();
         if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack ||
             JnJobStage( ev.jnJobStage.stage ) == JnJobStage::WaitCallstack )
         {
+            // Serial stack packets do not update the LFQ thread context. An
+            // image-compression packet may have left that context on DXT1.
+            CheckThreadString( ev.jnJobStage.arg0 );
             if( !m_recorderSerialCallstack ) RecorderFail( "JN Job stage is missing its serial callstack." );
             m_recorderSerialCallstack = false;
         }
+        else RecorderCheckCurrentThread();
         break;
     case QueueType::JnGpuZoneBeginCallsite:
         CheckSourceLocation( ev.jnGpuZoneBeginCallsite.srcloc );
         break;
     case QueueType::JnIoStage:
-        RecorderCheckCurrentThread();
         if( JnIoStage( ev.jnIoStage.stage ) == JnIoStage::RequestCallstack )
         {
+            CheckThreadString( ev.jnIoStage.detail );
             if( !m_recorderSerialCallstack ) RecorderFail( "JN I/O stage is missing its serial callstack." );
             m_recorderSerialCallstack = false;
         }
+        else RecorderCheckCurrentThread();
         break;
     default:
         RecorderFail( "Unsupported fixed-size protocol event." );
@@ -5864,7 +5911,7 @@ uint32_t Worker::StoreCallstackFrames( const CallstackFrameId* frames, uint16_t 
             auto* array = m_slab.Alloc<VarArray<CallstackFrameId>>();
             new( array ) VarArray<CallstackFrameId>( size, reinterpret_cast<const CallstackFrameId*>( stored ) );
             m_data.callstackPayload.push_back( array );
-            if( queryFrames ) for( const auto& frame : *array ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
+            if( queryFrames ) for( const auto& frame : *array ) if( frame.sel == 0 ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
         }
         else
         {
@@ -5885,7 +5932,7 @@ uint32_t Worker::StoreCallstackFrames( const CallstackFrameId* frames, uint16_t 
         m_data.callstackMap.emplace( arr, idx );
         m_data.callstackPayload.push_back( arr );
 
-        if( queryFrames ) for( const auto& frame : *arr ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
+        if( queryFrames ) for( const auto& frame : *arr ) if( frame.sel == 0 ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
     }
     else
     {
@@ -12058,6 +12105,31 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteCatalogVector(f,m_data.jnTrace.gpuRangeSets,m_offlineStorage,OfflineCatalogDomain::CatalogRangeSet);
     WriteCatalogVector(f,m_data.jnTrace.gpuDetailedEvidence,m_offlineStorage,OfflineCatalogDomain::CatalogDetailedEvidence);
     if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_catalog",OfflineCatalogDomainCount,OfflineCatalogDomainCount,"domains");
+    const auto frameCount = m_data.framesBase->frames.size();
+    uint64_t unassociatedImages = 0;
+    for( const auto& image : m_data.frameImage ) if( image->frameRef >= frameCount ) ++unassociatedImages;
+    if( unassociatedImages )
+    {
+        f.Write( &JnFrameImageRefsMagic, sizeof( JnFrameImageRefsMagic ) );
+        f.Write( &JnFrameImageRefsVersion, sizeof( JnFrameImageRefsVersion ) );
+        f.Write( &unassociatedImages, sizeof( unassociatedImages ) );
+        for( uint64_t image = 0; image < m_data.frameImage.size(); ++image )
+        {
+            const auto frame = m_data.frameImage[image]->frameRef;
+            if( frame < frameCount ) continue;
+            f.Write( &image, sizeof( image ) );
+            f.Write( &frame, sizeof( frame ) );
+        }
+    }
+    if(!m_params.empty())
+    {
+        const uint64_t count=m_params.size();f.Write(&JnParametersMagic,sizeof(JnParametersMagic));f.Write(&JnParametersVersion,sizeof(JnParametersVersion));f.Write(&count,sizeof(count));
+        for(const auto& p:m_params)
+        {
+            const uint8_t flag=p.name.__data,isBool=p.isBool?1:0;
+            f.Write(&p.idx,sizeof(p.idx));f.Write(&p.name.str,sizeof(p.name.str));f.Write(&flag,sizeof(flag));f.Write(&isBool,sizeof(isBool));f.Write(&p.val,sizeof(p.val));
+        }
+    }
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

@@ -18,7 +18,22 @@ std::string Sha256(const fs::path &path);
 void AtomicJson(const fs::path &path, const Json &data);
 Json ReadJson(const fs::path &path);
 bool ValidName(const std::string &name);
-bool CanPublish(bool validated, bool identityMatches, bool recoverable);
+bool CaptureConnectionTimedOut(bool receivedData, bool latestStatusHasData, uint64_t idleMs);
+// A CPU set as Windows reports it.
+struct CpuSet
+{
+    uint32_t id = 0;
+    uint8_t efficiencyClass = 0;
+    uint8_t logical = 0;
+};
+// The efficiency cores of a hybrid CPU: the sets of the lowest efficiency class
+// when there is more than one class, otherwise none.
+std::vector<CpuSet> EfficiencyCpuSets(const std::vector<CpuSet> &all);
+std::vector<CpuSet> SystemCpuSets();
+// Keeps a process's threads on the given CPU sets; an empty list lifts the
+// restriction. False when Windows has no CPU sets or refuses.
+bool SetProcessCpuSets(HANDLE process, const std::vector<CpuSet> &sets);
+void PreferBundledTools(struct Settings &settings, const fs::path &directory);
 fs::path NewTaskDirectory(const fs::path &root, const std::string &name);
 fs::path ExecutableDirectory();
 fs::path SettingsDirectory();
@@ -27,8 +42,10 @@ std::string ChoosePath(HWND owner, bool folder, const wchar_t *filter = L"All fi
 struct Settings
 {
     std::string player, workingDirectory, arguments, ini, output, toolDirectory, viewer, name, scene, note;
-    bool admin = true, existing = false, ready = false, timed = false, sound = true;
+    bool admin = true, existing = false, ready = false, timed = false, sound = true, customTools = false;
     int seconds = 60, port = 8086, drainSeconds = 30, hotkey = VK_F9;
+    // Recordings at least this many minutes long are published as their
+    // journal and event store instead of a .tracy file; 0 always does.
     unsigned hotkeyModifiers = MOD_CONTROL | MOD_SHIFT;
     uint64_t warnGiB = 50, stopGiB = 20, memoryMiB = 8192;
     DWORD targetPid = 0;

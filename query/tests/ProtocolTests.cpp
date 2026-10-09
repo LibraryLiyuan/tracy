@@ -64,6 +64,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "memory.get" ) params["ref"] = "fake:memory-event:0";
     if( method == "memory.active_at_time" ) params["time_ns"] = "50";
     if( method == "memory.frame_snapshot" ) params["frame_index"] = 0;
+    if( method == "gpu.frame.resources" ) params["frame_index"] = 0;
     if( method == "memory.diff" ) { params["base_frame_index"] = 0; params["target_frame_index"] = 0; }
     if( method == "lock.get" ) params["ref"] = "fake:lock:1";
     if( method == "lock.timeline" ) params["lock_ref"] = "fake:lock:1";
@@ -177,7 +178,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 21 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 43 );
+    assert( coverage.at( "domains" ).size() == 44 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "partial" );
     assert( coverage.at( "field_status" ) == "complete" );

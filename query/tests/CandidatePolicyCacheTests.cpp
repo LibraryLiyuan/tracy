@@ -129,7 +129,7 @@ void WriteNeutral(const std::filesystem::path& root,const CandidatePolicyInput& 
     NeutralStatisticsStreamSummary summary; summary.qualityComplete=true;
     summary.signatureCount=input.aggregate.signatures.size(); summary.domains=input.aggregate.domains; w.Commit(summary);
 }
-void CachedParity(const std::filesystem::path& root, bool local=false, bool fallback=false)
+void CachedParity(const std::filesystem::path& root, bool local=false, bool fallback=false, size_t workers=1)
 {
     auto input=Fixture(root,local);
     if(fallback)
@@ -165,6 +165,7 @@ void CachedParity(const std::filesystem::path& root, bool local=false, bool fall
     auto metadata=input; metadata.aggregate.signatures.clear(); metadata.aggregate.rankings.clear(); metadata.signatures.clear();
     NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
     CandidatePolicyCacheOptions options; options.table.blockBytes=16384; options.sortBufferBytes=32768;
+    options.workers=workers;
     std::ostringstream phaseLog;
     const auto oldError=std::cerr.rdbuf(phaseLog.rdbuf());
     std::string policyId;
@@ -1003,6 +1004,9 @@ int main(int argc,char** argv)
         if(argc==2 && std::string(argv[1])=="--scale-dense-series") { DenseSeriesScale(root); std::filesystem::remove_all(root); return 0; }
         if(argc==3 && std::string(argv[1])=="--scale-policy") { Scale(root,std::stoull(argv[2])); std::filesystem::remove_all(root); return 0; }
         TopInputBinaryRoundTrip();
+        CachedParity(root/"parallel-global",false,false,4);
+        CachedParity(root/"parallel-local",true,false,4);
+        CachedParity(root/"parallel-fallback",true,true,4);
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
         CandidateJoinWorkspace(root/"candidate-join");

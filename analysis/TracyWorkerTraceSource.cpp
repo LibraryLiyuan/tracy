@@ -669,6 +669,18 @@ public:
 
     void BuildIndexes()
     {
+        // The Worker rebuilds each memory pool's plot on its own background
+        // thread and inserts it at the front when done, so the order of memory
+        // plots follows thread timing. Keep them in front of the other plots
+        // (whose order is the file's) but order them by name, so plot and
+        // plot-point refs are the same on every load.
+        for( const auto* plot : worker->GetPlots() ) plots.push_back( plot );
+        const auto memoryEnd = std::stable_partition( plots.begin(), plots.end(), []( const PlotData* plot ) { return plot->type == PlotType::Memory; } );
+        std::stable_sort( plots.begin(), memoryEnd, [this]( const PlotData* lhs, const PlotData* rhs ) {
+            const std::string a = lhs->name == 0 ? "Default allocator" : Safe( worker->GetString( lhs->name ) );
+            const std::string b = rhs->name == 0 ? "Default allocator" : Safe( worker->GetString( rhs->name ) );
+            return a != b ? a < b : lhs->name < rhs->name;
+        } );
         for( const auto& callsite : worker->GetJnTraceData().callsites )
         {
             callsitesByZone.emplace( CallsiteZoneKey( callsite.sourceLocation, callsite.callstack ), &callsite );
@@ -730,6 +742,7 @@ public:
     std::vector<uint64_t> symbols;
     std::unordered_map<uint64_t, const JnCallsiteData*> callsitesByZone;
     std::unordered_map<uint32_t, const JnCallsiteData*> callsitesById;
+    std::vector<const PlotData*> plots;
     mutable std::mutex readMutex;
 };
 
@@ -1434,6 +1447,9 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto info = GetTraceInfoMetadata();
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
+    const auto plots = GetPlotList();
+    const bool hasVramPlots = std::any_of( plots.begin(), plots.end(), []( const auto& plot ) {
+        return plot.name.rfind( "GPU.DXGI.", 0 ) == 0 || plot.name.rfind( "GPU.VRAM.", 0 ) == 0; } );
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
     const auto& jnTrace = m_impl->worker->GetJnTraceData();
     const bool hasIo = jnTrace.schemaVersion >= 3 && ( !jnTrace.ioRequests.empty() || !jnTrace.ioStages.empty() );
@@ -1515,6 +1531,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             hasStructuredGc ? "" : "trace predates or did not emit JNGC1" ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
+        capability( "gpu.vram", hasVramPlots, true, { "gpu.vram.summary", "gpu.vram.resources", "gpu.vram.resource_growth", "gpu.frame.resources" },
+            hasVramPlots ? "DXGI and engine GPU memory plots are present" : "trace contains no GPU.DXGI or GPU.VRAM plots" ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
         capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "job.gfx", hasJnTrace, true, { "job.gfx.statistics", "job.gfx_chain" }, hasJnTrace ? "JN Graphics Jobs schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
@@ -1881,7 +1899,7 @@ std::vector<PlotDto> WorkerTraceSource::GetPlotList() const
     std::lock_guard lock( m_impl->readMutex );
     std::vector<PlotDto> result;
     auto& worker = *m_impl->worker;
-    const auto& plots = worker.GetPlots();
+    const auto& plots = m_impl->plots;
     result.reserve( plots.size() );
     for( size_t i = 0; i < plots.size(); i++ )
     {
@@ -2085,7 +2103,7 @@ std::vector<PlotPointDto> WorkerTraceSource::ScanPlots( const ScanRange& range )
     std::lock_guard lock( m_impl->readMutex );
     std::vector<PlotPointDto> result;
     size_t skipped = 0;
-    const auto& plots = m_impl->worker->GetPlots();
+    const auto& plots = m_impl->plots;
     for( size_t plotIndex = 0; plotIndex < plots.size(); plotIndex++ )
     {
         const auto* plot = plots[plotIndex];
@@ -2102,6 +2120,26 @@ std::vector<PlotPointDto> WorkerTraceSource::ScanPlots( const ScanRange& range )
         }
     }
     return result;
+}
+
+void WorkerTraceSource::VisitTopLevelGpuZones( const std::function<void( size_t, int64_t, int64_t )>& visit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    for( const auto& entry : m_impl->gpuZones )
+    {
+        if( entry.parent ) continue;
+        const auto start = entry.zone->GpuStart();
+        const auto end = entry.zone->GpuEnd();
+        if( start >= 0 && end >= start ) visit( entry.context, start, end );
+    }
+}
+
+void WorkerTraceSource::VisitPlotPoints( std::string_view plotRef, const std::function<void( int64_t, double )>& visit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto index = m_impl->ParseRef( plotRef, "plot" );
+    if( !index || *index >= m_impl->plots.size() ) return;
+    for( const auto& point : m_impl->plots[size_t( *index )]->data ) visit( point.time.Val(), point.val );
 }
 
 std::vector<std::string> WorkerTraceSource::ScanLocks( const ScanRange& range ) const
@@ -3010,6 +3048,43 @@ std::vector<CallsiteDto> WorkerTraceSource::ScanCallsites( size_t offset, size_t
     return result;
 }
 
+std::vector<JnGpuReferencePassData> WorkerTraceSource::ScanGpuReferencePasses( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferencePasses;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU pass page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
+std::vector<JnGpuReferenceUseData> WorkerTraceSource::ScanGpuReferenceUses( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferenceUses;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU use page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
+std::vector<JnGpuReferenceEndData> WorkerTraceSource::ScanGpuReferenceEnds( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex ); const auto& values = m_impl->worker->GetJnTraceData().gpuReferenceEnds;
+    if( limit > 4096 ) throw std::invalid_argument( "GPU end page limit exceeded" );
+    if( offset >= values.size() ) return {}; return { values.begin() + offset, values.begin() + offset + std::min( limit, values.size() - offset ) };
+}
+std::optional<GpuReferenceRange> WorkerTraceSource::ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& jn = m_impl->worker->GetJnTraceData();
+    if( jn.gpuReferencePasses.empty() ) return std::nullopt;
+    GpuReferenceRange result;
+    for( const auto& pass : jn.gpuReferencePasses )
+        if( pass.time >= begin && pass.time < end ) result.passes.push_back( { pass.passId, pass.time, pass.taxonomyId, pass.taxonomyLevel } );
+    // A set's resources carry the time its pass began, so they are in range
+    // exactly when their pass is.
+    for( const auto& use : jn.gpuReferenceUses )
+    {
+        if( use.time < begin || use.time >= end || use.resourceId == 0 ) continue;
+        if( result.uses.size() == maxUses ) { result.truncated = true; break; }
+        result.uses.push_back( { use.resourceId, use.passId, use.time, use.usageMask } );
+    }
+    return result;
+}
+
 std::shared_ptr<const tracy::JnTraceData> WorkerTraceSource::GetGpuCatalogData() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -3396,7 +3471,7 @@ std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( 
             dto.startNs = event.Start();
             if( complete ) dto.endNs = end;
             dto.rawThreadIndex = event.Thread();
-            dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( event.Thread() ) );
+            dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThreadExternal( event.Thread() ) );
             dto.complete = complete;
             result.emplace_back( std::move( dto ) );
             if( result.size() >= range.limit ) return result;

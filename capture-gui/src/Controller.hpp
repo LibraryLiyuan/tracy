@@ -7,9 +7,13 @@ namespace capturegui
 struct ViewState
 {
     std::string state = "ready", message = "准备好场景后开始录制", directory, stage, quality, actualConfig;
+    // The current step of the stage, shown with its progress.
+    std::string progressText;
     bool busy = false, gameMayClose = false;
     uint64_t elapsedMs = 0, streamBytes = 0, memoryBytes = 0, freeBytes = 0;
     double percent = -1;
+    double recordingBytesPerSecond = 0, remainingDiskSeconds = -1;
+    uint64_t committedBytes = 0, durableBytes = 0, backpressureWaits = 0;
     Json task = Json::object();
     ProcessIdentity target;
 };
@@ -20,7 +24,7 @@ class Controller
     ViewState Snapshot();
     bool Launch(const Settings &settings);
     bool Start(const Settings &settings, ProcessIdentity target);
-    bool Recover(const fs::path &directory);
+    bool Recover(const fs::path &directory, const Settings *currentTools = nullptr);
     void Stop();
     void ForceClose();
     void Reset();

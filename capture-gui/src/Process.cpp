@@ -15,7 +15,7 @@ Process::~Process()
     if (m_process)
         CloseHandle(m_process);
 }
-void Process::Start(const fs::path &exe, const std::vector<std::string> &args, const fs::path &log, bool pipe)
+void Process::Start(const fs::path &exe, const std::vector<std::string> &args, const fs::path &log, bool pipe, bool background)
 {
     if (m_process)
         throw std::runtime_error("Process already assigned");
@@ -56,7 +56,8 @@ void Process::Start(const fs::path &exe, const std::vector<std::string> &args, c
     startup.hStdOutput = output;
     startup.hStdError = file;
     PROCESS_INFORMATION info{};
-    BOOL ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+    const DWORD flags = CREATE_NO_WINDOW | (background ? BELOW_NORMAL_PRIORITY_CLASS : 0);
+    BOOL ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, flags, nullptr,
                              exe.parent_path().c_str(), &startup, &info);
     auto error = GetLastError();
     cleanup();
@@ -70,7 +71,8 @@ void Process::Adopt(const ProcessIdentity &identity)
 {
     if (m_process)
         throw std::runtime_error("Process already assigned");
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE | SYNCHRONIZE,
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE | SYNCHRONIZE |
+                               PROCESS_SET_LIMITED_INFORMATION,
                            FALSE, identity.pid);
     if (!h)
         throw std::runtime_error(ErrorText());

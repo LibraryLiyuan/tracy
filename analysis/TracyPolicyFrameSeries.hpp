@@ -7,8 +7,10 @@
 #include "TracyPagedRecordStore.hpp"
 #include <array>
 #include <bit>
+#include <cstring>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 namespace tracy::analysis
@@ -36,6 +38,59 @@ inline void WritePolicyFrameSeries( std::ostream& output, PolicySignatureContext
         PolicySeriesRecord row { frame.frameIndex, uint64_t( frame.inclusiveNs ),
             uint64_t( frame.exclusiveNs ), uint64_t( frame.waitNs ), uint64_t( frame.criticalPathNs ),
             frame.occurrenceCount, frame.exact ? 1ULL : 0ULL };
+        output.write( reinterpret_cast<const char*>( row.data() ), sizeof( row ) );
+        hash.Update( row.data(), sizeof( row ) );
+    }
+    if( !output ) throw std::runtime_error( "frame_series_write_failed" );
+    context.seriesSha256 = hash.FinalHex();
+    context.frameSeriesComplete = true;
+}
+
+// The rows WritePolicyFrameSeries writes for these frames. Sets the context's
+// series count, hash and completeness; the caller writes the rows and sets
+// the offset they were written at.
+inline std::string EncodePolicyFrameSeries( PolicySignatureContext& context,
+    const std::vector<NeutralMergedFrameValues>& frames )
+{
+    if(frames.size()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("analysis_scan_cache_disk_budget");
+    std::string bytes( frames.size() * sizeof( PolicySeriesRecord ), '\0' );
+    for( size_t i = 0; i < frames.size(); ++i )
+    {
+        const auto& frame = frames[i];
+        const PolicySeriesRecord row { frame.frameIndex, uint64_t( frame.inclusiveNs ),
+            uint64_t( frame.exclusiveNs ), uint64_t( frame.waitNs ), uint64_t( frame.criticalPathNs ),
+            frame.occurrenceCount, frame.exact ? 1ULL : 0ULL };
+        std::memcpy( bytes.data() + i * sizeof( row ), row.data(), sizeof( row ) );
+    }
+    Sha256Builder hash;
+    hash.Update( bytes.data(), bytes.size() );
+    context.seriesCount = frames.size();
+    context.seriesSha256 = hash.FinalHex();
+    context.frameSeriesComplete = true;
+    return bytes;
+}
+
+// A frame root's timeline in the same rows: the frame value fills every
+// metric column, so the context's metric preference reads it back. Only the
+// frame index, value and exactness are kept; the timeline's evidence carries
+// no references, structure key or time range.
+inline void WritePolicyFrameSeries( std::ostream& output, PolicySignatureContext& context,
+    const std::vector<PolicyFrameEvidence>& frames, const std::shared_ptr<AnalysisDiskBudget>& disk = {} )
+{
+    if(frames.size()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("analysis_scan_cache_disk_budget");
+    for( const auto& frame : frames )
+        if( !frame.eventRefs.empty() || !frame.structureKey.empty() || frame.beginNs || frame.endNs || frame.valueNs < 0 )
+            throw std::runtime_error( "frame_series_timeline_unsupported" );
+    AnalysisDiskGrow(disk,uint64_t(frames.size())*sizeof(PolicySeriesRecord));
+    const auto offset = output.tellp();
+    if( offset < 0 ) throw std::runtime_error( "frame_series_position_failed" );
+    context.seriesOffset = uint64_t( offset );
+    context.seriesCount = frames.size();
+    Sha256Builder hash;
+    for( const auto& frame : frames )
+    {
+        const auto value = uint64_t( frame.valueNs );
+        PolicySeriesRecord row { frame.frameIndex, value, value, value, value, 0, frame.exact ? 1ULL : 0ULL };
         output.write( reinterpret_cast<const char*>( row.data() ), sizeof( row ) );
         hash.Update( row.data(), sizeof( row ) );
     }

@@ -8,6 +8,7 @@
 #include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyAnalysisProcessMemory.hpp"
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyWindowedTraceSource.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -62,6 +63,9 @@ struct AnalysisScanProducts
     std::filesystem::path frameSeriesPath;
 };
 
+// Half the hardware threads, between 1 and 8.
+size_t DefaultAnalysisZoneWorkers();
+
 struct AnalysisScanExecutionRequest
 {
     std::string scanId;
@@ -76,6 +80,9 @@ struct AnalysisScanExecutionRequest
     std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace;
     std::function<void()> checkDiskSpace;
     std::shared_ptr<analysis::AnalysisDiskBudget> disk;
+    // Threads for the CPU frame scan of a source with compact zone records;
+    // 0 reads zone DTOs on the scan thread. The result does not depend on it.
+    size_t zoneWorkers = DefaultAnalysisZoneWorkers();
 };
 
 using AnalysisScanProgressCallback = std::function<void(
@@ -103,6 +110,8 @@ struct AnalysisScanStartRequest
     std::shared_ptr<QueryResourceContext> resourceContext;
     nlohmann::json normalizedProfile;
     std::string profileIdentity;
+    // Normalized windows the scan is restricted to; empty scans the whole capture.
+    std::vector<analysis::AnalysisTimeWindow> windows;
 };
 
 struct AnalysisScanSnapshot
@@ -117,6 +126,7 @@ struct AnalysisScanSnapshot
     std::string stage;
     std::string error;
     analysis::AnalysisProcessMemorySnapshot processMemory;
+    std::vector<analysis::AnalysisTimeWindow> windows;
 };
 
 nlohmann::json AnalysisProcessMemorySnapshotJson(const analysis::AnalysisProcessMemorySnapshot& value);

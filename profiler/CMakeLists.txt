@@ -92,6 +92,8 @@ set(SERVER_FILES
     TracyTimelineItemGpu.cpp
     TracyTimelineItemPlot.cpp
     TracyTimelineItemThread.cpp
+    TracyTimelineItemUsage.cpp
+    TracyTimelineItemVram.cpp
     TracyUserData.cpp
     TracyUtility.cpp
     TracyView.cpp
@@ -130,6 +132,8 @@ set(SERVER_FILES
     TracyView_Utility.cpp
     TracyView_ZoneInfo.cpp
     TracyView_ZoneTimeline.cpp
+    TracyUsage.cpp
+    TracyVram.cpp
     TracyWeb.cpp
 )
 
@@ -263,6 +267,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     nlohmann_json::nlohmann_json
     md4c
 )
+
+if(WIN32)
+    include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream_store.cmake)
+    target_sources(${PROJECT_NAME} PRIVATE src/profiler/TracyStreamingView.cpp src/profiler/TracyStreamingTimeline.cpp)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TRACY_STREAM_VIEW=1)
+    target_link_libraries(${PROJECT_NAME} PRIVATE TracyEventStore)
+endif()
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${tidy_SOURCE_DIR}/include
 )

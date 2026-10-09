@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -25,9 +26,12 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -51,6 +55,13 @@ std::string HashText( std::string_view value )
     return hash.FinalHex();
 }
 
+json WindowsJson( const std::vector<AnalysisTimeWindow>& windows )
+{
+    json result = json::array();
+    for( const auto& window : windows ) result.push_back( json::array( { window.startNs, window.endNs } ) );
+    return result;
+}
+
 AnalysisProcessMemoryOptions ProfileMemoryOptions(AnalysisProcessMemoryOptions options,const json& profile)
 {
     // A Profile may tighten the process limit, never raise the Manager's
@@ -70,8 +81,12 @@ public:
         :m_roots(std::move(roots)),m_minimum(minimum),m_available(std::move(available)) {}
     void Check(bool force=false)
     {
-        std::lock_guard lock(m_mutex);
+        // Scan loops call this for every event; between checks only every
+        // 256th call of this guard reads the clock, without taking the lock.
+        if(!force && (m_calls.fetch_add(1,std::memory_order_relaxed) & 255)!=0) return;
         const auto now=std::chrono::steady_clock::now();
+        if(!force && now.time_since_epoch().count()<m_nextTicks.load(std::memory_order_relaxed)) return;
+        std::lock_guard lock(m_mutex);
         if(!force && now<m_next) return;
         for(const auto& root:m_roots)
         {
@@ -83,12 +98,15 @@ public:
             if(available<m_minimum) throw std::runtime_error("analysis_scan_minimum_free_disk");
         }
         m_next=now+std::chrono::milliseconds(100);
+        m_nextTicks.store(m_next.time_since_epoch().count(),std::memory_order_relaxed);
     }
 private:
     std::array<std::filesystem::path,2> m_roots;
     uint64_t m_minimum;
     std::function<uint64_t(const std::filesystem::path&)> m_available;
     std::chrono::steady_clock::time_point m_next{};
+    std::atomic<std::chrono::steady_clock::rep> m_nextTicks{0};
+    std::atomic<uint32_t> m_calls{0};
     std::mutex m_mutex;
 };
 
@@ -492,6 +510,11 @@ void CheckGenerationDiskBudget( const std::filesystem::path& root,uint64_t limit
 
 }
 
+size_t DefaultAnalysisZoneWorkers()
+{
+    return std::clamp<size_t>( std::thread::hardware_concurrency() / 2, 1, 8 );
+}
+
 bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
     std::stop_token stopToken, const AnalysisScanProgressCallback& progress,
     AnalysisScanProducts& products, std::string& error )
@@ -532,6 +555,7 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             std::cerr << "Query scan-progress stage=" << stage << " completed=" << completed <<
                 " total=" << total << '\n';
         } );
+        statistics.SetFinishWorkers( request.zoneWorkers );
         NeutralStatisticsCacheOptions cacheOptions;
         cacheOptions.table.cancelled = cancelled;
         cacheOptions.table.workspace = workspace;
@@ -741,6 +765,8 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
                 << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - cpuProgressStarted ).count() << '\n';
         };
+        cpuOptions.zoneWorkers = request.zoneWorkers;
+        cpuOptions.runRefs = false;
         auto cpuDefinitionOutput = std::make_unique<AnalysisCacheSortedWriter>( cpuDefinitionsPath,
             products.neutralCacheIdentity, "cpu-definitions-v1", cacheOptions.table );
         cpuOptions.definitionSink = [&]( const CpuSignatureDefinition& definition ) {
@@ -1145,10 +1171,6 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         const auto selectEvidence = [&]( const NeutralSignatureAggregate& aggregate,
             const std::vector<NeutralMergedFrameValues>& frames, PolicySignatureContext& context ) {
             if( frames.empty() ) return;
-            // Preserve all numeric rows on disk before choosing UI representatives.
-            // Job origin IDs are not Player.Frame indexes. CPU uses actual
-            // FrameSet boundaries; GPU uses explicitly typed L0 segments.
-            if( context.domain == "cpu" || context.domain == "gpu" ) WritePolicyFrameSeries( seriesOutput, context, frames,request.disk );
             const auto value = [&]( const NeutralMergedFrameValues& frame ) {
                 if( context.metricPreference == "wait" ) return frame.waitNs;
                 if( context.metricPreference == "inclusive" ) return frame.inclusiveNs;
@@ -1168,21 +1190,24 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             std::vector<const NeutralMergedFrameValues*> ordered;
             ordered.reserve( frames.size() );
             for( const auto& frame : frames ) ordered.push_back( &frame );
-            std::partial_sort( ordered.begin(), ordered.begin() + std::min<size_t>( 3, ordered.size() ),
-                ordered.end(), [&]( const auto* left, const auto* right ) {
+            const auto largest = std::min<size_t>( 3, ordered.size() );
+            std::partial_sort( ordered.begin(), ordered.begin() + largest, ordered.end(), [&]( const auto* left, const auto* right ) {
                 if( value( *left ) != value( *right ) ) return value( *left ) > value( *right );
                 return left->frameIndex < right->frameIndex;
             } );
-            for( size_t index = 0; index < std::min<size_t>( 3, ordered.size() ); ++index ) add( *ordered[index] );
+            for( size_t index = 0; index < largest; ++index ) add( *ordered[index] );
             const auto p95 = metric->perCompleteFrame.p95;
-            std::partial_sort( ordered.begin(), ordered.begin() + std::min<size_t>( 2, ordered.size() ),
-                ordered.end(), [&]( const auto* left, const auto* right ) {
+            const auto nearP95 = [&]( const auto* left, const auto* right ) {
                 const auto lhs = std::abs( double( value( *left ) ) - p95 );
                 const auto rhs = std::abs( double( value( *right ) ) - p95 );
                 if( lhs != rhs ) return lhs < rhs;
                 return left->frameIndex < right->frameIndex;
-            } );
-            for( size_t index = 0; index < std::min<size_t>( 2, ordered.size() ); ++index ) add( *ordered[index] );
+            };
+            const auto nearest = std::min<size_t>( 2, ordered.size() );
+            // A NaN p95 makes the order partial; keep the full sort's choice then.
+            if( std::isnan( p95 ) ) std::sort( ordered.begin(), ordered.end(), nearP95 );
+            else std::partial_sort( ordered.begin(), ordered.begin() + nearest, ordered.end(), nearP95 );
+            for( size_t index = 0; index < nearest; ++index ) add( *ordered[index] );
             if( metric->longestBurstFrames >= 3 && metric->longestBurstStartFrame &&
                 metric->longestBurstEndFrame && metric->longestBurstPeakFrame )
             {
@@ -1227,10 +1252,23 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         NeutralStatisticsCacheWriter cache( products.neutralCachePath,
             products.neutralCacheIdentity, cacheOptions );
         NeutralStatisticsStreamSummary summary;
-        const auto persistSignature = [&]( const NeutralSignatureAggregate& aggregate,
-            const std::vector<NeutralMergedFrameValues>& frames ) {
-            AnalysisWorkspaceReservation decodedWorkspace( workspace );
-            PolicySignatureContext decoded;
+        // A signature's context, representatives, series rows and statistics
+        // record are prepared where it is computed (a Finish worker); the
+        // sink writes them in signature order.
+        struct PreparedSignature
+        {
+            AnalysisWorkspaceReservation workspace;
+            PolicySignatureContext context;
+            std::optional<size_t> mapped;   // its context in products.signatureContexts
+            bool hasSeries = false;
+            std::string series;
+            std::string statistics;
+        };
+        std::mutex contextInputMutex;
+        statistics.SetSignaturePrepare( [&]( const NeutralSignatureAggregate& aggregate,
+            const std::vector<NeutralMergedFrameValues>& frames ) -> std::shared_ptr<void> {
+            auto prepared = std::make_shared<PreparedSignature>();
+            prepared->workspace = AnalysisWorkspaceReservation( workspace );
             const auto found = contexts.find( contextKey( aggregate.domain,
                 aggregate.signatureId, aggregate.frameScope ) );
             if( found == contexts.end() )
@@ -1244,20 +1282,56 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
                 const auto token=statistics.FindSignatureToken(aggregate.domain,aggregate.signatureId,aggregate.frameScope);
                 if(token==NeutralStatisticsStreamBuilder::InvalidSignatureToken)
                     throw std::runtime_error("neutral_statistics_context_signature_missing");
-                const auto record = input->Find( cache_key::Unsigned(token) );
-                if( !record ) throw std::runtime_error( "neutral_statistics_context_missing" );
-                decodedWorkspace.Resize( 65536 + 32ull * record->payload.size() );
-                if( !DeserializePolicySignatureContextRecord( record->payload, decoded, error ) )
-                    throw std::runtime_error( error );
+                std::string payload;
+                {
+                    std::lock_guard lock( contextInputMutex );
+                    const auto record = input->Find( cache_key::Unsigned(token) );
+                    if( !record ) throw std::runtime_error( "neutral_statistics_context_missing" );
+                    payload = record->payload;
+                }
+                prepared->workspace.Resize( 65536 + 32ull * payload.size() );
+                std::string decodeError;
+                if( !DeserializePolicySignatureContextRecord( payload, prepared->context, decodeError ) )
+                    throw std::runtime_error( decodeError );
             }
-            auto& context = found == contexts.end() ? decoded : products.signatureContexts[found->second];
-            AnalysisWorkspaceReservation evidenceWorkspace(workspace,65536+frames.size()*16ull+64ull*context.path.size());
+            else
+            {
+                prepared->mapped = found->second;
+                prepared->context = products.signatureContexts[found->second];
+            }
+            auto& context = prepared->context;
+            prepared->workspace.Add( 65536+frames.size()*16ull+64ull*context.path.size() );
+            // Preserve all numeric rows on disk before choosing UI representatives.
+            // Job origin IDs are not Player.Frame indexes. CPU uses actual
+            // FrameSet boundaries; GPU uses explicitly typed L0 segments.
+            if( !frames.empty() && ( context.domain == "cpu" || context.domain == "gpu" ) )
+            {
+                prepared->workspace.Add( 2ull * frames.size() * sizeof( PolicySeriesRecord ) );
+                prepared->series = EncodePolicyFrameSeries( context, frames );
+                prepared->hasSeries = true;
+            }
             selectEvidence( aggregate, frames, context );
-            cache.AppendStatistics( aggregate );
-            cache.AppendContext( SerializePolicySignatureContextRecord( context ) );
+            prepared->statistics = SerializeNeutralSignatureRecord( aggregate );
+            prepared->workspace.Add( 2ull * prepared->statistics.size() );
+            return prepared;
+        } );
+        const auto persistSignature = [&]( const NeutralSignatureAggregate& aggregate,
+            const std::vector<NeutralMergedFrameValues>& ) {
+            auto& prepared = *static_cast<PreparedSignature*>( statistics.PreparedSignature().get() );
+            auto& context = prepared.context;
+            if( prepared.hasSeries )
+            {
+                if( seriesOutput.Count() > UINT64_MAX / sizeof(PolicySeriesRecord) ||
+                    prepared.series.size() % sizeof(PolicySeriesRecord) != 0 )
+                    throw std::runtime_error( "frame_series_position_failed" );
+                context.seriesOffset = seriesOutput.Count() * sizeof(PolicySeriesRecord);
+                seriesOutput.Append( prepared.series.data(), context.seriesCount );
+            }
+            cache.AppendStatistics( aggregate, prepared.statistics );
+            cache.AppendContext( context, SerializePolicySignatureContextRecord( context ) );
             // Only the lookup key/ordinal is needed after this signature. Do
             // not retain every representative/path beside the cache writer.
-            context = {};
+            if( prepared.mapped ) products.signatureContexts[*prepared.mapped] = {};
         };
         statistics.SetCompleteFrameFilter([&](std::string_view domain,std::string_view scope,uint64_t index) {
             if(domain!="gpu") return true;
@@ -1437,7 +1511,8 @@ bool AnalysisScanManager::SaveStateLocked( const Entry& entry, std::string& erro
         { "aggregate_identity", ComputeNeutralAggregateIdentity( entry.aggregateIdentity ) },
         { "aggregate_root", entry.aggregateRoot.generic_string() },
         { "neutral_generation", entry.neutralGeneration }, { "neutral_header_sha256", entry.neutralHeaderSha256 },
-        { "policy_generation", entry.policyGeneration }, { "policy_identity", entry.policyIdentity }
+        { "policy_generation", entry.policyGeneration }, { "policy_identity", entry.policyIdentity },
+        { "windows", WindowsJson( entry.request.windows ) }
     }, error, DiskUsageFor(entry) );
 }
 
@@ -1487,8 +1562,12 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     // Even the resumable state journal must fit before any namespace is
     // published. There is deliberately no fixed-size floor overriding 16*S.
     if(traceLimits.peakBytes<65536) throw std::runtime_error("analysis_scan_cache_disk_budget");
-    const auto traceStrongId = request.source->GetTraceInfoMetadata().fingerprint;
-    if( traceStrongId.empty() ) throw std::invalid_argument( "analysis_scan_trace_identity_missing" );
+    const auto fingerprint = request.source->GetTraceInfoMetadata().fingerprint;
+    if( fingerprint.empty() ) throw std::invalid_argument( "analysis_scan_trace_identity_missing" );
+    // A scan of windows has its own aggregate: the trace identity covers them.
+    const auto windows = request.windows.empty() ? request.windows : NormalizeAnalysisWindows( request.windows );
+    const auto traceStrongId = windows.empty() ? fingerprint :
+        HashText( fingerprint + "\nwindows:" + AnalysisWindowsText( windows ) );
     NeutralAggregateIdentity aggregateIdentity { traceStrongId, m_queryExecutableSha256,
         "1.35.0", NeutralScanAlgorithmId, NeutralAggregateSchemaVersion };
     const auto aggregateId = ComputeNeutralAggregateIdentity( aggregateIdentity );
@@ -1525,7 +1604,9 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     entry->snapshot.scanId = scanId;
     entry->snapshot.state = ScanState::Queued;
     entry->snapshot.stage = "queued";
+    entry->snapshot.windows = windows;
     entry->request = request;
+    entry->request.windows = windows;
     entry->aggregateIdentity = std::move( aggregateIdentity );
     entry->scanRoot = m_root / "scans" / scanId;
     entry->aggregateRoot = m_cacheRoot / AnalysisScanCacheFormatId / aggregateId;
@@ -1650,6 +1731,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         auto source = entry->request.source;
         if( !source && m_resolver ) source = m_resolver( entry->request.tracePath, stopToken );
         if( !source ) { Update( entry, ScanState::Failed, 0, 4, "source", "trace_source_unavailable" ); return; }
+        if( !entry->request.windows.empty() ) source = MakeWindowedTraceSource( std::move( source ), entry->request.windows );
         AnalysisScanExecutionRequest request;
         request.scanId = entry->snapshot.scanId;
         request.traceSessionId = entry->request.traceSessionId;
@@ -1761,9 +1843,11 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         seriesReader=std::make_shared<PagedRecordReader>(frameSeriesPath,identity,
             sizeof(PolicySeriesRecord),seriesOptions);
     }
+    std::mutex seriesReadMutex;
     uint64_t seriesReadCalls=0,seriesRows=0,seriesReadNs=0;
     policy.readFrameSeries = [&,seriesReader,frameSeriesPath,seriesBudget,identity,
         cancelled=options.cancelled]( const PolicySignatureContext& context ) {
+        std::lock_guard seriesLock(seriesReadMutex);
         const auto began=std::chrono::steady_clock::now();
         auto result=seriesReader ? ReadPolicyFrameSeries(*seriesReader,context,seriesBudget,cancelled) :
             ReadPolicyFrameSeries(frameSeriesPath,context,seriesBudget,cancelled,identity);
@@ -1781,6 +1865,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     // Admit long capture timelines against the one shared workspace contract;
     // PrepareLocals still reserves its real copies before allocation.
     policyOptions.frameWorkspaceBytes=workspace->Snapshot().maximumBytes;
+    policyOptions.workers=DefaultAnalysisZoneWorkers();
     const auto candidateRoot=entry->scanRoot/"policy-generations"/generation/"policy-cache";
     const auto policyIdentity=BuildCandidatePolicyCache(candidateRoot,neutral,policy,policyOptions);
     if(seriesReader) {
@@ -1863,6 +1948,13 @@ std::shared_ptr<AnalysisScanManager::Entry> AnalysisScanManager::LoadEntry( cons
         entry->request.tracePath = std::filesystem::path( state.at( "trace_path" ).get<std::string>() );
         entry->request.profileIdentity = state.at( "profile_identity" ).get<std::string>();
         entry->request.normalizedProfile = ReadJson( root / "profile.json",entry->controlWorkspace );
+        if( state.contains( "windows" ) )
+        {
+            for( const auto& window : state.at( "windows" ) )
+                entry->request.windows.push_back( { window.at( 0 ).get<int64_t>(), window.at( 1 ).get<int64_t>() } );
+            if( !entry->request.windows.empty() ) entry->request.windows = NormalizeAnalysisWindows( entry->request.windows );
+        }
+        entry->snapshot.windows = entry->request.windows;
         entry->aggregateIdentity = { state.at( "trace_strong_id" ).get<std::string>(),
             m_queryExecutableSha256, "1.35.0", NeutralScanAlgorithmId, NeutralAggregateSchemaVersion };
         if( state.at( "aggregate_identity" ).get<std::string>() !=

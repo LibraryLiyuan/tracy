@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <atomic>
+#include <exception>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 namespace tracy::analysis
 {
@@ -343,7 +346,15 @@ struct Builder
         roots.clear(); rootsWorkspace.Resize(0);
         reportSubphase("frame-prepare");
         auto topInput=Sorter("local-top-input"),observations=Sorter("local-observations");
-        VisitContexts([&](const PolicySignatureContext& c) {
+        // With several workers, contexts are evaluated in small batches and each
+        // context's top items and signals are appended in context order; with
+        // one, each context appends its records as it produces them.
+        struct Evaluated
+        {
+            std::vector<std::pair<std::string,std::string>> tops,signals;
+            AnalysisWorkspaceReservation workspace;
+        };
+        const auto evaluate=[&](const PolicySignatureContext& c,const auto& emitTop,const auto& emitSignal) {
             if(FrameBytes(c.frames)>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
             const auto key=SignatureKey(c);
             AnalysisWorkspaceReservation seriesWorkspace(options.table.workspace);
@@ -362,7 +373,7 @@ struct Builder
                 [&](const frame_window::TopKey& group,frame_window::TopItem item) {
                     Check(options); item.sourceKey=key;
                     const auto groupKey=Field(std::get<0>(group))+Field(std::get<1>(group))+Field(std::get<2>(group))+Field(std::get<3>(group));
-                    topInput->Append(groupKey+Unsigned(item.context),candidate_policy::top_record::Encode(item));
+                    emitTop(groupKey+Unsigned(item.context),candidate_policy::top_record::Encode(item));
                 },[&](const std::vector<PolicyFrameEvidence>& series) {
                     const auto bytes=borrowedRoot?FrameStorageBytes(series):FrameBytes(series);
                     if(bytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
@@ -391,9 +402,98 @@ struct Builder
             for(const auto& signal:signals)
             {
                 Check(options); const auto mergeKey=Unsigned(signal.context)+Field(signal.manifestation);
-                observations->Append(mergeKey+Unsigned(0),json{{"merge_key",Hex(mergeKey)},{"source_key",Hex(key)},{"signal",SignalJson(signal)}}.dump());
+                emitSignal(mergeKey+Unsigned(0),json{{"merge_key",Hex(mergeKey)},{"source_key",Hex(key)},{"signal",SignalJson(signal)}}.dump());
             }
+        };
+        const auto keep=[](Evaluated& out,std::vector<std::pair<std::string,std::string>>& to) {
+            return [&out,&to](std::string key,std::string payload) {
+                out.workspace.Add(256+2ull*(key.size()+payload.size()));
+                to.emplace_back(std::move(key),std::move(payload));
+            };
+        };
+        std::vector<PolicySignatureContext> batch;
+        AnalysisWorkspaceReservation batchWorkspace(options.table.workspace);
+        const auto evaluateNow=[&](const PolicySignatureContext& c) {
+            evaluate(c,[&](std::string key,std::string payload) { topInput->Append(key,payload); },
+                [&](std::string key,std::string payload) { observations->Append(key,payload); });
+        };
+        const auto isBudget=[](const std::exception_ptr& error) {
+            try { std::rethrow_exception(error); }
+            catch(const std::exception& e) { return std::string_view(e.what()).find("workspace_budget")!=std::string_view::npos; }
+            catch(...) { return false; }
+        };
+        const auto flushBatch=[&] {
+            std::vector<Evaluated> results;
+            results.reserve(batch.size());
+            for(size_t i=0;i<batch.size();++i) results.push_back({{},{},AnalysisWorkspaceReservation(options.table.workspace)});
+            std::vector<std::exception_ptr> errors(batch.size());
+            const auto threads=std::max<size_t>(1,std::min(options.workers,batch.size()));
+            if(threads==1) for(size_t i=0;i<batch.size();++i) evaluate(batch[i],keep(results[i],results[i].tops),keep(results[i],results[i].signals));
+            else
+            {
+                std::atomic<size_t> next{0};
+                std::atomic<bool> failed{false};
+                const auto work=[&] {
+                    for(;;)
+                    {
+                        const auto i=next.fetch_add(1);
+                        if(i>=batch.size() || failed.load()) return;
+                        try { evaluate(batch[i],keep(results[i],results[i].tops),keep(results[i],results[i].signals)); }
+                        catch(...) { errors[i]=std::current_exception(); failed=true; }
+                    }
+                };
+                std::vector<std::thread> pool;
+                for(size_t n=1;n<threads;++n) pool.emplace_back(work);
+                work();
+                for(auto& thread:pool) thread.join();
+                // The first failing context in order, as a sequential pass reports it.
+                // Contexts evaluated beside others may run out of workspace a
+                // sequential pass would have had: from the first such context,
+                // the batch is evaluated again one context at a time.
+                for(size_t i=0;i<batch.size();++i)
+                {
+                    if(!errors[i]) continue;
+                    if(!isBudget(errors[i])) std::rethrow_exception(errors[i]);
+                    for(size_t j=i;j<results.size();++j) results[j]={{},{},AnalysisWorkspaceReservation(options.table.workspace)};
+                    for(size_t j=0;j<i;++j)
+                    {
+                        Check(options);
+                        for(const auto& [key,payload]:results[j].tops) topInput->Append(key,payload);
+                        for(const auto& [key,payload]:results[j].signals) observations->Append(key,payload);
+                        results[j]={{},{},AnalysisWorkspaceReservation(options.table.workspace)};
+                    }
+                    for(size_t j=i;j<batch.size();++j) evaluateNow(batch[j]);
+                    batch.clear(); batchWorkspace.Resize(0);
+                    return;
+                }
+            }
+            for(auto& result:results)
+            {
+                Check(options);
+                for(const auto& [key,payload]:result.tops) topInput->Append(key,payload);
+                for(const auto& [key,payload]:result.signals) observations->Append(key,payload);
+            }
+            batch.clear(); batchWorkspace.Resize(0);
+        };
+        // A batch holds contexts whose estimated evaluation workspace (as the
+        // series reservations above charge it) fits in half the workspace; a
+        // context larger than that is evaluated alone, as the sequential pass does.
+        const auto workspaceShare=(options.table.workspace ? options.table.workspace->Snapshot().maximumBytes : (4ull<<30))/2;
+        const auto estimate=[](const PolicySignatureContext& c) {
+            return (std::max<uint64_t>(c.seriesCount,c.frames.size())+1024)*8192ull;
+        };
+        uint64_t batchEstimate=0;
+        VisitContexts([&](const PolicySignatureContext& c) {
+            if(options.workers<=1) { evaluateNow(c); return; }
+            const auto need=estimate(c);
+            if(!batch.empty() && batchEstimate+need>workspaceShare) { flushBatch(); batchEstimate=0; }
+            if(need>workspaceShare) { evaluateNow(c); return; }
+            batchEstimate+=need;
+            batchWorkspace.Add(ContextBytes(c));
+            batch.push_back(c);
+            if(batch.size()>=4*options.workers) { flushBatch(); batchEstimate=0; }
         });
+        if(!batch.empty()) flushBatch();
         topInput->Commit(); topInput.reset();
         reportSubphase("context-scan");
         {

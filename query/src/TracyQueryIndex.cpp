@@ -1479,7 +1479,8 @@ json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
     for( const auto& item : value.logicalResources ) logicalResources.push_back( {
         { "id", item.logicalResourceId }, { "physical", item.physicalAllocationId }, { "size", item.size },
         { "offset", item.physicalOffset }, { "owner", item.primaryOwnerId }, { "physical_owner", item.physicalOwnerId },
-        { "flags", item.flags }, { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name } } );
+        { "flags", item.flags }, { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name },
+        { "category", item.category } } );
     json logicalGenerations = json::array();
     std::vector<std::pair<analysis::MemoryEventKey, size_t>> generationKeys(
         value.logicalGenerationByKey.begin(), value.logicalGenerationByKey.end() );
@@ -1492,7 +1493,7 @@ json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
             { "pool", key.pool }, { "index", key.index }, { "id", item.logicalResourceId },
             { "physical", item.physicalAllocationId }, { "size", item.size }, { "offset", item.physicalOffset },
             { "owner", item.primaryOwnerId }, { "physical_owner", item.physicalOwnerId }, { "flags", item.flags },
-            { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name } } );
+            { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name }, { "category", item.category } } );
     }
     json origins = json::array();
     for( const auto& item : value.origins ) origins.push_back( {
@@ -1572,6 +1573,7 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
         resource.primaryOwnerId = item.at( "owner" ).get<uint32_t>(); resource.physicalOwnerId = item.at( "physical_owner" ).get<uint32_t>();
         resource.flags = item.at( "flags" ).get<uint32_t>(); resource.kind = char( item.at( "kind" ).get<uint8_t>() );
         resource.segment = char( item.at( "segment" ).get<uint8_t>() ); resource.name = item.at( "name" ).get<std::string>();
+        resource.category = item.value( "category", std::string() );
         result.logicalById.emplace( resource.logicalResourceId, result.logicalResources.size() ); result.logicalResources.emplace_back( resource );
     }
     if( result.logicalResources.size() != value.at( "logical_count" ).get<size_t>() ) throw std::runtime_error( "GPU-memory logical summary count mismatch" );
@@ -1583,6 +1585,7 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
         resource.primaryOwnerId = item.at( "owner" ).get<uint32_t>(); resource.physicalOwnerId = item.at( "physical_owner" ).get<uint32_t>();
         resource.flags = item.at( "flags" ).get<uint32_t>(); resource.kind = char( item.at( "kind" ).get<uint8_t>() );
         resource.segment = char( item.at( "segment" ).get<uint8_t>() ); resource.name = item.at( "name" ).get<std::string>();
+        resource.category = item.value( "category", std::string() );
         const analysis::MemoryEventKey key { item.at( "pool" ).get<uint64_t>(), item.at( "index" ).get<size_t>() };
         result.logicalGenerationByKey.emplace( key, result.logicalGenerations.size() );
         result.logicalGenerations.emplace_back( std::move( resource ) );
@@ -3143,6 +3146,25 @@ public:
                 if( resource.name.empty() ) resource.name = allocation->second->poolName;
             }
             result.resources.emplace_back( std::move( resource ) );
+        }
+        return result;
+    }
+    std::optional<analysis::GpuReferenceRange> ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const override
+    {
+        if( m_gpuReferencePasses.Count() == 0 ) return std::nullopt;
+        analysis::GpuReferenceRange result;
+        for( uint64_t index = 0; index < m_gpuReferencePasses.Count(); index++ )
+        {
+            const auto& value = m_gpuReferencePasses.At<JnGpuReferencePassData>( index );
+            if( value.time >= begin && value.time < end ) result.passes.push_back( { value.passId, value.time, value.taxonomyId, value.taxonomyLevel } );
+        }
+        // A set's resources carry the time its pass began.
+        for( uint64_t index = 0; index < m_gpuReferenceUses.Count(); index++ )
+        {
+            const auto& value = m_gpuReferenceUses.At<JnGpuReferenceUseData>( index );
+            if( value.time < begin || value.time >= end || value.resourceId == 0 ) continue;
+            if( result.uses.size() == maxUses ) { result.truncated = true; break; }
+            result.uses.push_back( { value.resourceId, value.passId, value.time, value.usageMask } );
         }
         return result;
     }

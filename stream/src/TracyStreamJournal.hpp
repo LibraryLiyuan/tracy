@@ -148,6 +148,11 @@ struct ScanOptions
     uint64_t maxPayloadSize = DefaultMaxPayloadSize;
     size_t maxCollectedRecords = 256;
     std::function<void()> check;
+    // Called only after header, payload and commit-trailer validation. The
+    // visitor may stream records to disk without accumulating a record vector.
+    std::function<void(const RecordInfo&)> recordVisitor;
+    uint64_t maxNewRecords = UINT64_MAX;
+    std::function<bool()> cancelled;
 };
 
 struct ScanResult
@@ -171,6 +176,34 @@ struct ScanResult
 ScanResult ScanJournal( const std::filesystem::path& path, const ScanOptions& options = {} );
 ScanResult ScanJournalPrefix( const std::filesystem::path& path, uint64_t prefixSize, const ScanOptions& options = {} );
 ScanResult ScanJournal( std::span<const uint8_t> bytes, const ScanOptions& options = {} );
+
+// Polls one append-only journal. Visitors receive only newly committed records.
+// Incomplete tails are retried; identity or committed-prefix changes fail closed
+// and leave Snapshot() unchanged. A new reader is required after such a failure.
+// Consumers must retain a transaction until Poll returns successfully: a source
+// change detected after delivery or a visitor exception must roll back the batch.
+// EveryPoll checks the whole accepted prefix before and after each batch.
+// Deferred is for an unpublished transaction only: it hashes appended bytes
+// incrementally and the consumer MUST call VerifyPrefix() before publication.
+// VerifiedBytes reports validation I/O separately from delivered record count.
+class JournalTailReader
+{
+public:
+    enum class PrefixValidation { EveryPoll, Deferred };
+    explicit JournalTailReader( std::filesystem::path path, PrefixValidation validation = PrefixValidation::EveryPoll );
+    ~JournalTailReader();
+    JournalTailReader( const JournalTailReader& ) = delete;
+    JournalTailReader& operator=( const JournalTailReader& ) = delete;
+    ScanResult Poll( const ScanOptions& options = {} );
+    const ScanResult& Snapshot() const;
+    uint64_t VerifiedBytes() const;
+    std::array<uint8_t, 32> PrefixDigest() const;
+    void VerifyPrefix( const std::function<bool()>& cancelled = {} );
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
 bool TruncateToValidPrefix( const std::filesystem::path& path, const ScanResult& scan, std::string& error );
 
 FileHeader MakeFileHeader( uint32_t protocolVersion, uint32_t flags = 0 );

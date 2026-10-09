@@ -310,6 +310,7 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
                     resource.flags = uint32_t( UnsignedField( line, "flags" ) );
                     const auto kind = Field( line, "kind" ); if( !kind.empty() ) resource.kind = kind.front();
                     const auto segment = Field( line, "segment" ); if( !segment.empty() ) resource.segment = segment.front();
+                    resource.category = Field( line, "category" );
                     resource.name = zone.name;
                     if( resource.logicalResourceId != 0 && resource.physicalAllocationId != 0 )
                     {

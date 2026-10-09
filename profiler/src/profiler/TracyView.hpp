@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "imgui.h"
@@ -25,6 +26,8 @@
 #include "TracyUserData.hpp"
 #include "TracyUtility.hpp"
 #include "TracyViewData.hpp"
+#include "TracyUsage.hpp"
+#include "TracyVram.hpp"
 #include "../server/TracyFileWrite.hpp"
 #include "../server/TracyTaskDispatch.hpp"
 #include "../server/TracyShortPtr.hpp"
@@ -145,6 +148,14 @@ public:
 
     ViewData& GetViewData() { return m_vd; }
     const ViewData& GetViewData() const { return m_vd; }
+    // The GPU memory plots of the JN engine, null without them.
+    const VramData* GetVram() const { return m_vram.get(); }
+    // The CPU, memory and GPU usage plots, null without them.
+    const UsageData* GetUsage() const { return m_usage.get(); }
+    // The base frame set's frames, for the FPS lane.
+    FrameTimes GetFpsFrames() const;
+    // Shows a time in the GPU memory panel of the GPU Memory & Resources window.
+    void ShowVramAt( int64_t time );
 
     ShortenName GetShortenName() const { return m_vd.shortenName; }
     int GetNextGpuIdx() { return m_gpuIdx++; }
@@ -753,6 +764,47 @@ private:
     bool m_showJnJobs = false;
     bool m_showJnCaptureOverview = true;
     bool m_showJnGpuResources = false;
+
+    // The JN engine's GPU memory plots, copied from the worker's whenever
+    // their point count changes; the GPU memory lanes draw them stacked.
+    void UpdateVram();
+    std::unique_ptr<VramData> m_vram;
+    std::vector<const PlotData*> m_vramPlots;
+    size_t m_vramPlotCount = 0, m_vramPoints = 0;
+    // The lanes' timeline keys: the segment of each.
+    std::array<int, JnVram::Segments> m_vramLanes { 0, 1 };
+    // The CPU, memory and GPU usage plots, copied from the worker's whenever
+    // their point count changes; the usage lanes draw them.
+    void UpdateUsage();
+    std::unique_ptr<UsageData> m_usage;
+    std::vector<const PlotData*> m_usagePlots;
+    size_t m_usagePlotCount = 0, m_usagePoints = 0, m_usageAppInfo = 0;
+    // The lanes' timeline keys: the UsageLane of each.
+    std::array<UsageLane, UsageLanes> m_usageLanes { UsageLane::Cpu, UsageLane::Memory, UsageLane::Gpu };
+    // The FPS lane's frames: the base frame set's starts, and their ends
+    // unless it is continuous, appended from the worker's as frames arrive.
+    void UpdateFps();
+    const FrameData* m_fpsData = nullptr;
+    std::vector<int64_t> m_fpsStarts, m_fpsEnds;
+    // The lane's timeline key.
+    int m_fpsLane = 0;
+    VramPanelState m_vramPanel;
+    // The panel's resources live at a time, from the worker's memory events
+    // and the engine's resource records.
+    std::shared_ptr<const VramResources> VramResourcesAt( int segment, int64_t time );
+    // Per resource address, the times, names and categories of its records,
+    // in time order; read again while the record count grows.
+    void UpdateVramNames();
+    struct VramNameRecord
+    {
+        int64_t time;
+        const char* name;
+        int8_t category;
+    };
+    std::unordered_map<uint64_t, std::vector<VramNameRecord>> m_vramNames;
+    size_t m_vramRecords = SIZE_MAX, m_vramResourceEvents = 0;
+    double m_vramNamesTime = -1, m_vramResourcesTime = -1;
+    std::shared_ptr<const VramResources> m_vramResources;
 
     struct JnGpuResourcesUi
     {

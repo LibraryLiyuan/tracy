@@ -429,12 +429,27 @@ struct AnalysisCacheTableReader::Impl
         IndexHeader expected; expected.magic[7]=char('0'+schema);
         if(std::memcmp(header.magic, expected.magic, 8) || header.schema != schema || header.reserved || header.records != descriptor.records) Fail("index_header");
     }
+    // Index entries read ahead while records are visited in order; any other
+    // access reads the one entry it needs.
+    static constexpr size_t IndexWindow = 512;
+    std::vector<IndexEntry> window;
+    uint64_t windowFirst = 0;
     IndexEntry Position(uint64_t ordinal)
     {
         CheckCancel(options);
         if(ordinal >= descriptor.records) Fail("ordinal_out_of_range");
-        index.clear(); index.seekg(std::streamoff(sizeof(IndexHeader)+ordinal*sizeof(IndexEntry)));
-        const auto entry = Read<IndexEntry>(index);
+        if(ordinal < windowFirst || ordinal-windowFirst >= window.size())
+        {
+            const bool sequential = !window.empty() && ordinal == windowFirst+window.size();
+            const auto count = sequential ? size_t(std::min<uint64_t>(IndexWindow, descriptor.records-ordinal)) : size_t(1);
+            if(window.capacity() < count) { metadataMemory.Add(IndexWindow*sizeof(IndexEntry)); window.reserve(IndexWindow); }
+            window.resize(count);
+            index.clear(); index.seekg(std::streamoff(sizeof(IndexHeader)+ordinal*sizeof(IndexEntry)));
+            index.read(reinterpret_cast<char*>(window.data()), std::streamsize(count*sizeof(IndexEntry)));
+            if(!index) { window.clear(); Fail("truncated"); }
+            windowFirst = ordinal;
+        }
+        const auto entry = window[size_t(ordinal-windowFirst)];
         if(entry.block >= blocks.size() || entry.reserved) Fail("index_entry");
         const auto& block = blocks[size_t(entry.block)];
         if(ordinal < block.first || ordinal-block.first >= block.records || entry.keyBytes == 0 || entry.keyBytes > 65536 ||

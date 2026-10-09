@@ -1,5 +1,6 @@
 #include "TracySessionManager.hpp"
 
+#include "TracyEventStoreTraceSource.hpp"
 #include "TracySegmentTraceSource.hpp"
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
@@ -100,6 +101,10 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
         m_sourceLoader = [preferIndex,resourceOptions=std::move(resourceOptions)]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
             if( Lower( path.extension().string() ) == ".tracy-stream" )
             {
+                // A finished recording with an event store of the current
+                // schema is read from the store; a recording still in progress
+                // or without a store is replayed segment by segment.
+                if( EventStoreTraceSource::Available( path ) ) return EventStoreTraceSource::Open( path, std::move( callback ) );
                 return SegmentTraceSource::Open( path, std::move( callback ), preferIndex );
             }
             if( preferIndex )

@@ -26,6 +26,17 @@ std::filesystem::path TemporaryRoot()
         ( "jn-tracy-exact-statistics-test-" + std::to_string( stamp ) );
 }
 
+std::filesystem::directory_entry CompletedRun( NeutralStatisticsStreamBuilder& builder,
+    const std::filesystem::path& root )
+{
+    // A full ingest buffer may still be spilling on a background thread.
+    // Checkpoint publication drains that writer before exposing immutable runs.
+    builder.SaveCheckpoint( root / "inspection-checkpoint", std::string( 64, 'f' ) );
+    for( const auto& entry : std::filesystem::directory_iterator( root ) )
+        if( entry.is_regular_file() && entry.path().extension() == ".work" ) return entry;
+    throw std::runtime_error( "completed statistics run missing" );
+}
+
 const NeutralSignatureAggregate& Find( const NeutralStatisticsResult& result, const char* id )
 {
     const auto found = std::find_if( result.signatures.begin(), result.signatures.end(),
@@ -262,6 +273,68 @@ template<class Builder> bool CheckpointRoundTrip(const std::filesystem::path& ro
 
 }
 
+// Finishing with several workers commits the same findings, sink calls and
+// result as finishing on one thread.
+std::string FinishedWith( const std::filesystem::path& root, size_t workers, uint32_t seed, bool retained )
+{
+    std::mt19937_64 random( seed );
+    NeutralStatisticsStreamBuilder builder( root, 64, 512 );
+    builder.SetFinishWorkers( workers );
+    for( uint32_t signature = 0; signature < 300; ++signature )
+    {
+        const auto id = "sig-" + std::to_string( signature );
+        const auto frames = 1 + random() % 200;
+        for( uint64_t frame = 0; frame < frames; ++frame )
+        {
+            auto input = Input( id.c_str(), random() % 400, int64_t( random() % 100000 ), int64_t( random() % 50000 ), int64_t( random() % 1000 ) );
+            input.exact = random() % 97 != 0;
+            input.logical = random() % 211 == 0;
+            assert( builder.AddRun( input ) );
+        }
+        if( signature % 37 != 5 ) builder.AddDenominator( Denominator( id.c_str(), 300 + random() % 200 ) );
+    }
+    builder.AddDomainAudit( { "cpu", true, "complete", 300, 300, 300, std::string( 64, 'a' ), std::string( 64, 'a' ), true, {} } );
+    std::ostringstream out;
+    std::string error;
+    if( retained )
+    {
+        NeutralStatisticsResult result;
+        assert( builder.Finish( result, error, [&]( const auto& signature, const auto& frames ) {
+            out << "sink|" << signature.signatureId << '|' << frames.size() << '\n';
+        } ) );
+        out << SerializeNeutralStatisticsResult( result );
+    }
+    else
+    {
+        NeutralStatisticsStreamSummary summary;
+        assert( builder.FinishToSink( summary, error, [&]( const auto& signature, const auto& frames ) {
+            out << "sink|" << SerializeNeutralSignatureRecord( signature ) << '|' << frames.size() << '\n';
+        } ) );
+        out << "summary|" << summary.qualityComplete << '|' << summary.signatureCount << '|' << summary.unreportedGapCount;
+        for( const auto& finding : summary.qualityFindings ) out << '|' << finding;
+    }
+    return out.str();
+}
+
+void ParallelFinishMatches( const std::filesystem::path& root )
+{
+    for( uint32_t seed = 1; seed <= 3; ++seed )
+        for( const bool retained : { true, false } )
+        {
+            const auto expected = FinishedWith( root / ( "serial-" + std::to_string( seed ) ), 1, seed, retained );
+            for( const size_t workers : { 2, 4, 7 } )
+            {
+                const auto actual = FinishedWith( root / ( "parallel-" + std::to_string( seed ) + "-" + std::to_string( workers ) ), workers, seed, retained );
+                if( actual != expected )
+                {
+                    std::cerr << "parallel finish differs: seed " << seed << " workers " << workers << ( retained ? " retained" : " streamed" ) << '\n';
+                    std::exit( 1 );
+                }
+            }
+        }
+    std::cout << "parallel finish matches the serial finish\n";
+}
+
 int main( int argc, char** argv )
 {
     if(argc>1 && std::string_view(argv[1])=="--checkpoint-only")
@@ -299,6 +372,8 @@ int main( int argc, char** argv )
         NeutralStatisticsStreamBuilder stream(root/"stream",128,512,{},disk);
         for(size_t i=0;i<values.size();++i) assert(stream.AddRun(Input("equal",i,values[i],values[i],values[i],values[i])));
         stream.AddDenominator(Denominator("equal",values.size()));
+        // Measure distribution sorting independently of asynchronous ingestion.
+        stream.SaveCheckpoint(root/"stream"/"ingest-complete",std::string(64,'f'));
         writes=0; NeutralStatisticsStreamSummary summary; std::string error; uint64_t outputs=0;
         assert(stream.FinishToSink(summary,error,[&](const auto& stat,const auto&) {
             ++outputs;
@@ -401,6 +476,7 @@ int main( int argc, char** argv )
         {std::filesystem::remove_all(temporary);return 0;}
     }
     std::filesystem::create_directories( temporary );
+    ParallelFinishMatches( temporary / "parallel-finish" );
 
     {
         const auto compressedRoot = temporary / "compressed-multiblock-run";
@@ -413,7 +489,7 @@ int main( int argc, char** argv )
         source.AddDenominator( { "cpu", "compressed", "Player.Frame", 5000 } );
         source.AddDomainAudit( { "cpu", true, "complete", 5000, 5000, 1,
             std::string( 64, 'a' ), std::string( 64, 'a' ), true, {} } );
-        const auto run = *std::filesystem::directory_iterator( compressedRoot );
+        const auto run = CompletedRun( source, compressedRoot );
         std::ifstream header( run.path(), std::ios::binary );
         char magic[8] {};
         header.read( magic, sizeof( magic ) );
@@ -466,7 +542,7 @@ int main( int argc, char** argv )
         assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
         assert( source.AddRegisteredRun( token, 0, 1, 1, 0, 0, 1, true, false ) );
         assert( source.AddRegisteredRun( token, 1, 2, 2, 0, 0, 1, true, false ) );
-        const auto run = *std::filesystem::directory_iterator( root );
+        const auto run = CompletedRun( source, root );
         damage( run.path() );
         NeutralStatisticsStreamSummary summary;
         std::string error;

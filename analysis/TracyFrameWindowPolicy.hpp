@@ -286,7 +286,8 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
         {
             const auto manifestation = std::string( w.stable ? "stable_slow:" : "sustained_pressure:" ) + std::to_string( w.begin ) + ":" + std::to_string( w.end );
             std::vector<PolicyFrameEvidence> part;
-            for( const auto& frame : series ) if( frame.exact && frame.frameIndex >= w.begin && frame.frameIndex <= w.end ) part.push_back( frame );
+            for( auto frame = std::lower_bound( series.begin(), series.end(), w.begin, []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
+                frame != series.end() && frame->frameIndex <= w.end; ++frame ) if( frame->exact ) part.push_back( *frame );
             if( part.empty() ) continue;
             const auto peak = *std::max_element( part.begin(), part.end(), []( const auto& a, const auto& b ) { return a.valueNs < b.valueNs; } );
             select( ci, manifestation, w.stable ? "stable_slow_window" : "sustained_pressure_window", peak,

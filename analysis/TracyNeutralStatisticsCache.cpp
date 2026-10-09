@@ -227,6 +227,10 @@ NeutralStatisticsCacheWriter::NeutralStatisticsCacheWriter(std::filesystem::path
 NeutralStatisticsCacheWriter::~NeutralStatisticsCacheWriter()=default;
 void NeutralStatisticsCacheWriter::AppendStatistics(const NeutralSignatureAggregate& signature)
 {
+    AppendStatistics(signature,{});
+}
+void NeutralStatisticsCacheWriter::AppendStatistics(const NeutralSignatureAggregate& signature, std::string_view record)
+{
     auto& s=*m_impl;
     try {
         s.Check();
@@ -239,7 +243,9 @@ void NeutralStatisticsCacheWriter::AppendStatistics(const NeutralSignatureAggreg
         if(!s.physicalScopes.contains(scope)) { s.ReserveMetadata(256+2*scope.size()); s.physicalScopes.emplace(scope,false); }
         if(signature.exact && !signature.logical) s.physicalScopes.at(scope)=true;
         if(!s.domainCounts.contains(signature.domain)) { s.ReserveMetadata(256+2*signature.domain.size()); s.domainCounts.emplace(signature.domain,0); }
-        s.statistics->Append(Key(signature.domain,signature.signatureId,signature.frameScope),SerializeNeutralSignatureRecord(signature));
+        const auto key=Key(signature.domain,signature.signatureId,signature.frameScope);
+        if(record.empty()) s.statistics->Append(key,SerializeNeutralSignatureRecord(signature));
+        else s.statistics->Append(key,record);
         ++s.domainCounts.at(signature.domain); ++s.count;
     } catch(...) { s.failed=true; throw; }
 }
@@ -249,6 +255,13 @@ void NeutralStatisticsCacheWriter::AppendContext(std::string_view payload)
     try { s.Check(); if(payload.size()>s.options.table.blockBytes) Fail("context_record_budget");
         AnalysisWorkspaceReservation decodingWorkspace(s.options.table.workspace,65536+32ull*payload.size());
         s.contexts->Append(Key(json::parse(payload)),payload); }
+    catch(...) { s.failed=true; throw; }
+}
+void NeutralStatisticsCacheWriter::AppendContext(const PolicySignatureContext& context, std::string_view payload)
+{
+    auto& s=*m_impl;
+    try { s.Check(); if(payload.size()>s.options.table.blockBytes) Fail("context_record_budget");
+        s.contexts->Append(Key(context.domain,context.signatureId,context.frameScope),payload); }
     catch(...) { s.failed=true; throw; }
 }
 void NeutralStatisticsCacheWriter::Commit(const NeutralStatisticsStreamSummary& summary)

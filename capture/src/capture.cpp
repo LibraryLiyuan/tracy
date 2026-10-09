@@ -6,6 +6,7 @@
 #endif
 
 #include "CaptureStatus.hpp"
+#include "ProcessMemory.hpp"
 #include <atomic>
 #include <algorithm>
 #include <charconv>
@@ -105,6 +106,7 @@ void AnsiPrintf( const char* ansiEscape, const char* format, ... ) {
 [[noreturn]] void Usage()
 {
     printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit] [-d drain-idle-seconds] [-x stop-file]\n" );
+    printf( "  [--status-json path] [--headless] [--recorder-definition-limit N] [--recorder-query-limit N]\n" );
     exit( 1 );
 }
 
@@ -146,11 +148,24 @@ int CaptureMain( int argc, char** argv )
 {
     CaptureStatus status;
     bool headless = false;
+    size_t definitionLimit = tracy::Worker::DefaultRecorderDefinitionLimit;
+    size_t queryLimit = tracy::Worker::DefaultRecorderQueryQueueLimit;
     int kept = 1;
     for( int i = 1; i < argc; ++i )
     {
         if( std::string_view(argv[i]) == "--headless" ) headless = true;
         else if( std::string_view(argv[i]) == "--status-json" && i+1 < argc ) status.path = std::filesystem::u8path(argv[++i]);
+        else if( std::string_view(argv[i]) == "--recorder-definition-limit" || std::string_view(argv[i]) == "--recorder-query-limit" )
+        {
+            const bool definitions = std::string_view(argv[i]) == "--recorder-definition-limit";
+            if(i+1 >= argc) { printf("Recorder budget requires a positive decimal integer.\n"); return 4; }
+            const std::string_view text = argv[++i];
+            size_t value = 0;
+            const auto parsed = std::from_chars(text.data(), text.data()+text.size(), value);
+            if(parsed.ec != std::errc() || parsed.ptr != text.data()+text.size() || value == 0)
+            { printf("Recorder budget requires a positive decimal integer within size_t range.\n"); return 4; }
+            (definitions ? definitionLimit : queryLimit) = value;
+        }
         else argv[kept++] = argv[i];
     }
     argc = kept; argv[argc] = nullptr;
@@ -302,6 +317,14 @@ int CaptureMain( int argc, char** argv )
     std::unique_ptr<tracy::stream::StreamProtocolObserver> protocolObserver;
     if( journalOutput )
     {
+        std::error_code spaceError;
+        const auto space = std::filesystem::space( NormalizeOutputPath( journalOutput ).parent_path(), spaceError );
+        if( spaceError || space.available < 16ull * 1024 * 1024 )
+        {
+            printf( "Cannot start journal: output space is unavailable or below the 16 MiB safety reserve.\n" );
+            status.Write("disk_space_error", true);
+            return 5;
+        }
         tracy::stream::ProtocolJournalOptions journalOptions;
         if( deferSymbolExpansion )
             journalOptions.sessionFlags |= tracy::stream::SessionBeginFlagDeferredSymbolExpansion;
@@ -320,8 +343,44 @@ int CaptureMain( int argc, char** argv )
     fflush( stdout );
     tracy::Worker worker( address, port, memoryLimit, protocolObserver.get(),
         protocolOnly ? tracy::Worker::Mode::ProtocolOnly : tracy::Worker::Mode::Full,
-        tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
+        definitionLimit, queryLimit,
         deferSymbolExpansion );
+    uint64_t rateStartCommitted = 0;
+    status.refresh = [&](CaptureStatus& value) {
+        const auto memory = GetProcessMemoryState();
+        value.workingSetBytes = memory.workingSet;
+        value.privateCommitBytes = memory.commit;
+        value.physicalAvailableBytes = memory.physicalAvailable;
+        value.physicalLoadPercent = memory.physicalLoadPercent;
+        value.systemCommitAvailable = memory.systemCommitAvailable;
+        value.systemCommitTotalBytes = memory.systemCommitTotal;
+        value.systemCommitLimitBytes = memory.systemCommitLimit;
+        value.systemCommitLoadPercent = memory.commitLoadPercent;
+        value.protocolEvents = worker.GetProtocolEventCount();
+        value.definitions = worker.GetProtocolDefinitionCount();
+        if(protocolObserver) {
+            const auto journal = protocolObserver->Status();
+            value.committedBytes = journal.committedSize;
+            value.durableBytes = journal.durableSize;
+            value.clientBytes = journal.clientBytes;
+            value.serverBytes = journal.serverBytes;
+            value.backpressureWaits = journal.backpressureWaitCount;
+            value.peakBufferedBytes = journal.peakBufferedBytes;
+            value.journalFinalized = journal.finalized;
+            value.closeReason = journal.finalized ? uint32_t(journal.closeReason) : 0;
+            value.captureComplete = journal.finalized && !journal.failed && journal.closeReason == tracy::ProtocolCloseReason::CaptureComplete;
+            std::error_code spaceError;
+            const auto space = std::filesystem::space(NormalizeOutputPath(journalOutput).parent_path(), spaceError);
+            value.outputSpaceAvailable = !spaceError;
+            value.outputFreeBytes = spaceError ? 0 : space.available;
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-value.started).count();
+            value.bytesPerSecond = value.firstData && elapsed >= 1 && value.committedBytes >= rateStartCommitted ?
+                double(value.committedBytes-rateStartCommitted) / elapsed : 0;
+            const uint64_t reserve = 16ull * 1024 * 1024;
+            value.remainingDiskSeconds = !spaceError && value.bytesPerSecond > 0 ?
+                double(space.available > reserve ? space.available-reserve : 0) / value.bytesPerSecond : -1;
+        }
+    };
     while( !worker.HasData() )
     {
         std::error_code stopError;
@@ -352,14 +411,14 @@ int CaptureMain( int argc, char** argv )
     status.firstData = true;
     status.clientPid = worker.GetPid();
     status.started = std::chrono::steady_clock::now();
+    rateStartCommitted = protocolObserver ? protocolObserver->CommittedSize() : 0;
     status.Write("recording");
     printf( "\nTimer resolution: %s\n", tracy::TimeToString( worker.GetResolution() ) );
     if( protocolOnly )
     {
         printf( "Recorder mode: bounded protocol-only (%s memory limit, %zu definitions, %zu queued queries, ",
             tracy::MemSizeToString( worker.GetMemoryLimit() ),
-            tracy::Worker::DefaultRecorderDefinitionLimit,
-            tracy::Worker::DefaultRecorderQueryQueueLimit );
+            definitionLimit, queryLimit );
         if( drainIdleSeconds == 0 )
             printf( "drain idle timeout disabled)\n" );
         else
@@ -388,9 +447,22 @@ int CaptureMain( int argc, char** argv )
     auto& lock = worker.GetMbpsDataLock();
 
     const auto t0 = std::chrono::high_resolution_clock::now();
+    auto lastSpaceCheck = std::chrono::steady_clock::now();
+    bool diskProtection = false;
     while( worker.IsConnected() )
     {
         status.Write("recording");
+        if(protocolObserver && std::chrono::steady_clock::now()-lastSpaceCheck >= std::chrono::seconds(1))
+        {
+            lastSpaceCheck = std::chrono::steady_clock::now();
+            std::error_code spaceError;
+            const auto space = std::filesystem::space(NormalizeOutputPath(journalOutput).parent_path(), spaceError);
+            if(spaceError || space.available < 16ull * 1024 * 1024)
+            {
+                diskProtection = true;
+                s_disconnect.store(true, std::memory_order_relaxed);
+            }
+        }
         if( stopFile )
         {
             std::error_code stopError;
@@ -486,6 +558,7 @@ int CaptureMain( int argc, char** argv )
     size_t drainDefinitionCount = protocolOnly ? worker.GetProtocolDefinitionCount() : 0;
     while( worker.IsConnected() )
     {
+        status.Write("draining");
         if( protocolDrain && s_forceStopProtocolDrain.load( std::memory_order_relaxed ) )
         {
             printf( "\nProtocol drain force-stopped. The committed journal prefix remains recoverable.\n" );
@@ -656,9 +729,20 @@ int CaptureMain( int argc, char** argv )
         }
     }
 
-    if( protocolObserver && protocolObserver->Failed() ) return 6;
-    if( worker.DidProtocolResolverFail() ) return 7;
+    if( protocolObserver && protocolObserver->Failed() ) { status.Write("write_error", true); return 6; }
+    if( worker.DidProtocolResolverFail() ) { status.Write("budget_or_resolver_error", true); return 7; }
+    if( protocolObserver && protocolObserver->Status().closeReason == tracy::ProtocolCloseReason::MemoryLimit )
+    { status.Write("memory_limit", true); return 7; }
+    if( protocolObserver )
+    {
+        const auto reason = protocolObserver->Status().closeReason;
+        if(reason == tracy::ProtocolCloseReason::PeerDisconnected)
+        { status.Write("peer_disconnected", true); return 8; }
+        if(reason != tracy::ProtocolCloseReason::CaptureComplete && reason != tracy::ProtocolCloseReason::LocalShutdown)
+        { status.Write("protocol_error", true); return 8; }
+    }
     status.sessionEnd = protocolObserver && protocolObserver->Finalized();
+    if(diskProtection) { status.Write("disk_space_low", true); return 9; }
     status.Write("finished", true);
     return 0;
 }

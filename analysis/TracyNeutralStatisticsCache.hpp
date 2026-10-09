@@ -2,6 +2,7 @@
 #define __TRACYNEUTRALSTATISTICSCACHE_HPP__
 #include "TracyAnalysisCacheTable.hpp"
 #include "TracyExactStatistics.hpp"
+#include "TracyCandidatePolicy.hpp"
 namespace tracy::analysis
 {
 struct PolicySignatureContext;
@@ -22,8 +23,12 @@ public:
         NeutralStatisticsCacheOptions options = {});
     ~NeutralStatisticsCacheWriter();
     void AppendStatistics(const NeutralSignatureAggregate& signature);
+    // As above, with the record SerializeNeutralSignatureRecord(signature) returned.
+    void AppendStatistics(const NeutralSignatureAggregate& signature, std::string_view record);
     // One existing Context schema record, including its full path/series refs.
     void AppendContext(std::string_view payload);
+    // As above, for the record SerializePolicySignatureContextRecord(context) returned.
+    void AppendContext(const PolicySignatureContext& context, std::string_view payload);
     void Commit(const NeutralStatisticsStreamSummary& summary);
 private:
     struct Impl;

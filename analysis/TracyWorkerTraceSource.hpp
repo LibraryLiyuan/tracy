@@ -2,6 +2,7 @@
 #define __TRACYWORKERTRACESOURCE_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyFrameTriageSource.hpp"
 #include "TracyMemoryAnalysis.hpp"
 
 #include <filesystem>
@@ -55,7 +56,7 @@ enum class WorkerTraceLoadMode
 };
 
 class WorkerTraceSource final : public TraceSource, public NativeBoundedTraceSource,
-    public GpuCatalogBoundedScanSource
+    public GpuCatalogBoundedScanSource, public FrameTriageSource
 {
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
@@ -66,6 +67,9 @@ public:
         SerializedStringSource* serializedStringSource = nullptr,
         SerializedCallstackSource* serializedCallstackSource = nullptr );
     static WorkerLoadProgress GetLoadProgress();
+    std::vector<JnGpuReferencePassData> ScanGpuReferencePasses( size_t offset, size_t limit ) const;
+    std::vector<JnGpuReferenceUseData> ScanGpuReferenceUses( size_t offset, size_t limit ) const;
+    std::vector<JnGpuReferenceEndData> ScanGpuReferenceEnds( size_t offset, size_t limit ) const;
     static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;
 
@@ -97,6 +101,8 @@ public:
         const std::function<void()>& check = {} ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
+    void VisitTopLevelGpuZones( const std::function<void( size_t, int64_t, int64_t )>& visit ) const override;
+    void VisitPlotPoints( std::string_view plotRef, const std::function<void( int64_t, double )>& visit ) const override;
 
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
@@ -191,6 +197,7 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
+    std::optional<GpuReferenceRange> ScanGpuReferencesInRange( int64_t begin, int64_t end, size_t maxUses ) const override;
     GpuMemoryAttribution GetGpuMemoryAttributionFromExternalZones(
         const std::vector<GpuMemoryCpuZoneInput>& cpuInputs,
         const std::vector<GpuMemoryGpuZoneInput>& gpuInputs ) const;

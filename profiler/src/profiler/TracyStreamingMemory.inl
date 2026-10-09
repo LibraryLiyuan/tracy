@@ -1,0 +1,68 @@
+uint64_t StreamingView::ResultBytes( const Result& r )
+{
+    uint64_t bytes = sizeof( r ) + sizeof( *r.zones ) + stream::CacheDynamicBytes( *r.zones ) + sizeof( *r.gpuZones ) + stream::CacheDynamicBytes( *r.gpuZones ) + sizeof( *r.overview ) + stream::CacheDynamicBytes( *r.overview );
+    if(r.cpuDensity)bytes+=sizeof(*r.cpuDensity)+stream::CacheDynamicBytes(*r.cpuDensity);
+    if(r.gpuDensity)bytes+=sizeof(*r.gpuDensity)+stream::CacheDynamicBytes(*r.gpuDensity);
+#define TRACY_RESULT_FIELD( field ) bytes += stream::CacheDynamicBytes( r.field )
+    TRACY_RESULT_FIELD( info );
+    TRACY_RESULT_FIELD( children );
+    TRACY_RESULT_FIELD( texts );
+    TRACY_RESULT_FIELD( selected );
+    TRACY_RESULT_FIELD( gpuChildren );
+    TRACY_RESULT_FIELD( gpuContexts );
+    TRACY_RESULT_FIELD( selectedGpu );
+    TRACY_RESULT_FIELD( gpuAnnotations );
+    TRACY_RESULT_FIELD( samples );
+    TRACY_RESULT_FIELD( contextRegions );
+    TRACY_RESULT_FIELD( cpuRegions );
+    TRACY_RESULT_FIELD( selectedSample );
+    TRACY_RESULT_FIELD( messages );
+    TRACY_RESULT_FIELD( appInfo );
+    TRACY_RESULT_FIELD( selectedMessage );
+    TRACY_RESULT_FIELD( plots );
+    TRACY_RESULT_FIELD( plotPoints );
+    TRACY_RESULT_FIELD( parameters );
+    TRACY_RESULT_FIELD( locks );
+    TRACY_RESULT_FIELD( lockEvents );
+    TRACY_RESULT_FIELD( jobs );
+    TRACY_RESULT_FIELD( ioRequests );
+    TRACY_RESULT_FIELD( selectedJob );
+    TRACY_RESULT_FIELD( selectedIo );
+    TRACY_RESULT_FIELD( jobStages );
+    TRACY_RESULT_FIELD( dependencies );
+    TRACY_RESULT_FIELD( jobLanes );
+    TRACY_RESULT_FIELD( ioStages );
+    TRACY_RESULT_FIELD( scriptFrames );
+    TRACY_RESULT_FIELD( scriptEvents );
+    TRACY_RESULT_FIELD( allocations );
+    TRACY_RESULT_FIELD( memoryPools );
+    TRACY_RESULT_FIELD( selectedAllocation );
+    TRACY_RESULT_FIELD( referencePasses );
+    TRACY_RESULT_FIELD( references );
+    TRACY_RESULT_FIELD( referenceEnds );
+    TRACY_RESULT_FIELD( catalogGenerations );
+    TRACY_RESULT_FIELD( catalogRecords );
+    TRACY_RESULT_FIELD( catalogResources );
+    TRACY_RESULT_FIELD( images );
+    TRACY_RESULT_FIELD( selectedImage );
+    TRACY_RESULT_FIELD( imageBytes );
+    TRACY_RESULT_FIELD( auxiliary );
+    TRACY_RESULT_FIELD( runtimeStates );
+    TRACY_RESULT_FIELD( hardware );
+    TRACY_RESULT_FIELD( hardwareAddresses );
+    TRACY_RESULT_FIELD( sources );
+    TRACY_RESULT_FIELD( symbols );
+    TRACY_RESULT_FIELD( code );
+    TRACY_RESULT_FIELD( fibers );
+    TRACY_RESULT_FIELD( callsites );
+    TRACY_RESULT_FIELD( fiberName );
+    TRACY_RESULT_FIELD( stack );
+    TRACY_RESULT_FIELD( statistics );
+    TRACY_RESULT_FIELD( flame );
+    TRACY_RESULT_FIELD( flameGraph );
+    TRACY_RESULT_FIELD( search );
+    TRACY_RESULT_FIELD( error );
+    TRACY_RESULT_FIELD( analysisError );
+#undef TRACY_RESULT_FIELD
+    return bytes;
+}

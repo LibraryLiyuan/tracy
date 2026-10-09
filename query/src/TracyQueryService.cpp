@@ -6,7 +6,9 @@
 #include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyAnalysisProfile.hpp"
+#include "TracyFrameTriage.hpp"
 #include "TracyHash.hpp"
+#include "TracyQueryVram.hpp"
 
 #include "TracyAnalysis.hpp"
 #include "TracyEmbeddedData.hpp"
@@ -45,7 +47,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume",
         "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get",
-        "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close",
+        "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close", "analysis.scan.triage",
         "capture.context", "capture.coverage", "trace.telemetry_cost", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "relation.search", "relation.get", "runtime.domain.states",
@@ -61,7 +63,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain", "gpu.resource.lifetime",
         "gpu.resource.allocations", "gpu.resource.references", "gpu.resource.views", "gpu.resource.mesh_buffers",
         "gpu.resource.raytracing_chain", "gpu.resource.vg_pages", "gpu.pass.resources", "gpu.pass.vg_evidence",
-        "gpu.memory.peak", "gpu.memory.by_type", "gpu.memory.by_pass", "gpu.memory.churn",
+        "gpu.memory.peak", "gpu.memory.by_type", "gpu.memory.by_pass", "gpu.memory.churn", "gpu.vram.summary", "gpu.vram.resources", "gpu.vram.resource_growth", "gpu.frame.resources",
         "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones",
         "memory.gc.summary", "memory.gc.events",
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
@@ -82,7 +84,7 @@ nlohmann::json RequiredParametersFor( const std::string& method )
     if( method.rfind( "analysis.scan.", 0 ) == 0 )
     {
         if( method == "analysis.scan.profile.validate" ) required.emplace_back( "profile" );
-        else if( method == "analysis.scan.start" )
+        else if( method == "analysis.scan.start" || method == "analysis.scan.triage" )
         {
             required.emplace_back( "trace_id" );
             required.emplace_back( "profile" );
@@ -211,6 +213,35 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["fields"] = ParameterSchemaFor( "fields" );
                 properties["filter"] = ParameterSchemaFor( "filter" );
             }
+            if( method == "analysis.scan.start" )
+            {
+                const json time = { { "type", json::array( { "string", "integer" } ) } };
+                properties["windows"] = { { "type", "array" }, { "minItems", 1 }, { "maxItems", analysis::MaximumAnalysisWindows },
+                    { "description", "Restrict the scan to these capture time windows, e.g. tracy_scan triage scan_windows." },
+                    { "items", { { "type", "object" }, { "required", json::array( { "start_ns", "end_ns" } ) },
+                        { "properties", { { "start_ns", time }, { "end_ns", time } } }, { "additionalProperties", false } } } };
+            }
+            if( method == "gpu.vram.summary" )
+            {
+                properties["segment"] = { { "type", "string" }, { "enum", json::array( { "local", "non_local", "all" } ) } };
+                properties["buckets"] = { { "type", "integer" }, { "minimum", 0 }, { "maximum", 500 } };
+                properties["time_ns"] = ParameterSchemaFor( "time_ns" );
+            }
+            if( method == "gpu.vram.resources" || method == "gpu.vram.resource_growth" || method == "gpu.frame.resources" )
+            {
+                if( method != "gpu.frame.resources" ) properties["segment"] = { { "type", "string" }, { "enum", json::array( { "local", "non_local" } ) } };
+                properties["type"] = { { "type", "string" }, { "enum", json::array( { "texture", "render_target", "depth_stencil", "buffer", "ray_tracing", "other", "upload", "readback" } ) } };
+                properties["name"] = { { "type", "string" }, { "maxLength", 256 } };
+            }
+            if( method == "gpu.vram.resources" ) properties["time_ns"] = ParameterSchemaFor( "time_ns" );
+            if( method == "gpu.frame.resources" ) properties["frame_index"] = ParameterSchemaFor( "frame_index" );
+            if( method == "analysis.scan.triage" )
+            {
+                properties["frame_set"] = { { "type", "string" }, { "minLength", 1 }, { "maxLength", 256 } };
+                properties["segment_seconds"] = { { "type", "number" }, { "minimum", 0 }, { "maximum", 3600 } };
+                properties["window_seconds"] = { { "type", "number" }, { "minimum", 0.5 }, { "maximum", 60 } };
+                properties["max_windows"] = { { "type", "integer" }, { "minimum", 1 }, { "maximum", 32 } };
+            }
             json alternatives = json::array();
             if( method == "frame.get" )
             {
@@ -219,6 +250,8 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["frame_set"] = ParameterSchemaFor( "frame_set" );
                 properties["index"] = { { "type", "integer" }, { "minimum", 0 } };
             }
+            else if( method == "gpu.frame.resources" )
+                alternatives = json::array( { json::array( { "frame_index" } ), json::array( { "start_ns", "end_ns" } ) } );
             else if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
             {
                 alternatives = json::array( { json::array( { "ref" } ), json::array( { "frame_id" } ) } );
@@ -330,7 +363,7 @@ std::string QueryExecutableSha256()
 
 nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
 {
-    return {
+    nlohmann::json result = {
         { "scan_id", value.scanId }, { "state", analysis::ScanStateName( value.state ) },
         { "resumable", value.resumable }, { "completed", value.completed },
         { "closed", value.closed },
@@ -339,6 +372,14 @@ nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
             { "total", std::to_string( value.progressTotal ) }, { "stage", value.stage } } },
         { "error", value.error.empty() ? nlohmann::json( nullptr ) : nlohmann::json( value.error ) }
     };
+    if( !value.windows.empty() )
+    {
+        nlohmann::json windows = nlohmann::json::array();
+        for( const auto& window : value.windows )
+            windows.push_back( { { "start_ns", std::to_string( window.startNs ) }, { "end_ns", std::to_string( window.endNs ) } } );
+        result["windows"] = std::move( windows );
+    }
+    return result;
 }
 
 using nlohmann::json;
@@ -4828,6 +4869,61 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             } }
         } );
     }
+    if( method == "analysis.scan.triage" )
+    {
+        // Labels every frame by what limited it, from the threads' work and
+        // waits, GPU busy time and memory counters; needs no analysis cache.
+        const auto validation = analysis::ValidateAndNormalizeAnalysisProfile( params.at( "profile" ) );
+        if( !validation.valid )
+        {
+            json errors = json::array();
+            for( const auto& error : validation.errors ) errors.push_back( { { "path", error.path }, { "message", error.message } } );
+            throw QueryError( "INVALID_ANALYSIS_PROFILE", "analysis profile validation failed", false, { { "errors", std::move( errors ) } } );
+        }
+        const auto& profile = validation.normalized;
+        analysis::FrameTriageOptions options;
+        options.cancelled = [&] { return stopToken.stop_requested(); };
+        options.frameBudgetMs = profile.at( "frame_budget" ).at( "frame_ms" ).get<double>();
+        const auto& resources = profile.at( "resource_budgets" );
+        if( resources.contains( "gpu_memory_bytes" ) ) options.gpuMemoryBudgetBytes = resources.at( "gpu_memory_bytes" ).get<double>();
+        if( resources.contains( "cpu_memory_bytes" ) ) options.cpuMemoryBudgetBytes = resources.at( "cpu_memory_bytes" ).get<double>();
+        const auto number = [&]( const char* name, double fallback, double minimum, double maximum ) {
+            if( !params.contains( name ) ) return fallback;
+            if( !params[name].is_number() || params[name].get<double>() < minimum || params[name].get<double>() > maximum )
+                throw QueryError( "INVALID_PARAMS", std::string( name ) + " is out of range" );
+            return params[name].get<double>();
+        };
+        if( params.contains( "frame_set" ) )
+        {
+            if( !params["frame_set"].is_string() || params["frame_set"].get_ref<const std::string&>().empty() )
+                throw QueryError( "INVALID_PARAMS", "frame_set must be a frame set ref or name" );
+            options.frameSet = params["frame_set"].get<std::string>();
+        }
+        options.segmentSeconds = number( "segment_seconds", 0, 0, 3600 );
+        options.windowSeconds = number( "window_seconds", 5, 0.5, 60 );
+        if( params.contains( "max_windows" ) && !params["max_windows"].is_number_integer() ) throw QueryError( "INVALID_PARAMS", "max_windows must be an integer" );
+        options.maxWindows = size_t( number( "max_windows", 6, 1, 32 ) );
+        options.workers = DefaultAnalysisZoneWorkers();
+        const auto traceId = params.at( "trace_id" ).get<std::string>();
+        auto source = m_sessions.GetReadySource( traceId );
+        try
+        {
+            auto result = analysis::RunFrameTriage( *source, options );
+            result["trace_id"] = traceId;
+            result["profile_identity"] = validation.profileSha256;
+            return Success( id, std::move( result ) );
+        }
+        catch( const QueryError& ) { throw; }
+        catch( const std::invalid_argument& error ) { throw QueryError( "INVALID_PARAMS", error.what() ); }
+        catch( const std::exception& error )
+        {
+            if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+            const std::string message = error.what();
+            if( message == "frame_triage_no_frame_set" || message == "frame_triage_no_complete_frames" )
+                throw QueryError( "INCOMPLETE_DATA", message );
+            throw QueryError( "INTERNAL_ERROR", message );
+        }
+    }
     if( IsDeterministicScanMethod( method ) )
     {
         if( !m_scanManager ) throw QueryError( "ANALYSIS_PATHS_NOT_CONFIGURED",
@@ -4865,6 +4961,31 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     request.resourceContext = owner->GetQueryResourceContext();
                 request.normalizedProfile = validation.normalized;
                 request.profileIdentity = validation.profileSha256;
+                if( params.contains( "windows" ) )
+                {
+                    const auto& windows = params["windows"];
+                    if( !windows.is_array() || windows.empty() || windows.size() > analysis::MaximumAnalysisWindows )
+                        throw QueryError( "INVALID_PARAMS", "windows must be an array of 1 to 64 {start_ns, end_ns} objects" );
+                    const auto time = [&]( const json& value ) {
+                        int64_t result = 0;
+                        if( value.is_number_integer() ) return value.get<int64_t>();
+                        if( value.is_string() )
+                        {
+                            const auto& text = value.get_ref<const std::string&>();
+                            const auto parsed = std::from_chars( text.data(), text.data() + text.size(), result );
+                            if( parsed.ec == std::errc() && parsed.ptr == text.data() + text.size() && !text.empty() ) return result;
+                        }
+                        throw QueryError( "INVALID_PARAMS", "window times must be integers or decimal strings in ns" );
+                    };
+                    for( const auto& window : windows )
+                    {
+                        if( !window.is_object() || window.size() != 2 || !window.contains( "start_ns" ) || !window.contains( "end_ns" ) )
+                            throw QueryError( "INVALID_PARAMS", "each window must be {start_ns, end_ns}" );
+                        request.windows.push_back( { time( window["start_ns"] ), time( window["end_ns"] ) } );
+                    }
+                    try { request.windows = analysis::NormalizeAnalysisWindows( std::move( request.windows ) ); }
+                    catch( const std::invalid_argument& error ) { throw QueryError( "INVALID_PARAMS", error.what() ); }
+                }
                 return snapshot( m_scanManager->Start( request ) );
             }
             if( method == "analysis.scan.status" ) return snapshot( m_scanManager->Status( scanId ) );
@@ -9845,7 +9966,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                             { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
                             { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
                             { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
-                            { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                            { "flags", resource.flags }, { "name", resource.name }, { "category", resource.category.empty() ? json( nullptr ) : json( resource.category ) }, { "trust", "untrusted_trace_data" }
                         };
                     }
                     allocations.emplace_back( std::move( allocationJson ) );
@@ -9871,7 +9992,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                             { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
                             { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
                             { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
-                            { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                            { "flags", resource.flags }, { "name", resource.name }, { "category", resource.category.empty() ? json( nullptr ) : json( resource.category ) }, { "trust", "untrusted_trace_data" }
                         } );
                     }
                     json ownerRollups = json::array();
@@ -10269,7 +10390,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "size_bytes", Decimal( resource->size ) }, { "physical_offset_bytes", Decimal( resource->physicalOffset ) },
                         { "primary_owner_id", Decimal( uint64_t( resource->primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource->physicalOwnerId ) ) },
                         { "kind", std::string( 1, resource->kind ) }, { "segment", std::string( 1, resource->segment ) },
-                        { "flags", resource->flags }, { "name", resource->name }, { "trust", "untrusted_trace_data" }
+                        { "flags", resource->flags }, { "name", resource->name }, { "category", resource->category.empty() ? json( nullptr ) : json( resource->category ) }, { "trust", "untrusted_trace_data" }
                     };
                 }
             }
@@ -10291,7 +10412,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
                     { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
                     { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
-                    { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                    { "flags", resource.flags }, { "name", resource.name }, { "category", resource.category.empty() ? json( nullptr ) : json( resource.category ) }, { "trust", "untrusted_trace_data" }
                 } );
             }
             json ownerRollups = json::array();
@@ -10468,6 +10589,254 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "points", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
+    }
+    // The GPU memory plots of the trace (TracyJnVram.hpp).
+    const auto loadVramSeries = [&]( query::VramSeriesSet& series ) {
+        std::unordered_map<std::string, query::VramSeries*> wanted;
+        for( size_t index = 0; index < JnVram::Segments; ++index )
+        {
+            wanted[JnVram::DxgiUsagePlots[index]] = &series.usage[index];
+            wanted[JnVram::DxgiBudgetPlots[index]] = &series.budget[index];
+            wanted[JnVram::PhysicalTotalPlots[index]] = &series.physical[index];
+            wanted[JnVram::LogicalTotalPlots[index]] = &series.logical[index];
+            for( size_t ledger = 0; ledger < JnVram::Ledgers; ++ledger )
+                for( size_t category = 0; category < JnVram::Categories; ++category )
+                    wanted[JnVram::PlotNames[index][ledger][category]] = &series.categories[index][ledger][category];
+        }
+        wanted[JnVram::EvictedBytesPlot] = &series.evicted;
+        std::unordered_map<std::string, query::VramSeries*> byRef;
+        for( const auto& plot : source->GetPlotList() )
+        {
+            const auto found = wanted.find( plot.name );
+            if( found != wanted.end() ) byRef[plot.ref] = found->second;
+        }
+        if( const auto* fast = dynamic_cast<const analysis::FrameTriageSource*>( source.get() ) )
+        {
+            for( const auto& [ref, values] : byRef )
+            {
+                checkCancelled();
+                fast->VisitPlotPoints( ref, [values = values]( int64_t time, double value ) { values->push_back( { time, value } ); } );
+            }
+        }
+        else if( !byRef.empty() )
+        {
+            size_t offset = 0;
+            constexpr size_t chunk = 4096;
+            while( true )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange scan; scan.offset = offset; scan.limit = allowed;
+                const auto points = source->ScanPlots( scan );
+                BudgetScanned( points.size(), chunk, allowed );
+                for( const auto& point : points )
+                {
+                    const auto found = byRef.find( point.plotRef );
+                    if( found != byRef.end() ) found->second->push_back( { point.timeNs, point.value } );
+                }
+                offset += points.size();
+                if( points.size() < allowed ) break;
+            }
+        }
+        for( const auto& [ref, values] : byRef )
+            std::stable_sort( values->begin(), values->end(), []( const auto& a, const auto& b ) { return a.timeNs < b.timeNs; } );
+    };
+    if( method == "gpu.vram.summary" )
+    {
+        query::VramRequest request;
+        const auto segment = params.value( "segment", std::string( "all" ) );
+        if( segment != "local" && segment != "non_local" && segment != "all" ) throw QueryError( "INVALID_PARAMS", "segment must be local, non_local or all" );
+        request.segments = { segment != "non_local", segment != "local" };
+        const auto buckets = params.value( "buckets", int64_t( 60 ) );
+        if( buckets < 0 || buckets > 500 ) throw QueryError( "INVALID_PARAMS", "buckets must be between 0 and 500" );
+        request.buckets = size_t( buckets );
+        const auto range = ScanRangeFrom( params, 0, 1 );
+        if( params.contains( "start_ns" ) ) request.beginNs = range.startNs;
+        if( params.contains( "end_ns" ) ) request.endNs = range.endNs;
+        if( params.contains( "time_ns" ) )
+            request.atNs = ScanRangeFrom( json { { "start_ns", params["time_ns"] }, { "end_ns", Decimal( std::numeric_limits<int64_t>::max() ) } }, 0, 1 ).startNs;
+        query::VramSeriesSet series;
+        loadVramSeries( series );
+        return Success( id, query::VramSummary( series, request ), trace );
+    }
+    const auto vramFilter = [&]() {
+        query::VramResourceFilter filter;
+        filter.type = params.value( "type", std::string() );
+        filter.name = params.value( "name", std::string() );
+        if( !filter.type.empty() && !query::IsVramResourceType( filter.type ) )
+            throw QueryError( "INVALID_PARAMS", "type must be texture, render_target, depth_stencil, buffer, ray_tracing, other, upload or readback" );
+        return filter;
+    };
+    // The engine's logical resources, with their names and lifetimes, and
+    // the first and last time they record.
+    const auto loadVramResources = [&]( std::vector<query::VramResourceInput>& resources, int64_t& firstNs, int64_t& lastNs, query::VramSeriesSet& series ) {
+        loadVramSeries( series );
+        // A resource recorded before the engine's first sample after the
+        // connection existed before the capture: the engine records those
+        // resources when the capture connects, then samples.
+        const auto registryStart = query::VramRegistryStart( series );
+        firstNs = std::numeric_limits<int64_t>::max();
+        lastNs = std::numeric_limits<int64_t>::min();
+        const auto add = [&]( const analysis::GpuMemoryAllocationInput& allocation, const analysis::GpuMemoryLogicalResource& logical,
+            const analysis::GpuMemoryAllocationOrigin* origin ) {
+            query::VramResourceInput resource;
+            resource.name = logical.name;
+            resource.category = logical.category;
+            resource.kind = logical.kind;
+            resource.segment = logical.segment;
+            resource.sizeBytes = allocation.size;
+            resource.allocationId = allocation.allocationId;
+            resource.createdNs = allocation.allocationNs;
+            resource.freedNs = allocation.freeNs;
+            resource.preCapture = registryStart ? resource.createdNs <= *registryStart : origin && ( origin->preCapture || origin->replayed );
+            firstNs = std::min( firstNs, resource.createdNs );
+            lastNs = std::max( lastNs, resource.freedNs.value_or( resource.createdNs ) );
+            resources.push_back( std::move( resource ) );
+        };
+        if( auto page = source->ScanGpuMemoryAllocations( 0, MaximumPageSize, std::nullopt, "", "" ) )
+        {
+            // An indexed source pages its allocations.
+            for( size_t offset = 0;; )
+            {
+                for( const auto& item : page->allocations )
+                    if( item.logicalResource ) add( item.attribution.allocation, *item.logicalResource, item.origin ? &*item.origin : nullptr );
+                offset += page->allocations.size();
+                if( !page->hasMore || page->allocations.empty() ) break;
+                checkCancelled();
+                page = source->ScanGpuMemoryAllocations( offset, MaximumPageSize, std::nullopt, "", "" );
+                if( !page ) break;
+            }
+        }
+        else
+        {
+            const auto attributionValue = CachedGpuAttribution( trace.id, source );
+            const auto& attribution = *attributionValue;
+            for( const auto& item : attribution.allocations )
+            {
+                if( item.allocation.poolName.rfind( "GPU D3D12 Logical ", 0 ) != 0 ) continue;
+                const analysis::GpuMemoryLogicalResource* logical = nullptr;
+                if( const auto generation = attribution.logicalGenerationByKey.find( item.allocation.key );
+                    generation != attribution.logicalGenerationByKey.end() && generation->second < attribution.logicalGenerations.size() )
+                    logical = &attribution.logicalGenerations[generation->second];
+                else if( const auto found = attribution.logicalById.find( item.allocation.allocationId ); found != attribution.logicalById.end() )
+                    logical = &attribution.logicalResources[found->second];
+                if( !logical ) continue;
+                const analysis::GpuMemoryAllocationOrigin* origin = nullptr;
+                if( const auto found = attribution.logicalOriginById.find( item.allocation.allocationId );
+                    found != attribution.logicalOriginById.end() && found->second < attribution.origins.size() )
+                    origin = &attribution.origins[found->second];
+                add( item.allocation, *logical, origin );
+            }
+        }
+    };
+    const json noVramResources = { { "present", false }, { "reason", "the trace has no GTMEM logical resource records: the JN engine's GPU memory tracking was off, or the capture predates them" } };
+    if( method == "gpu.vram.resources" || method == "gpu.vram.resource_growth" )
+    {
+        const auto segmentName = params.value( "segment", std::string( "local" ) );
+        if( segmentName != "local" && segmentName != "non_local" ) throw QueryError( "INVALID_PARAMS", "segment must be local or non_local" );
+        const size_t segment = segmentName == "local" ? 0 : 1;
+        const auto filter = vramFilter();
+        std::vector<query::VramResourceInput> resources;
+        int64_t firstNs = 0, lastNs = 0;
+        query::VramSeriesSet series;
+        loadVramResources( resources, firstNs, lastNs, series );
+        if( resources.empty() ) return Success( id, noVramResources, trace );
+        const auto timeParam = [&]( const char* key ) {
+            return ScanRangeFrom( json { { "start_ns", params[key] }, { "end_ns", Decimal( std::numeric_limits<int64_t>::max() ) } }, 0, 1 ).startNs;
+        };
+        if( method == "gpu.vram.resources" )
+        {
+            // By default the time of the segment's DXGI usage peak.
+            int64_t time = lastNs;
+            std::string timeSource = "last_record";
+            if( params.contains( "time_ns" ) )
+            {
+                time = timeParam( "time_ns" );
+                timeSource = "time_ns";
+            }
+            else if( const auto peak = query::VramUsagePeak( series, segment ) )
+            {
+                time = *peak;
+                timeSource = "dxgi_usage_peak";
+            }
+            const auto page = ParsePage( params, method, trace );
+            auto result = query::VramResourcesAt( resources, segment, time, filter, page.offset, page.limit );
+            result["time_source"] = timeSource;
+            const auto returned = result["resources"].size();
+            const auto cursor = NextCursor( page, method, trace, returned, result["resources_truncated"].get<bool>() );
+            return Success( id, std::move( result ), trace, PageJson( page, returned, cursor ) );
+        }
+        // By default from the first record to after the last.
+        const auto begin = params.contains( "start_ns" ) ? timeParam( "start_ns" ) : firstNs;
+        const auto end = params.contains( "end_ns" ) ? timeParam( "end_ns" ) : lastNs + 1;
+        if( end <= begin ) throw QueryError( "INVALID_PARAMS", "end_ns must be after start_ns" );
+        const auto limit = params.value( "limit", int64_t( 50 ) );
+        if( limit < 1 || limit > int64_t( MaximumPageSize ) ) throw QueryError( "INVALID_PARAMS", "limit must be between 1 and 1000" );
+        return Success( id, query::VramResourceGrowth( resources, segment, begin, end, filter, size_t( limit ) ), trace );
+    }
+    if( method == "gpu.frame.resources" )
+    {
+        // A frame of a frame set, or a time range.
+        int64_t begin = 0, end = 0;
+        json frame = nullptr;
+        if( params.contains( "frame_index" ) )
+        {
+            const auto setIndex = ResolveFrameSet( *source, params );
+            const auto frames = source->GetFramesForSet( setIndex, params["frame_index"].get<size_t>(), 1 );
+            if( frames.empty() ) throw QueryError( "ENTITY_NOT_FOUND", "frame_index was not found in the frame set" );
+            if( !frames.front().endNs ) throw QueryError( "ENTITY_NOT_FOUND", "the frame has not ended in the trace" );
+            begin = frames.front().beginNs;
+            end = *frames.front().endNs;
+            frame = FrameJson( frames.front() );
+        }
+        else if( params.contains( "start_ns" ) && params.contains( "end_ns" ) )
+        {
+            const auto range = ScanRangeFrom( params, 0, 1 );
+            begin = range.startNs;
+            end = range.endNs;
+        }
+        else throw QueryError( "INVALID_PARAMS", "frame_index, or start_ns and end_ns, is required" );
+        if( end <= begin ) throw QueryError( "INVALID_PARAMS", "end_ns must be after start_ns" );
+        const auto filter = vramFilter();
+        // A frame at pass granularity holds tens of thousands of references.
+        constexpr size_t MaximumFrameReferences = 1u << 20;
+        const auto references = source->ScanGpuReferencesInRange( begin, end, MaximumFrameReferences );
+        if( !references )
+            return Success( id, { { "present", false }, { "reason", "the trace has no GPU resource references: [GpuReference] Mode was off, or the capture predates them" } }, trace );
+        query::VramFrameReferences used;
+        used.beginNs = begin;
+        used.endNs = end;
+        used.passes = references->passes.size();
+        for( const auto& pass : references->passes ) if( pass.taxonomyLevel == 0 ) used.commandListSets++;
+        used.truncated = references->truncated;
+        std::unordered_map<uint64_t, size_t> position;
+        // The passes that referenced each resource; a pass can reference one
+        // more than once.
+        std::vector<std::pair<uint64_t, uint64_t>> passResources;
+        passResources.reserve( references->uses.size() );
+        for( const auto& use : references->uses )
+        {
+            auto [found, added] = position.try_emplace( use.resourceId, used.resources.size() );
+            if( added ) used.resources.push_back( { use.resourceId, use.time, 0, 0 } );
+            auto& resource = used.resources[found->second];
+            resource.firstNs = std::min( resource.firstNs, use.time );
+            resource.usageMask |= use.usageMask;
+            passResources.emplace_back( use.resourceId, use.passId );
+        }
+        std::sort( passResources.begin(), passResources.end() );
+        passResources.erase( std::unique( passResources.begin(), passResources.end() ), passResources.end() );
+        for( const auto& [resourceId, passId] : passResources ) used.resources[position[resourceId]].passes++;
+        std::vector<query::VramResourceInput> resources;
+        int64_t firstNs = 0, lastNs = 0;
+        query::VramSeriesSet series;
+        loadVramResources( resources, firstNs, lastNs, series );
+        if( resources.empty() ) return Success( id, noVramResources, trace );
+        const auto page = ParsePage( params, method, trace );
+        auto result = query::VramFrameResources( resources, used, filter, page.offset, page.limit );
+        result["frame"] = std::move( frame );
+        const auto returned = result["resources"].size();
+        const auto cursor = NextCursor( page, method, trace, returned, result["resources_truncated"].get<bool>() );
+        return Success( id, std::move( result ), trace, PageJson( page, returned, cursor ) );
     }
     if( method == "plot.statistics" || method == "plot.downsample" )
     {
@@ -13994,7 +14363,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         json findings = json::array();
         const auto metadata = info();
-        const auto addFinding = [&]( const char* severity, const char* code, std::string message, uint64_t count, json refs = json::array() ) {
+        const auto addFinding = [&]( const char* severity, const char* code, std::string message, uint64_t count, json refs = json() ) {
+            if( refs.is_null() ) refs = json::array();
             findings.push_back( { { "severity", severity }, { "code", code }, { "message", std::move( message ) },
                 { "count", Decimal( count ) }, { "refs", std::move( refs ) } } );
         };

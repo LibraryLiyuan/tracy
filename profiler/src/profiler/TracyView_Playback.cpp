@@ -14,7 +14,7 @@ void View::SetPlaybackFrame( uint32_t idx )
 
     m_playback.frame = idx;
 
-    if( idx == frameImages.size() - 1 )
+    if( idx == frameImages.size() - 1 || frameImages[idx]->frameRef >= frameSet->frames.size() || frameImages[idx+1]->frameRef >= frameSet->frames.size() )
     {
         m_playback.pause = true;
     }
@@ -45,7 +45,10 @@ void View::DrawPlayback()
     const auto& fi = frameImages[m_playback.frame];
     const auto ficnt = m_worker.GetFrameImageCount();
 
-    const auto tstart = m_worker.GetFrameBegin( *frameSet, fi->frameRef );
+    const bool hasFrame = fi->frameRef < frameSet->frames.size();
+    const bool canPlay = hasFrame && m_playback.frame + 1 < frameImages.size() && frameImages[m_playback.frame+1]->frameRef < frameSet->frames.size();
+    const auto tstart = hasFrame ? m_worker.GetFrameBegin( *frameSet, fi->frameRef ) : 0;
+    if( !canPlay ) m_playback.pause = true;
 
     if( !m_playback.texture )
     {
@@ -56,7 +59,7 @@ void View::DrawPlayback()
         m_playback.currFrame = m_playback.frame;
         UpdateTexture( m_playback.texture, m_worker.UnpackFrameImage( *fi ), fi->w, fi->h );
 
-        if( m_playback.sync )
+        if( m_playback.sync && hasFrame )
         {
             const auto end = m_worker.GetFrameEnd( *frameSet, fi->frameRef );
             m_zoomAnim.active = false;
@@ -165,10 +168,12 @@ void View::DrawPlayback()
     ImGui::SameLine();
     if( m_playback.pause )
     {
-        if( ImGui::Button( PlaybackWindowButtons[0], ImVec2( bw, 0 ) ) && m_playback.frame != frameImages.size() - 1 )
+        ImGui::BeginDisabled( !canPlay );
+        if( ImGui::Button( PlaybackWindowButtons[0], ImVec2( bw, 0 ) ) && canPlay )
         {
             m_playback.pause = false;
         }
+        ImGui::EndDisabled();
     }
     else
     {
@@ -180,7 +185,7 @@ void View::DrawPlayback()
     ImGui::SameLine();
     if( ImGui::Checkbox( "Sync timeline", &m_playback.sync ) )
     {
-        if( m_playback.sync )
+        if( m_playback.sync && hasFrame )
         {
             m_vd.zvStart = m_worker.GetFrameBegin( *frameSet, fi->frameRef );
             m_vd.zvEnd = m_worker.GetFrameEnd( *frameSet, fi->frameRef );
@@ -191,12 +196,12 @@ void View::DrawPlayback()
     }
     ImGui::SameLine();
     ImGui::Checkbox( "Zoom 2\xc3\x97", &m_playback.zoom );
-    TextFocused( "Timestamp:", TimeToString( tstart ) );
-    TooltipIfHovered( TimeToStringExact( tstart ) );
+    TextFocused( "Timestamp:", hasFrame ? TimeToString( tstart ) : "Frame not recorded" );
+    if( hasFrame ) TooltipIfHovered( TimeToStringExact( tstart ) );
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();
-    TextFocused( "Frame:", RealToString( GetFrameNumber( *frameSet, fi->frameRef ) ) );
+    TextFocused( "Frame:", hasFrame ? RealToString( GetFrameNumber( *frameSet, fi->frameRef ) ) : "Unassociated image" );
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();

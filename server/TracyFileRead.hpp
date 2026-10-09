@@ -439,6 +439,9 @@ public:
     }
 
     const std::string& GetFilename() const { return m_filename; }
+    // The next stream's exhausted flag is owned by this reader thread. Already
+    // queued blocks remain visible even when all compressed input was prefetched.
+    bool HasData() const { return m_offset < m_bufSize || !m_streams[m_streamId]->exhausted; }
 
 private:
     static uint64_t EstimateStreamMemory( uint8_t type )

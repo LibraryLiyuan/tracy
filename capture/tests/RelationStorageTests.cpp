@@ -1,10 +1,11 @@
 #include "../src/OfflineValidationSink.hpp"
 #include <fstream>
 #include <cstdio>
+#include <chrono>
 using namespace tracy;
 static void Check(bool v){if(!v)throw std::runtime_error("relation storage invariant");}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
-static void Zones(conversion::OfflineValidationSink& sink){sink.GlobalStringsBegin(0);sink.GlobalStringsEnd();for(uint8_t kind=0;kind<3;++kind){sink.GlobalPointerTableBegin(kind,0);sink.GlobalPointerTableEnd(kind);}sink.CallstacksBegin(0);sink.CallstacksEnd();ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();sink.CpuZonesBegin(0);sink.CpuZonesEnd();sink.GpuZonesBegin(0);sink.GpuZonesEnd();sink.CatalogMetadata({});
+static void Zones(conversion::OfflineValidationSink& sink,bool frames=true){sink.GlobalStringsBegin(0);sink.GlobalStringsEnd();for(uint8_t kind=0;kind<3;++kind){sink.GlobalPointerTableBegin(kind,0);sink.GlobalPointerTableEnd(kind);}sink.CallstacksBegin(0);sink.CallstacksEnd();if(frames){sink.CallstackFrameDefinitionsBegin(0);sink.CallstackFrameDefinitionsEnd();}ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();sink.CpuZonesBegin(0);sink.CpuZonesEnd();sink.GpuZonesBegin(0);sink.GpuZonesEnd();sink.CatalogMetadata({});
 #define X(name,field,type,mut) sink.JnRecordsBegin(SerializedZoneSink::JnDomain::name,0,sizeof(type));sink.JnRecordsEnd(SerializedZoneSink::JnDomain::name);
  TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
@@ -13,7 +14,7 @@ int main(int argc,char** argv){try{
  StringIdx largest(0xFFFFFE);Check(largest.Active()&&largest.Idx()==0xFFFFFE);
  Check(StringIdx(0xFFFFFF).Idx()==0xFFFFFF);
  Refuses([]{StringIdx invalid(UINT32_MAX);});
- if(argc!=2)return 2;auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
+ if(argc!=2)return 2;auto root=std::filesystem::path(argv[1])/std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());std::filesystem::create_directories(root);
  storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
@@ -28,6 +29,7 @@ int main(int argc,char** argv){try{
  conversion::OfflineConversionStorage empty(root/"empty",identity,resources);empty.Seal();empty.SealCatalog({});
  Check(empty.RelationCount()==0&&!std::filesystem::exists(root/"empty/relations"));
  conversion::OfflineValidationSink sink(empty,resources);Zones(sink);sink.Finish();
+ conversion::OfflineValidationSink missingFrames(empty,resources);Zones(missingFrames,false);Refuses([&]{missingFrames.Finish();});
  conversion::OfflineValidationSink begun(empty,resources);Zones(begun);begun.JnRecordsBegin(Domain::Relation,0,37);Refuses([&]{begun.Finish();});begun.JnRecordsEnd(Domain::Relation);begun.Finish();
  }
  {

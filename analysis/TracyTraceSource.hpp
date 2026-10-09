@@ -1319,6 +1319,9 @@ public:
     virtual std::optional<GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t, size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t, size_t, std::optional<uint64_t>, const std::string&, const std::string& ) const { return std::nullopt; }
+    // The GPU reference passes that began in [begin, end) and at most maxUses
+    // of the resources they referenced; none from a source without references.
+    virtual std::optional<GpuReferenceRange> ScanGpuReferencesInRange( int64_t, int64_t, size_t ) const { return std::nullopt; }
     virtual GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const
     {
         GpuMemoryEvidenceSlice result;

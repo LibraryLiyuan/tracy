@@ -3,15 +3,24 @@
 
 #include "TracyHash.hpp"
 #include "TracyAnalysisDictionary.hpp"
+#include "TracyCpuZoneScanSource.hpp"
+#include "TracyWindowedTraceSource.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -220,6 +229,30 @@ CpuWorkClass Classify( const CpuZoneDto& zone )
     return CpuWorkClass::ActiveWork;
 }
 
+// The id hashes the signature kind, thread identity, parent signature and the
+// zone's source fields. Zones of one call path repeat these inputs, so the
+// memo computes each distinct preimage's SHA-256 once; `added` reports a new
+// preimage for workspace accounting.
+std::string SignatureId( Sha256HexMemo& memo, bool& added, bool logical, std::string_view threadIdentity,
+    std::string_view parent, std::string_view sourceLocationRef, std::string_view name, std::string_view function,
+    std::string_view file, uint32_t line, bool stableSite = false )
+{
+    memo.Begin();
+    const uint8_t kind = logical ? 1 : 0;
+    memo.Add( &kind, sizeof( kind ) );
+    memo.AddString( threadIdentity );
+    if( !stableSite ) memo.AddString( parent );
+    memo.AddString( sourceLocationRef );
+    if( !stableSite || sourceLocationRef.empty() )
+    {
+        memo.AddString( name );
+        memo.AddString( function );
+        memo.AddString( file );
+        memo.Add( &line, sizeof( line ) );
+    }
+    return std::string( logical ? "cpu-logical:" : "cpu-exact:" ) + memo.Digest( added );
+}
+
 void HashString( Sha256Builder& hash, std::string_view value )
 {
     const auto size = uint64_t( value.size() );
@@ -247,20 +280,63 @@ std::string SignatureId( bool logical, std::string_view threadIdentity,
     return std::string( logical ? "cpu-logical:" : "cpu-exact:" ) + hash.FinalHex();
 }
 
+std::string SignatureId( Sha256HexMemo& memo, bool& added, bool logical, std::string_view threadIdentity,
+    std::string_view parent, const CpuZoneDto& zone, bool stableSite = false )
+{
+    static_assert( std::is_same_v<decltype( zone.line ), uint32_t> );
+    return SignatureId( memo, added, logical, threadIdentity, parent, zone.sourceLocationRef, zone.name,
+        zone.function, zone.file, zone.line, stableSite );
+}
+
+// Zone findings of both zone passes, indexed by ZoneFinding.
+enum class ZoneFinding : uint8_t
+{
+    InvalidTiming,
+    MissingEnd,
+    MissingParent,
+    Unassigned,
+    ChildOutsideParent,
+    ChildUnionExceedsParent
+};
+
+struct ZoneFindingText
+{
+    const char* code;
+    const char* message;
+};
+
+constexpr ZoneFindingText ZoneFindingTexts[] = {
+    { "invalid_zone_timing", "Zone end precedes its begin." },
+    { "missing_zone_end", "Zone has no closing timestamp." },
+    { "missing_parent_zone", "Parent zone was not available on the same bounded thread stack." },
+    { "zone_unassigned_to_complete_frame", "A valid zone does not intersect any complete frame and is excluded from exact frame denominators." },
+    { "child_outside_parent", "Child zone is not contained by its declared parent interval." },
+    { "child_union_exceeds_parent", "Direct child interval union exceeds its clipped parent interval." }
+};
+
+const ZoneFindingText& FindingText( ZoneFinding finding )
+{
+    return ZoneFindingTexts[size_t( finding )];
+}
+
+// Children arrive in start order, so the intervals are usually sorted
+// already. Cancellation is polled per 4096 intervals.
 int64_t IntervalUnion( std::vector<std::pair<int64_t, int64_t>> intervals,
     const std::function<bool()>& cancelled )
 {
     CheckCancelled( cancelled );
     if( intervals.empty() ) return 0;
-    std::sort( intervals.begin(), intervals.end(), [&]( const auto& a, const auto& b ) {
-        CheckCancelled( cancelled ); return a < b;
-    } );
+    if( !std::is_sorted( intervals.begin(), intervals.end() ) )
+    {
+        std::sort( intervals.begin(), intervals.end() );
+        CheckCancelled( cancelled );
+    }
     int64_t total = 0;
     auto begin = intervals.front().first;
     auto end = intervals.front().second;
     for( size_t i = 1; i < intervals.size(); ++i )
     {
-        CheckCancelled( cancelled );
+        if( ( i & 4095 ) == 0 ) CheckCancelled( cancelled );
         if( intervals[i].first <= end )
         {
             end = std::max( end, intervals[i].second );
@@ -279,6 +355,353 @@ void AddRepresentative( std::vector<std::string>& refs, const std::string& ref )
 {
     if( refs.size() >= RepresentativeLimit ) return;
     if( std::find( refs.begin(), refs.end(), ref ) == refs.end() ) refs.emplace_back( ref );
+}
+
+// Compact-record zone pass. Each thread's zones are split into chunks that
+// start at zones without a parent, where the DTO pass has closed every zone of
+// the thread. Workers run the DTO pass's per-zone steps on whole chunks and
+// record, in order, the steps that depend on scan-wide state: a signature's
+// first use, frame runs and findings. The scanning thread replays the chunks
+// in scan order through the DTO pass's own definition, run and finding steps.
+constexpr uint32_t NoSignature = UINT32_MAX;
+
+enum class NativeEventKind : uint8_t
+{
+    Signature,
+    Run,
+    Finding
+};
+
+struct NativeEvent
+{
+    const FrameBoundary* frame = nullptr;   // Run
+    uint64_t ordinal = 0;                   // Run, Finding: the zone
+    int64_t inclusive = 0;                  // Run
+    int64_t childUnion = 0;                 // Run
+    uint32_t index = 0;                     // Signature, Run: chunk signature; Finding: message + 1, or 0
+    NativeEventKind kind = NativeEventKind::Run;
+    uint8_t code = 0;                       // Run: exact; Finding: ZoneFinding
+};
+
+// A signature's first use in a chunk, with the fields its definition takes
+// from the zone that uses it.
+struct NativeSignature
+{
+    std::string id;
+    uint32_t parent = NoSignature;
+    uint32_t location = 0;
+    uint32_t depth = 0;
+    bool hasName = false;
+    std::string name;
+};
+
+struct NativeChunk
+{
+    size_t thread = 0;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    // The thread's last chunk: the zones still open at its end are closed
+    // when the whole scan ends.
+    bool last = false;
+};
+
+struct NativeChunkResult
+{
+    explicit NativeChunkResult( std::shared_ptr<AnalysisWorkspaceBudget> budget ) : workspace( std::move( budget ) ) {}
+    AnalysisWorkspaceReservation workspace;
+    std::vector<NativeEvent> events;
+    std::vector<NativeEvent> finalEvents;
+    std::vector<NativeSignature> signatures;
+    std::vector<std::string> messages;
+    uint64_t inputZones = 0;
+    uint64_t validZones = 0;
+    uint64_t invalidZones = 0;
+    uint64_t unassignedZones = 0;
+    uint64_t probes = 0;
+    size_t maximumDepth = 0;
+    std::exception_ptr error;
+};
+
+struct NativeZone
+{
+    uint64_t ordinal = 0;
+    uint32_t signature = 0;
+    int64_t beginNs = 0;
+    int64_t endNs = 0;
+    bool exact = true;
+    uint64_t bytes = 0;
+    std::vector<FrameContribution> frames;
+    // Direct children's clipped intervals by frame.
+    std::vector<std::pair<const FrameBoundary*, std::vector<std::pair<int64_t, int64_t>>>> children;
+};
+
+struct NativeScanInput
+{
+    const CpuZoneScanSource& source;
+    const std::vector<CpuZoneScanThread>& threads;
+    const std::vector<CpuZoneScanLocation>& locations;
+    const std::map<std::string, std::vector<FrameBoundary*>>& framesBySet;
+    size_t batch = 4096;
+    // Zones that meet none of these windows are skipped.
+    const std::vector<AnalysisTimeWindow>* windows = nullptr;
+};
+
+struct NativeWorker
+{
+    explicit NativeWorker( const std::shared_ptr<AnalysisWorkspaceBudget>& budget ) : stackWorkspace( budget ), memoWorkspace( budget ) {}
+    std::unique_ptr<CpuZoneScanReader> reader;
+    std::vector<CpuZoneScanRecord> records;
+    std::vector<NativeZone> stack;
+    uint64_t stackBytes = 0;
+    AnalysisWorkspaceReservation stackWorkspace;
+    // Exact signatures hash the thread, so a memo serves one thread at a time.
+    Sha256HexMemo memo;
+    size_t memoThread = SIZE_MAX;
+    AnalysisWorkspaceReservation memoWorkspace;
+};
+
+void ProcessNativeChunk( const NativeScanInput& input, const NativeChunk& chunk, NativeWorker& worker,
+    NativeChunkResult& out, const std::atomic<bool>& abort )
+{
+    const auto& thread = input.threads[chunk.thread];
+    if( worker.memoThread != chunk.thread )
+    {
+        worker.memo = Sha256HexMemo();
+        worker.memoWorkspace.Resize( 0 );
+        worker.memoThread = chunk.thread;
+    }
+    if( !worker.reader ) worker.reader = input.source.OpenCpuZoneScanReader();
+    auto& reader = *worker.reader;
+    auto& stack = worker.stack;
+    stack.clear();
+    worker.stackBytes = 0;
+    const auto chargeStack = [&]( uint64_t bytes ) {
+        worker.stackBytes += bytes;
+        if( worker.stackBytes > worker.stackWorkspace.Bytes() )
+            worker.stackWorkspace.Resize( std::max( worker.stackBytes, 2 * worker.stackWorkspace.Bytes() ) );
+    };
+    std::unordered_map<uint64_t, uint32_t> plain;
+    std::unordered_map<std::string, uint32_t> named;
+    std::string key;
+    const auto emit = [&]( std::vector<NativeEvent>& events, const NativeEvent& event ) {
+        if( events.size() == events.capacity() )
+        {
+            const auto capacity = std::max<size_t>( 1024, events.capacity() * 2 );
+            out.workspace.Add( uint64_t( capacity - events.capacity() ) * sizeof( NativeEvent ) );
+            events.reserve( capacity );
+        }
+        events.push_back( event );
+    };
+    const auto finding = [&]( std::vector<NativeEvent>& events, ZoneFinding code, uint64_t ordinal, uint32_t message = 0 ) {
+        NativeEvent event;
+        event.kind = NativeEventKind::Finding;
+        event.code = uint8_t( code );
+        event.ordinal = ordinal;
+        event.index = message;
+        emit( events, event );
+    };
+    const auto closeTop = [&]( std::vector<NativeEvent>& events ) {
+        auto zone = std::move( stack.back() );
+        stack.pop_back();
+        for( const auto& contribution : zone.frames )
+        {
+            // The DTO pass keys children by frame ref and moves the intervals
+            // out on first use; a repeated ref then finds none.
+            int64_t childUnion = 0;
+            for( auto& [frame, intervals] : zone.children )
+            {
+                if( frame != contribution.frame && frame->ref != contribution.frame->ref ) continue;
+                childUnion = IntervalUnion( std::move( intervals ), {} );
+                intervals.clear();
+                break;
+            }
+            auto exact = zone.exact;
+            if( childUnion > contribution.endNs - contribution.beginNs )
+            {
+                exact = false;
+                finding( events, ZoneFinding::ChildUnionExceedsParent, zone.ordinal );
+            }
+            NativeEvent event;
+            event.kind = NativeEventKind::Run;
+            event.index = zone.signature;
+            event.frame = contribution.frame;
+            event.ordinal = zone.ordinal;
+            event.inclusive = contribution.endNs - contribution.beginNs;
+            event.childUnion = childUnion;
+            event.code = exact ? 1 : 0;
+            emit( events, event );
+        }
+        worker.stackBytes -= zone.bytes;
+    };
+    const auto signatureOf = [&]( const CpuZoneScanRecord& zone, uint32_t parent, uint32_t depth,
+        std::vector<NativeEvent>& events ) -> uint32_t {
+        const uint64_t plainKey = ( uint64_t( uint32_t( parent + 1u ) ) << 32 ) | zone.location;
+        uint32_t* slot = nullptr;
+        if( !zone.hasName )
+        {
+            const auto [it, inserted] = plain.try_emplace( plainKey, NoSignature );
+            if( !inserted ) return it->second;
+            slot = &it->second;
+        }
+        else
+        {
+            key.assign( reinterpret_cast<const char*>( &plainKey ), sizeof( plainKey ) );
+            key.append( zone.name );
+            const auto found = named.find( key );
+            if( found != named.end() ) return found->second;
+            slot = &named.emplace( key, NoSignature ).first->second;
+        }
+        const auto& location = input.locations[zone.location];
+        bool added = false;
+        auto id = SignatureId( worker.memo, added, false, thread.ref,
+            parent == NoSignature ? std::string_view() : std::string_view( out.signatures[parent].id ),
+            location.ref, zone.hasName ? zone.name : std::string_view( location.name ), location.function,
+            location.file, location.line );
+        if( added ) worker.memoWorkspace.Add( 256 + 2ull * worker.memo.PreimageBytes() + 2ull * id.size() );
+        out.workspace.Add( 256 + 2ull * ( id.size() + ( zone.hasName ? zone.name.size() : 0 ) ) );
+        const auto index = uint32_t( out.signatures.size() );
+        out.signatures.push_back( { std::move( id ), parent, zone.location, depth, zone.hasName,
+            zone.hasName ? std::string( zone.name ) : std::string() } );
+        *slot = index;
+        NativeEvent event;
+        event.kind = NativeEventKind::Signature;
+        event.index = index;
+        emit( events, event );
+        return index;
+    };
+
+    reader.Seek( chunk.thread, chunk.begin );
+    auto& events = out.events;
+    uint64_t next = chunk.begin;
+    while( next < chunk.end )
+    {
+        if( abort.load( std::memory_order_relaxed ) ) return;
+        reader.Read( worker.records, size_t( std::min<uint64_t>( input.batch, chunk.end - next ) ) );
+        if( worker.records.empty() ) throw BoundedScanError( "frame_cpu_scan_zone_records_missing" );
+        for( const auto& zone : worker.records )
+        {
+            if( zone.ordinal != next++ ) throw BoundedScanError( "frame_cpu_scan_zone_records_order" );
+            // Its descendants lie within it and are skipped too.
+            if( input.windows && !AnalysisWindowsMeet( *input.windows, zone.startNs,
+                zone.hasEnd ? std::max( zone.endNs, zone.startNs ) : std::numeric_limits<int64_t>::max() ) ) continue;
+            ++out.inputZones;
+            const bool hasParent = zone.parent != CpuZoneScanRecord::NoParent;
+            size_t parentPosition = std::numeric_limits<size_t>::max();
+            if( hasParent )
+            {
+                for( size_t i = stack.size(); i > 0; --i )
+                {
+                    if( stack[i-1].ordinal == zone.parent )
+                    {
+                        parentPosition = i - 1;
+                        break;
+                    }
+                }
+                if( parentPosition != std::numeric_limits<size_t>::max() )
+                    while( stack.size() > parentPosition + 1 ) closeTop( events );
+            }
+            else
+            {
+                while( !stack.empty() ) closeTop( events );
+            }
+
+            const bool timingValid = zone.complete && zone.hasEnd && zone.timingValid && zone.endNs >= zone.startNs;
+            if( !timingValid )
+            {
+                ++out.invalidZones;
+                uint32_t message = 0;
+                if( zone.hasInvalidReason )
+                {
+                    out.workspace.Add( 64 + zone.invalidReason.size() );
+                    out.messages.emplace_back( zone.invalidReason );
+                    message = uint32_t( out.messages.size() );
+                }
+                finding( events, zone.hasEnd ? ZoneFinding::InvalidTiming : ZoneFinding::MissingEnd, zone.ordinal, message );
+                if( parentPosition != std::numeric_limits<size_t>::max() && !stack.empty() ) stack.back().exact = false;
+                continue;
+            }
+
+            const bool parentResolved = !hasParent || parentPosition != std::numeric_limits<size_t>::max();
+            bool structuralExact = true;
+            if( hasParent && !parentResolved )
+            {
+                structuralExact = false;
+                finding( events, ZoneFinding::MissingParent, zone.ordinal );
+            }
+            ++out.validZones;
+            const bool nested = hasParent && parentResolved && !stack.empty();
+            const auto depth = nested ? uint32_t( stack.size() ) : 0u;
+            out.maximumDepth = std::max( out.maximumDepth, size_t( depth ) );
+            const auto signature = signatureOf( zone, nested ? stack.back().signature : NoSignature, depth, events );
+
+            NativeZone active;
+            active.ordinal = zone.ordinal;
+            active.signature = signature;
+            active.beginNs = zone.startNs;
+            active.endNs = zone.endNs;
+            active.exact = structuralExact;
+            for( const auto& [frameSet, candidates] : input.framesBySet )
+            {
+                size_t first = 0;
+                size_t last = candidates.size();
+                while( first < last )
+                {
+                    ++out.probes;
+                    const auto middle = first + ( last - first ) / 2;
+                    if( candidates[middle]->endNs <= zone.startNs ) first = middle + 1;
+                    else last = middle;
+                }
+                for( auto index = first; index < candidates.size(); ++index )
+                {
+                    ++out.probes;
+                    const auto& frame = *candidates[index];
+                    if( frame.beginNs >= zone.endNs ) break;
+                    const auto begin = std::max( zone.startNs, frame.beginNs );
+                    const auto end = std::min( zone.endNs, frame.endNs );
+                    if( end > begin ) active.frames.push_back( { &frame, begin, end } );
+                }
+            }
+            if( active.frames.empty() )
+            {
+                ++out.unassignedZones;
+                finding( events, ZoneFinding::Unassigned, zone.ordinal );
+            }
+            if( nested )
+            {
+                auto& parent = stack.back();
+                if( zone.startNs < parent.beginNs || zone.endNs > parent.endNs )
+                {
+                    parent.exact = false;
+                    active.exact = false;
+                    finding( events, ZoneFinding::ChildOutsideParent, zone.ordinal );
+                }
+                for( const auto& parentFrame : parent.frames )
+                {
+                    const auto begin = std::max( zone.startNs, parentFrame.beginNs );
+                    const auto end = std::min( zone.endNs, parentFrame.endNs );
+                    if( end <= begin ) continue;
+                    auto entry = std::find_if( parent.children.begin(), parent.children.end(), [&]( const auto& value ) {
+                        return value.first == parentFrame.frame || value.first->ref == parentFrame.frame->ref;
+                    } );
+                    if( entry == parent.children.end() )
+                    {
+                        parent.children.emplace_back( parentFrame.frame, std::vector<std::pair<int64_t, int64_t>>() );
+                        entry = std::prev( parent.children.end() );
+                        parent.bytes += 64;
+                        chargeStack( 64 );
+                    }
+                    entry->second.emplace_back( begin, end );
+                    parent.bytes += 32;
+                    chargeStack( 32 );
+                }
+            }
+            active.bytes = sizeof( NativeZone ) + 64ull * active.frames.size();
+            chargeStack( active.bytes );
+            stack.push_back( std::move( active ) );
+        }
+    }
+    auto& tail = chunk.last ? out.finalEvents : out.events;
+    while( !stack.empty() ) closeTop( tail );
 }
 
 }
@@ -509,6 +932,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     // millions of zone instances but usually only thousands of locations;
     // compute SHA-256 once per unique site instead of once per occurrence.
     std::array<std::unordered_map<std::string, std::string>, 4> stableLogicalSignatures;
+    Sha256HexMemo signatureMemo;
+    const auto signatureId = [&]( bool logical, std::string_view identity, std::string_view parent,
+        const CpuZoneDto& zone, bool stableSite ) {
+        bool added = false;
+        auto id = SignatureId( signatureMemo, added, logical, identity, parent, zone, stableSite );
+        if( added ) signatureWorkspace.Add( 256 + 2ull * signatureMemo.PreimageBytes() + 2ull * id.size() );
+        return id;
+    };
 
     AnalysisDictionary dictionary( options.workspace );
     struct SignatureEntry
@@ -583,11 +1014,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         return ordinal;
     };
 
+    // `replay`: the compact-record replay holds a reservation for this run's
+    // transient state and checks cancellation itself, every few thousand runs.
     auto updateRun = [&]( std::string_view signature, uint32_t signatureOrdinal,
         const FrameContribution& contribution, int64_t directChildUnion,
-        bool exact, const std::string& ref ) {
+        bool exact, const std::string& ref, bool replay = false ) {
         if( signature.empty() ) return;
-        AnalysisWorkspaceReservation currentRun( options.workspace, 1024 + 4 *
+        std::optional<AnalysisWorkspaceReservation> currentRun;
+        if( !replay ) currentRun.emplace( options.workspace, 1024 + 4 *
             ( signature.size() + contribution.frame->frameSetRef.size() + contribution.frame->ref.size() + ref.size() ) );
         const auto inclusive = contribution.endNs - contribution.beginNs;
         if( sink || viewSink )
@@ -601,7 +1035,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     signatureOrdinal, contribution.frame->frameSetOrdinal,
                     contribution.frame->index, inclusive, directChildUnion,
                     inclusive - directChildUnion, 1,
-                    exact && directChildUnion <= inclusive, ref, workClass };
+                    exact && directChildUnion <= inclusive, options.runRefs ? std::string_view(ref) : std::string_view(), workClass };
                 const bool sample=timed && (emittedRunCount & 4095u)==0;
                 const auto sampleStarted=sample ? std::chrono::steady_clock::now() : scanStarted;
                 accepted = ( *viewSink )( run );
@@ -620,7 +1054,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             }
             if( !accepted ) throw std::runtime_error( "frame_cpu_scan_sink_cancelled" );
             ++emittedRunCount;
-            checkCancelled();
+            if( !replay ) checkCancelled();
             const auto presence = ( uint64_t( signatureOrdinal ) << 32 ) | contribution.frame->frameSetOrdinal;
             if( !streamedPresence.contains( presence ) )
             {
@@ -659,12 +1093,13 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         {
             checkCancelled();
             const auto childIt = zone.directChildren.find( contribution.frame->ref );
-            const auto childUnion = childIt == zone.directChildren.end() ? 0 : IntervalUnion( childIt->second, options.cancelled );
+            const auto childUnion = childIt == zone.directChildren.end() ? 0 : IntervalUnion( std::move( childIt->second ), options.cancelled );
             auto exact = zone.exact;
             if( childUnion > contribution.endNs - contribution.beginNs )
             {
                 exact = false;
-                finding( "child_union_exceeds_parent", "Direct child interval union exceeds its clipped parent interval.", zone.ref );
+                const auto& text = FindingText( ZoneFinding::ChildUnionExceedsParent );
+                finding( text.code, text.message, zone.ref );
             }
             if( options.includeExactSignatures )
                 updateRun( dictionary.Text( signatureEntries[zone.exactSignatureOrdinal].signature ),
@@ -677,10 +1112,261 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         }
     };
 
+    const auto* zoneSource = options.zoneWorkers != 0 && options.includeExactSignatures && !options.includeLogicalSignatures ?
+        dynamic_cast<const CpuZoneScanSource*>( &m_source ) : nullptr;
+    if( zoneSource && !zoneSource->CpuZoneScanAvailable() ) zoneSource = nullptr;
+    // A scan restricted to windows skips the chunks whose zones cannot meet
+    // one, when the source knows when its chunks start, and the zones that do
+    // not meet one.
+    const auto* windowSource = dynamic_cast<const AnalysisWindowSource*>( &m_source );
+    const auto* windows = windowSource ? &windowSource->AnalysisWindows() : nullptr;
+    if( zoneSource )
+    {
+        const auto& threads = zoneSource->CpuZoneScanThreads();
+        const auto& locations = zoneSource->CpuZoneScanLocations();
+        std::vector<NativeChunk> plan;
+        std::vector<NativeChunk> chunks;
+        uint64_t totalZones = 0;
+        for( size_t index = 0; index < threads.size(); ++index )
+        {
+            checkCancelled();
+            const auto& thread = threads[index];
+            if( thread.first != totalZones ) throw BoundedScanError( "frame_cpu_scan_zone_threads_invalid" );
+            totalZones += thread.count;
+            if( thread.count == 0 ) continue;
+            metadataWorkspace.Add( 1024 + 4 * thread.ref.size() );
+            const auto end = thread.first + thread.count;
+            auto begin = thread.first;
+            chunks.clear();
+            for( const auto root : thread.roots )
+            {
+                if( root < begin + std::max<uint64_t>( options.zoneChunk, 1 ) || root >= end ) continue;
+                chunks.push_back( { index, begin, root, false } );
+                begin = root;
+            }
+            chunks.push_back( { index, begin, end, true } );
+            const bool timed = windows && !thread.roots.empty() && thread.roots.front() == thread.first &&
+                thread.rootStarts.size() == thread.roots.size() && thread.rootEnds.size() == thread.roots.size();
+            const auto first = plan.size();
+            for( const auto& chunk : chunks )
+            {
+                if( timed )
+                {
+                    // The chunk's zones span the segments of the roots in it.
+                    auto segment = size_t( std::upper_bound( thread.roots.begin(), thread.roots.end(), chunk.begin ) - thread.roots.begin() ) - 1;
+                    auto start = std::numeric_limits<int64_t>::max(), end = std::numeric_limits<int64_t>::min();
+                    for( ; segment < thread.roots.size() && thread.roots[segment] < chunk.end; ++segment )
+                    {
+                        start = std::min( start, thread.rootStarts[segment] );
+                        end = std::max( end, thread.rootEnds[segment] );
+                    }
+                    if( !AnalysisWindowsMeet( *windows, start, end ) ) continue;
+                }
+                plan.push_back( chunk );
+            }
+            // The thread's last chunk scanned closes its zones still open at
+            // the end of the scan, as the DTO pass over the same zones does.
+            for( auto n = first; n < plan.size(); ++n ) plan[n].last = n + 1 == plan.size();
+        }
+        AnalysisWorkspaceReservation planWorkspace( options.workspace, 1024 + uint64_t( plan.capacity() ) * ( sizeof( NativeChunk ) + 16 ) );
+
+        struct Shared
+        {
+            std::mutex mutex;
+            std::condition_variable changed;
+            std::vector<std::unique_ptr<NativeChunkResult>> results;
+            size_t replayed = 0;
+            std::exception_ptr failure;
+            std::atomic<size_t> next { 0 };
+            std::atomic<bool> abort { false };
+        } shared;
+        shared.results.resize( plan.size() );
+        const auto workers = std::max<size_t>( 1, std::min( options.zoneWorkers, plan.size() ) );
+        const size_t window = 2 * workers + 2;
+        const NativeScanInput input { *zoneSource, threads, locations, framesBySet, m_batchSize, windows };
+        std::vector<std::thread> pool;
+        struct Join
+        {
+            Shared& shared;
+            std::vector<std::thread>& pool;
+            ~Join()
+            {
+                {
+                    std::lock_guard lock( shared.mutex );
+                    shared.abort = true;
+                }
+                shared.changed.notify_all();
+                for( auto& thread : pool ) thread.join();
+            }
+        } join { shared, pool };
+        for( size_t n = 0; n < workers; ++n ) pool.emplace_back( [&] {
+            try
+            {
+                NativeWorker worker( options.workspace );
+                for( ;; )
+                {
+                    const auto index = shared.next.fetch_add( 1 );
+                    if( index >= plan.size() ) return;
+                    {
+                        std::unique_lock lock( shared.mutex );
+                        shared.changed.wait( lock, [&] { return shared.abort.load() || index < shared.replayed + window; } );
+                        if( shared.abort ) return;
+                    }
+                    auto result = std::make_unique<NativeChunkResult>( options.workspace );
+                    try
+                    {
+                        ProcessNativeChunk( input, plan[index], worker, *result, shared.abort );
+                    }
+                    catch( ... )
+                    {
+                        result->error = std::current_exception();
+                    }
+                    {
+                        std::lock_guard lock( shared.mutex );
+                        shared.results[index] = std::move( result );
+                    }
+                    shared.changed.notify_all();
+                }
+            }
+            catch( ... )
+            {
+                {
+                    std::lock_guard lock( shared.mutex );
+                    if( !shared.failure ) shared.failure = std::current_exception();
+                }
+                shared.changed.notify_all();
+            }
+        } );
+
+        std::string ref;
+        // Refs of runs are formatted only when a sink or the result takes them.
+        const bool runRefs = !viewSink || options.runRefs;
+        // The transient state of one run, held for the whole replay.
+        AnalysisWorkspaceReservation replayRun( options.workspace, 65536 );
+        const auto replay = [&]( NativeChunkResult& chunk, const std::vector<NativeEvent>& events,
+            std::vector<uint32_t>& global, size_t threadIndex ) {
+            const auto& thread = threads[threadIndex];
+            const auto roleIt = threadRoles.find( thread.ref );
+            const auto role = roleIt == threadRoles.end() ? std::string( "Other" ) : roleIt->second.name;
+            size_t processed = 0;
+            for( const auto& event : events )
+            {
+                if( ( ++processed & 4095 ) == 0 ) checkCancelled();
+                switch( event.kind )
+                {
+                case NativeEventKind::Signature:
+                {
+                    const auto& value = chunk.signatures[event.index];
+                    const auto found = signatureIndex.find( std::string_view( value.id ) );
+                    if( found != signatureIndex.end() )
+                    {
+                        global[event.index] = found->second;
+                        break;
+                    }
+                    // The definition of the zone that first uses the signature.
+                    const auto& location = locations[value.location];
+                    CpuZoneDto zone;
+                    zone.threadRef = thread.ref;
+                    zone.sourceLocationRef = location.ref;
+                    zone.name = value.hasName ? value.name : location.name;
+                    zone.function = location.function;
+                    zone.file = location.file;
+                    zone.line = location.line;
+                    std::string parent;
+                    AnalysisDictionary::PathId parentPath = 0;
+                    if( value.parent != NoSignature )
+                    {
+                        const auto& entry = signatureEntries[global[value.parent]];
+                        parent = dictionary.Text( entry.signature );
+                        parentPath = entry.path;
+                    }
+                    global[event.index] = ensureDefinition( zone, false, value.id, parent, zone.name, role, value.depth, parentPath );
+                    break;
+                }
+                case NativeEventKind::Run:
+                {
+                    const auto ordinal = global[event.index];
+                    if( runRefs ) zoneSource->CpuZoneScanRef( event.ordinal, ref );
+                    else ref.clear();
+                    updateRun( dictionary.Text( signatureEntries[ordinal].signature ), ordinal,
+                        FrameContribution { event.frame, 0, event.inclusive }, event.childUnion, event.code != 0, ref, true );
+                    break;
+                }
+                case NativeEventKind::Finding:
+                {
+                    const auto& text = FindingText( ZoneFinding( event.code ) );
+                    zoneSource->CpuZoneScanRef( event.ordinal, ref );
+                    finding( text.code, event.index ? chunk.messages[event.index - 1] : std::string( text.message ), ref );
+                    break;
+                }
+                }
+            }
+        };
+
+        // The DTO pass closes the zones still open at the end of each thread
+        // in the iteration order of its thread map, keyed by thread ref and
+        // filled in scan order; replay the same order.
+        struct Final
+        {
+            std::unique_ptr<NativeChunkResult> chunk;
+            std::vector<uint32_t> global;
+        };
+        std::unordered_map<size_t, Final> finals;
+        for( size_t index = 0; index < plan.size(); ++index )
+        {
+            std::unique_ptr<NativeChunkResult> chunk;
+            {
+                std::unique_lock lock( shared.mutex );
+                while( !shared.results[index] && !shared.failure )
+                {
+                    shared.changed.wait_for( lock, std::chrono::milliseconds( 50 ) );
+                    lock.unlock();
+                    checkCancelled();
+                    lock.lock();
+                }
+                if( shared.failure ) std::rethrow_exception( shared.failure );
+                chunk = std::move( shared.results[index] );
+            }
+            if( chunk->error ) std::rethrow_exception( chunk->error );
+            std::vector<uint32_t> global( chunk->signatures.size(), NoSignature );
+            replay( *chunk, chunk->events, global, plan[index].thread );
+            result.inputZoneCount += chunk->inputZones;
+            result.validZoneCount += chunk->validZones;
+            result.invalidZoneCount += chunk->invalidZones;
+            result.unassignedZoneCount += chunk->unassignedZones;
+            result.frameBoundaryProbeCount += chunk->probes;
+            result.maximumDepth = std::max( result.maximumDepth, chunk->maximumDepth );
+            if( plan[index].last && !chunk->finalEvents.empty() )
+            {
+                chunk->events = {};
+                chunk->workspace.Resize( 1024 + uint64_t( chunk->finalEvents.capacity() ) * sizeof( NativeEvent ) +
+                    uint64_t( chunk->signatures.size() ) * 512 );
+                finals[plan[index].thread] = { std::move( chunk ), std::move( global ) };
+            }
+            {
+                std::lock_guard lock( shared.mutex );
+                shared.replayed = index + 1;
+            }
+            shared.changed.notify_all();
+        }
+        std::unordered_map<std::string, size_t> threadOrder;
+        for( size_t index = 0; index < threads.size(); ++index )
+            if( threads[index].count != 0 ) threadOrder.try_emplace( threads[index].ref, index );
+        for( const auto& [threadRef, index] : threadOrder )
+        {
+            const auto found = finals.find( index );
+            if( found == finals.end() ) continue;
+            replay( *found->second.chunk, found->second.chunk->finalEvents, found->second.global, index );
+        }
+        // The DTO pass reads whole pages of the scan cursor.
+        if( totalZones != 0 ) result.maximumBatchObserved = std::max<size_t>( result.maximumBatchObserved,
+            size_t( std::min<uint64_t>( m_batchSize, totalZones ) ) );
+    }
+
     BoundedScanRequest zoneRequest;
     zoneRequest.domain = BoundedScanDomain::CpuZone;
     zoneRequest.limit = m_batchSize;
-    for( ;; )
+    if( !zoneSource ) for( ;; )
     {
         checkCancelled();
         AnalysisWorkspaceReservation pageWorkspace( options.workspace );
@@ -738,8 +1424,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             if( !timingValid )
             {
                 ++result.invalidZoneCount;
-                finding( zone.endNs ? "invalid_zone_timing" : "missing_zone_end",
-                    zone.timingInvalidReason.value_or( zone.endNs ? "Zone end precedes its begin." : "Zone has no closing timestamp." ), zone.ref );
+                const auto& text = FindingText( zone.endNs ? ZoneFinding::InvalidTiming : ZoneFinding::MissingEnd );
+                finding( text.code, zone.timingInvalidReason.value_or( text.message ), zone.ref );
                 if( parentPosition != std::numeric_limits<size_t>::max() && !stack.empty() ) stack.back().exact = false;
                 continue;
             }
@@ -749,7 +1435,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             if( zone.parentRef && !parentResolved )
             {
                 structuralExact = false;
-                finding( "missing_parent_zone", "Parent zone was not available on the same bounded thread stack.", zone.ref );
+                const auto& text = FindingText( ZoneFinding::MissingParent );
+                finding( text.code, text.message, zone.ref );
             }
 
             ++result.validZoneCount;
@@ -927,8 +1614,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             if( active.frames.empty() )
             {
                 ++result.unassignedZoneCount;
-                finding( "zone_unassigned_to_complete_frame",
-                    "A valid zone does not intersect any complete frame and is excluded from exact frame denominators.", zone.ref );
+                const auto& text = FindingText( ZoneFinding::Unassigned );
+                finding( text.code, text.message, zone.ref );
             }
 
             if( zone.parentRef && parentResolved && !stack.empty() )
@@ -938,7 +1625,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 {
                     parent.exact = false;
                     active.exact = false;
-                    finding( "child_outside_parent", "Child zone is not contained by its declared parent interval.", zone.ref );
+                    const auto& text = FindingText( ZoneFinding::ChildOutsideParent );
+                    finding( text.code, text.message, zone.ref );
                 }
                 for( const auto& parentFrame : parent.frames )
                 {

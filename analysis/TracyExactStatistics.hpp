@@ -242,6 +242,17 @@ public:
         std::string_view frameScope, uint64_t frameIndex)>;
     void SetCompleteFrameFilter( CompleteFrameFilter filter );
     void SetProgress( std::function<void( std::string_view, uint64_t, uint64_t )> progress );
+    // Threads that compute signatures' statistics during Finish; results are
+    // committed (findings, sink calls) in signature order either way.
+    void SetFinishWorkers( size_t workers );
+    // Work on a computed signature that touches no shared state, run on the
+    // thread that computed it (a Finish worker, or the finishing thread). Its
+    // result is available to the sink, through PreparedSignature(), while the
+    // sink is called for that signature.
+    using SignaturePrepare = std::function<std::shared_ptr<void>( const NeutralSignatureAggregate&,
+        const std::vector<NeutralMergedFrameValues>& )>;
+    void SetSignaturePrepare( SignaturePrepare prepare );
+    const std::shared_ptr<void>& PreparedSignature() const;
     void AddDomainAudit( const NeutralDomainAuditInput& value );
     // Internal phase snapshot. The owner must hold the generation writer lease.
     // checkpoint is a fresh direct child of temporaryRoot. Referenced runs are

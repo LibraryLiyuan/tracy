@@ -3,7 +3,8 @@
 #if __has_include("../../storage/TracyResourceIntervals.hpp")
 #include "../../storage/TracyResourceIntervals.hpp"
 #include <chrono>
-static void Check(bool ok){if(!ok)throw std::runtime_error("resource interval invariant");}
+static void CheckAt(bool ok,const char* expression,int line){if(!ok)throw std::runtime_error("resource interval invariant at line "+std::to_string(line)+": "+expression);}
+#define Check(value) CheckAt((value),#value,__LINE__)
 int main(int argc,char** argv){try{
  if(argc!=2)return 2;auto root=std::filesystem::path(argv[1])/std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());std::filesystem::create_directories(root);
  tracy::storage::ResourceLimits limits;limits.streamBytes=32ull<<20;limits.diskReserveBytes=0;
@@ -31,6 +32,8 @@ int main(int argc,char** argv){try{
  Check(statistics.smallIntervalBytes+statistics.mappedIntervalBytes==intervals.Count()*32&&statistics.mappedIntervalChunks>0);
  intervals.CloseAndRemove();Check(budget.DiskCurrent()==0);
  tracy::storage::ResourceLimits tightLimits; tightLimits.streamBytes=16ull<<10;tightLimits.diskReserveBytes=0;
+ // Exercise the caller's small cap independently of the default stream ratio.
+ tightLimits.absoluteDiskLimit=48ull<<10;
  tracy::storage::ConversionResources tight(tightLimits,[&]{return sample;},[]{return 1ull<<40;});bool refused=false;
  {try{tracy::storage::ResourceIntervals bounded(root/"bounded",tight);for(uint64_t i=0;i<=4096;++i){tracy::JnGpuCatalogResourceRecordV1 row{};row.pointerToken=9;row.resourceId=i+1;row.time=int64_t(i);row.operation=uint8_t(Op::Create);bounded.Add(row);}}catch(const std::exception& e){refused=std::string(e.what())=="conversion_disk_ratio_limit";}}
  Check(refused&&tight.DiskCurrent()==0);

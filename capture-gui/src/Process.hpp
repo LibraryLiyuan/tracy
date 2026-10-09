@@ -13,8 +13,10 @@ class Process
     ~Process();
     Process(const Process &) = delete;
     Process &operator=(const Process &) = delete;
+    // A background process runs below normal priority, so that the game being
+    // recorded keeps the CPU it needs.
     void Start(const fs::path &exe, const std::vector<std::string> &args, const fs::path &log,
-               bool pipe = false);
+               bool pipe = false, bool background = false);
     void Adopt(const ProcessIdentity &identity);
     bool Running() const;
     DWORD ExitCode() const;
@@ -23,6 +25,10 @@ class Process
     ProcessIdentity Identity() const
     {
         return m_identity;
+    }
+    HANDLE Handle() const
+    {
+        return m_process;
     }
     void Send(const std::string &text);
     std::string Line(std::atomic<bool> &cancel, std::chrono::seconds timeout);

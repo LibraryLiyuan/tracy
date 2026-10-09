@@ -38,6 +38,21 @@
 #include "profiler/TracyProtoHistory.hpp"
 #include "profiler/TracyTexture.hpp"
 #include "profiler/TracyView.hpp"
+#ifdef TRACY_STREAM_VIEW
+#include "profiler/TracyStreamingView.hpp"
+static std::unique_ptr<tracy::StreamingView> streamView;
+static std::string streamPath;
+static bool streamSmoke=false;
+static bool streamLive=false;
+static int streamSmokeResult=0;
+// A recording journal, opened through its event store.
+static bool IsStreamJournal( const char* path )
+{
+    constexpr std::string_view extension = ".tracy-stream";
+    const std::string_view name( path );
+    return name.size() >= extension.size() && std::equal( extension.begin(), extension.end(), name.end() - extension.size(), []( char a, char b ) { return a == tolower( (unsigned char)b ); } );
+}
+#endif
 #include "profiler/TracyWeb.hpp"
 #include "profiler/IconsFontAwesome6.h"
 #include "../../server/tracy_pdqsort.h"
@@ -266,10 +281,20 @@ int main( int argc, char** argv )
             printf( "Usage:\n\n" );
             printf( "    Open trace file stored on disk:\n" );
             printf( "      %s file.tracy\n\n", argv[0] );
+#ifdef TRACY_STREAM_VIEW
+            printf( "    Open a long capture through its event store:\n      %s file.tracy-stream\n\n",argv[0] );
+            printf( "    Follow a growing recording with immutable revisions:\n      %s --stream-live file.tracy-stream\n\n",argv[0] );
+#endif
             printf( "    Connect to a running client:\n" );
             printf( "      %s -a address [-p port]\n", argv[0] );
             exit( 0 );
         }
+#ifdef TRACY_STREAM_VIEW
+        // A long capture opens like a trace file, through its event store.
+        if( IsStreamJournal( argv[1] ) ) streamPath = argv[1];
+        else
+#endif
+        {
         try
         {
             initFileOpen = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( argv[1] ) );
@@ -294,11 +319,16 @@ int main( int argc, char** argv )
             fprintf( stderr, "Cannot open trace file: %s\n", argv[1] );
             exit( 1 );
         }
+        }
     }
     else
     {
         while( argc >= 3 )
         {
+#ifdef TRACY_STREAM_VIEW
+            if( strcmp(argv[1],"--stream")==0 || strcmp(argv[1],"--stream-smoke")==0 || strcmp(argv[1],"--stream-live")==0 || strcmp(argv[1],"--stream-live-smoke")==0 ){streamSmoke=strcmp(argv[1],"--stream-smoke")==0 || strcmp(argv[1],"--stream-live-smoke")==0;streamLive=strcmp(argv[1],"--stream-live")==0 || strcmp(argv[1],"--stream-live-smoke")==0;streamPath=argv[2];}
+            else
+#endif
             if( strcmp( argv[1], "-a" ) == 0 )
             {
                 connectTo = argv[2];
@@ -420,6 +450,9 @@ int main( int argc, char** argv )
     if( updateThread.joinable() ) updateThread.join();
     if( updateNotesThread.joinable() ) updateNotesThread.join();
     view.reset();
+#ifdef TRACY_STREAM_VIEW
+    streamView.reset();
+#endif
 
     tracy::FreeTexture( zigzagTex, RunOnMainThread );
     tracy::FreeTexture( iconTex, RunOnMainThread );
@@ -427,12 +460,20 @@ int main( int argc, char** argv )
 
     tracy::Fileselector::Shutdown();
 
+#ifdef TRACY_STREAM_VIEW
+    return streamSmokeResult;
+#else
     return 0;
+#endif
 }
 
 static void UpdateBroadcastClients()
 {
-    if( !view )
+    if( !view
+#ifdef TRACY_STREAM_VIEW
+        && !streamView && streamPath.empty()
+#endif
+    )
     {
         const auto time = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::system_clock::now().time_since_epoch() ).count();
         if( !broadcastListen )
@@ -626,6 +667,9 @@ static void DrawAchievements( tracy::data::AchievementItem** items )
 
 static void DrawContents()
 {
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+    ConfigureStreamingPresentation(bool(streamView));
+#endif
     static bool reconnect = false;
     static std::string reconnectAddr;
     static uint16_t reconnectPort;
@@ -641,7 +685,11 @@ static void DrawContents()
     const bool achievementsAttention = tracy::s_config.achievements ? s_achievements->NeedsAttention() : false;
 
     static int activeFrames = 3;
-    if( tracy::WasActive() || !clients.empty() || ( view && view->WasActive() ) || achievementsAttention )
+    if( tracy::WasActive() || !clients.empty() || ( view && view->WasActive() ) || achievementsAttention
+#ifdef TRACY_STREAM_VIEW
+        || (streamView && streamView->WasActive())
+#endif
+    )
     {
         activeFrames = 3;
     }
@@ -680,6 +728,19 @@ static void DrawContents()
 
     setlocale( LC_NUMERIC, "C" );
 
+#ifdef TRACY_STREAM_VIEW
+    if(!streamPath.empty()&&!streamView)
+    {
+        streamView=std::make_unique<tracy::StreamingView>(std::filesystem::u8path(streamPath),streamLive);
+        // The window title names the capture, as Tracy's does.
+        auto name = streamPath.substr( streamPath.find_last_of( "/\\" ) + 1 );
+        if( IsStreamJournal( name.c_str() ) ) name.resize( name.size() - strlen( ".tracy-stream" ) );
+        SetWindowTitleCallback( name.c_str() );
+        streamPath.clear();streamLive=false;
+    }
+    if(streamView){if(!streamView->Draw())streamView.reset();else if(streamSmoke){try{if(streamView->SmokeStep()){printf("Streaming CPU/Frame GUI smoke passed.\n");fflush(stdout);streamSmoke=false;bptr->RequestClose();}}catch(const std::exception& e){fprintf(stderr,"Streaming smoke failed: %s\n",e.what());streamSmokeResult=1;streamSmoke=false;bptr->RequestClose();}}}
+    else
+#endif
     if( !view )
     {
         if( s_customTitle )
@@ -1033,9 +1094,25 @@ static void DrawContents()
         ImGui::SameLine( 0, ImGui::GetTextLineHeight() * 2 );
 
 #ifndef TRACY_NO_FILESELECTOR
+#ifdef TRACY_STREAM_VIEW
+        if(ImGui::Button(ICON_FA_FOLDER_OPEN " Follow recording"))
+            tracy::Fileselector::OpenFile("tracy-stream","Recording in progress",[](const char* fn){streamLive=true;streamPath=fn;});
+        ImGui::SameLine();
+        // Long captures open here too, through their event store.
+        constexpr const char* traceExtensions = "tracy,tracy-stream";
+#else
+        constexpr const char* traceExtensions = "tracy";
+#endif
         if( ImGui::Button( ICON_FA_FOLDER_OPEN " Open saved trace" ) && !loadThread.joinable() )
         {
-            tracy::Fileselector::OpenFile( "tracy", "Tracy Profiler trace file", []( const char* fn ) {
+            tracy::Fileselector::OpenFile( traceExtensions, "Tracy Profiler trace file", []( const char* fn ) {
+#ifdef TRACY_STREAM_VIEW
+                if( IsStreamJournal( fn ) )
+                {
+                    streamPath = fn;
+                    return;
+                }
+#endif
                 try
                 {
                     auto f = std::shared_ptr<tracy::FileRead>( tracy::FileRead::Open( fn ) );

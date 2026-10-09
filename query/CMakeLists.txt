@@ -29,6 +29,7 @@ set(ZSTD_BUILD_TESTS OFF CACHE BOOL "Build zstd tests" FORCE)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream_store.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
 # Internal acceptance builds only; production binaries ignore experiment env.
@@ -58,6 +59,27 @@ file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-profile-v1.schema.json TRACY
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/neutral-aggregate-v1.schema.json TRACY_NEUTRAL_AGGREGATE_SCHEMA_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/candidate-manifest-v1.schema.json TRACY_CANDIDATE_MANIFEST_SCHEMA_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-scan-api-v1.schema.json TRACY_ANALYSIS_SCAN_API_SCHEMA_JSON)
+
+# MSVC limits the size of an individual string literal.  Encode each JSON
+# document as adjacent, line-sized C++ string literals so large schemas remain
+# byte-for-byte equivalent without exceeding that limit.
+function(tracy_json_to_cpp_string input output)
+    set(value "${${input}}")
+    string(REPLACE "\\" "\\\\" value "${value}")
+    string(REPLACE "\"" "\\\"" value "${value}")
+    string(REPLACE "\r" "\\r" value "${value}")
+    string(REPLACE "\n" "\\n\" \"" value "${value}")
+    set(${output} "\"${value}\"" PARENT_SCOPE)
+endfunction()
+
+tracy_json_to_cpp_string(TRACY_QUERY_SCHEMA_JSON TRACY_QUERY_SCHEMA_CPP)
+tracy_json_to_cpp_string(TRACY_QUERY_COVERAGE_JSON TRACY_QUERY_COVERAGE_CPP)
+tracy_json_to_cpp_string(TRACY_QUERY_FIELD_COVERAGE_JSON TRACY_QUERY_FIELD_COVERAGE_CPP)
+tracy_json_to_cpp_string(TRACY_QUERY_MCP_COVERAGE_JSON TRACY_QUERY_MCP_COVERAGE_CPP)
+tracy_json_to_cpp_string(TRACY_ANALYSIS_PROFILE_SCHEMA_JSON TRACY_ANALYSIS_PROFILE_SCHEMA_CPP)
+tracy_json_to_cpp_string(TRACY_NEUTRAL_AGGREGATE_SCHEMA_JSON TRACY_NEUTRAL_AGGREGATE_SCHEMA_CPP)
+tracy_json_to_cpp_string(TRACY_CANDIDATE_MANIFEST_SCHEMA_JSON TRACY_CANDIDATE_MANIFEST_SCHEMA_CPP)
+tracy_json_to_cpp_string(TRACY_ANALYSIS_SCAN_API_SCHEMA_JSON TRACY_ANALYSIS_SCAN_API_SCHEMA_CPP)
 configure_file(src/TracyEmbeddedData.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp @ONLY)
 
 add_library(TracyQueryProtocol STATIC
@@ -107,6 +129,10 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
     src/TracySegmentTraceSource.hpp
+    src/TracyEventStoreTraceSource.cpp
+    src/TracyEventStoreTraceSource.hpp
+    src/TracyQueryVram.cpp
+    src/TracyQueryVram.hpp
     src/TracySessionManager.cpp
     src/TracySessionManager.hpp
     src/TracyEmbeddedData.hpp
@@ -114,9 +140,11 @@ add_library(TracyQueryProtocol STATIC
 )
 target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
-target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore nlohmann_json::nlohmann_json)
+target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore TracyEventStore nlohmann_json::nlohmann_json)
 target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
 if(MSVC)
+    # Without link-time code generation TracyQueryService.cpp exceeds the
+    # default object file section limit.
     target_compile_options(TracyQueryProtocol PRIVATE /bigobj)
 endif()
 
@@ -444,6 +472,11 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)
     tracy_query_enable_assertions(tracy-gpu-analysis-tests)
     add_test(NAME tracy-gpu-analysis COMMAND tracy-gpu-analysis-tests)
+
+    add_executable(tracy-query-vram-tests tests/VramSummaryTests.cpp)
+    target_link_libraries(tracy-query-vram-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-vram-tests)
+    add_test(NAME tracy-query-vram COMMAND tracy-query-vram-tests)
 
     add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
