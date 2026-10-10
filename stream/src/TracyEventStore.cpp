@@ -37,6 +37,8 @@
 #include <unordered_set>
 #include <thread>
 #include <deque>
+#include <condition_variable>
+#include <mutex>
 #ifdef _WIN32
 #  include <Windows.h>
 #  include <bcrypt.h>
@@ -250,7 +252,9 @@ struct Db
         int rc = sqlite3_step( s );
         if( rc == SQLITE_ROW ) return true;
         if( rc == SQLITE_DONE ) return false;
-        throw std::runtime_error( sqlite3_errmsg( handle ) );
+        const std::string error = sqlite3_errmsg( handle );
+        const char* sql = sqlite3_sql( s );
+        throw std::runtime_error( error + " [SQL: " + ( sql ? sql : "unknown statement" ) + "]" );
     }
     void Run( sqlite3_stmt* s ) { Require( !Step( s ), "Unexpected SQL row" ); }
     I Scalar( const std::string& sql )
@@ -322,6 +326,7 @@ void Save( Db& d, const StoreInfo& i )
     Meta( d, "source_resources", std::to_string( i.sourceFiles ) );
     Meta( d, "catalog_present", i.catalogPresent ? "1" : "0" );
     Meta( d, "catalog_valid", i.catalogValid ? "1" : "0" );
+    Meta( d, "zone_events_misplaced", std::to_string( i.misplacedZoneEvents ) );
     for( auto [k, v] : std::array<std::pair<const char*, uint64_t>, 11>{ { { "bytes", i.sourceBytes }, { "valid", i.validBytes }, { "revision", i.revision }, { "events", i.events }, { "zones", i.cpuZones }, { "frames", i.frames }, { "open", i.openZones }, { "unresolved", i.unresolvedDefinitions }, { "first", uint64_t( i.firstNs ) }, { "last", uint64_t( i.lastNs ) }, { "clean", i.cleanEnd ? 1 : 0 } } } ) Meta( d, k, std::to_string( v ) );
 }
 StoreInfo Load( Db& d )
@@ -368,6 +373,8 @@ StoreInfo Load( Db& d )
     i.gpuReferenceUses = n( "gpu_reference_uses" );
     i.gpuReferenceEnds = n( "gpu_reference_ends" );
     i.fibers = n( "fibers" );
+    // Absent in stores built before misplaced zone events were counted.
+    if( d.Scalar( "SELECT COUNT(*) FROM metadata WHERE key='zone_events_misplaced'" ) != 0 ) i.misplacedZoneEvents = n( "zone_events_misplaced" );
     i.hardwareSamples = n( "hardware_samples" );
     i.hardwareAddresses = n( "hardware_addresses" );
     i.symbols = n( "symbol_resources" );
@@ -609,6 +616,43 @@ struct AwaitRecordedQuery : std::runtime_error
 {
     AwaitRecordedQuery() : std::runtime_error( "Definition response awaits its recorded query" ) {}
 };
+// The LZ4 frames of a journal's client records, decoded in record order: a
+// frame may refer to the last 64 KiB decoded before it.
+struct FrameDecoder
+{
+    std::vector<char> dictionary = std::vector<char>( 65536 );
+    size_t dictionarySize = 0;
+    // Whether Ingest::Consume decodes the payload `p` of record `r` as a frame.
+    static bool Carries( const RecordInfo& r, std::span<const uint8_t> p )
+    {
+        if( r.type != RecordType::ClientToServer || ( r.flags & RecordFlagHandshake ) || !( r.flags & RecordFlagCompressedFrame ) || p.size() < 4 ) return false;
+        uint32_t size;
+        memcpy( &size, p.data(), 4 );
+        return size && size <= LZ4Size && p.size() == size + 4;
+    }
+    // Decodes a payload that Carries() a frame into `out`, which holds
+    // TargetFrameSize bytes; returns the decoded size, 0 if it does not decode.
+    size_t Decode( std::span<const uint8_t> p, std::vector<char>& out )
+    {
+        uint32_t size;
+        memcpy( &size, p.data(), 4 );
+        const int n = LZ4_decompress_safe_usingDict( reinterpret_cast<const char*>( p.data() + 4 ), out.data(), int( size ), TargetFrameSize, dictionary.data(), int( dictionarySize ) );
+        if( n <= 0 ) return 0;
+        if( size_t( n ) >= dictionary.size() )
+        {
+            memcpy( dictionary.data(), out.data() + n - dictionary.size(), dictionary.size() );
+            dictionarySize = dictionary.size();
+        }
+        else
+        {
+            size_t retain = std::min( dictionarySize, dictionary.size() - size_t( n ) );
+            memmove( dictionary.data(), dictionary.data() + dictionarySize - retain, retain );
+            memcpy( dictionary.data() + retain, out.data(), n );
+            dictionarySize = retain + n;
+        }
+        return size_t( n );
+    }
+};
 class Ingest
 {
     Db& db;
@@ -654,6 +698,10 @@ class Ingest
         // source reuses it without a lookup. Not kept when the frame spills.
         uint64_t childSkey = 0, childNode = 0;
         uint8_t childSkind = 0;
+        // The zone's own source, for error reports. Not kept when the frame
+        // spills.
+        uint64_t skey = 0;
+        uint8_t skind = 0;
     };
     static constexpr uint32_t ZoneWindow = 64;
     static constexpr size_t ThreadCacheLimit = 1024;
@@ -1114,8 +1162,8 @@ public:
 private:
 #include "TracyEventStoreTranscript.inl"
     std::string single, second, image;
-    std::vector<char> decoded = std::vector<char>( TargetFrameSize ), dictionary = std::vector<char>( 65536 );
-    size_t dictionarySize = 0;
+    std::vector<char> decoded = std::vector<char>( TargetFrameSize );
+    FrameDecoder frames;
     I Time( I t )
     {
         Require( multiplier > 0 && base != INT64_MIN, "Event precedes valid welcome" );
@@ -1467,14 +1515,32 @@ private:
         return value;
     }
     void Scalar( sqlite3_stmt* s, int column, double value ) { Blob( s, column, { reinterpret_cast<const uint8_t*>( &value ), 8 } ); }
+    // The plots receiving points: their `plot_keys` rows and point
+    // statistics, which a point otherwise looked up and rewrote. The
+    // statistics reach `plots` in FlushPlots(), which Finish() calls before
+    // anything reads them. Plots are few; past PlotCacheLimit the caches are
+    // written back and dropped.
+    struct PlotStats
+    {
+        uint64_t points = 0;
+        double min = 0, max = 0, sum = 0;
+        bool dirty = false;
+    };
+    static constexpr size_t PlotCacheLimit = 4096;
+    std::unordered_map<uint64_t, uint64_t> plotKeys;
+    std::unordered_map<uint64_t, PlotStats> plotStats;
     uint64_t Plot( uint64_t key, uint64_t id )
     {
+        const auto cached = plotKeys.find( key );
+        if( cached != plotKeys.end() ) return cached->second;
+        if( plotKeys.size() >= PlotCacheLimit ) plotKeys.clear();
         auto s = db.Prep( "SELECT plot FROM plot_keys WHERE key=?" );
         Int( s, 1, key );
         if( db.Step( s ) )
         {
             const uint64_t plot = sqlite3_column_int64( s, 0 );
             sqlite3_reset( s );
+            plotKeys.emplace( key, plot );
             return plot;
         }
         sqlite3_reset( s );
@@ -1486,23 +1552,51 @@ private:
         Int( s, 1, key );
         Int( s, 2, id );
         db.Run( s );
+        plotKeys.emplace( key, id );
         return id;
+    }
+    void FlushPlots()
+    {
+        for( auto& [plot, stats] : plotStats )
+        {
+            if( !stats.dirty ) continue;
+            auto s = db.Prep( "UPDATE plots SET points=?,min=?,max=?,sum=? WHERE id=?" );
+            Int( s, 1, stats.points );
+            Scalar( s, 2, stats.min );
+            Scalar( s, 3, stats.max );
+            Scalar( s, 4, stats.sum );
+            Int( s, 5, plot );
+            db.Run( s );
+            stats.dirty = false;
+        }
     }
     void PlotValue( uint64_t plot, double value )
     {
-        auto s = db.Prep( "SELECT points,min,max,sum FROM plots WHERE id=?" );
-        Int( s, 1, plot );
-        Require( db.Step( s ), "Missing plot stats" );
-        const uint64_t count = sqlite3_column_int64( s, 0 );
-        const double min = sqlite3_column_type(s,1)==SQLITE_BLOB?Double(s,1):sqlite3_column_double(s,1);
-        const double max = sqlite3_column_type(s,2)==SQLITE_BLOB?Double(s,2):sqlite3_column_double(s,2),sum=Double(s,3);
-        sqlite3_reset( s );
-        s = db.Prep( "UPDATE plots SET points=?,min=?,max=?,sum=? WHERE id=?" );
-        Int( s, 1, count + 1 );
-        Scalar(s,2,count?std::min(min,value):value);Scalar(s,3,count?std::max(max,value):value);
-        Scalar( s, 4, count ? sum + value : value );
-        Int( s, 5, plot );
-        db.Run( s );
+        auto found = plotStats.find( plot );
+        if( found == plotStats.end() )
+        {
+            if( plotStats.size() >= PlotCacheLimit )
+            {
+                FlushPlots();
+                plotStats.clear();
+            }
+            auto s = db.Prep( "SELECT points,min,max,sum FROM plots WHERE id=?" );
+            Int( s, 1, plot );
+            Require( db.Step( s ), "Missing plot stats" );
+            PlotStats stats;
+            stats.points = sqlite3_column_int64( s, 0 );
+            stats.min = sqlite3_column_type(s,1)==SQLITE_BLOB?Double(s,1):sqlite3_column_double(s,1);
+            stats.max = sqlite3_column_type(s,2)==SQLITE_BLOB?Double(s,2):sqlite3_column_double(s,2);
+            stats.sum = Double( s, 3 );
+            sqlite3_reset( s );
+            found = plotStats.emplace( plot, stats ).first;
+        }
+        auto& stats = found->second;
+        stats.min = stats.points ? std::min( stats.min, value ) : value;
+        stats.max = stats.points ? std::max( stats.max, value ) : value;
+        stats.sum = stats.points ? stats.sum + value : value;
+        ++stats.points;
+        stats.dirty = true;
     }
     void PlotPoint( uint64_t id, uint64_t key, I delta, double value )
     {
@@ -1544,9 +1638,12 @@ private:
             Int( s, 1, dst );
             Int( s, 2, src );
             db.Run( s );
+            for( auto& [cachedKey, plot] : plotKeys )
+                if( plot == src ) plot = dst;
             s = db.Prep( "DELETE FROM plots WHERE id=?" );
             Int( s, 1, src );
             db.Run( s );
+            plotStats.erase( src );
         }
         else
         {
@@ -1745,11 +1842,71 @@ private:
         }
         return key;
     }
+    // The statistics of the memory pools in use, which every allocation and
+    // free otherwise read and rewrote. FlushPools() writes them to
+    // `memory_pools` in Finish(), before anything reads them. Pools are few;
+    // past PoolCacheLimit the cache is written back and dropped.
+    struct PoolStats
+    {
+        uint64_t allocations = 0, active = 0, usage = 0, frees = 0;
+        std::optional<std::string> low, high;
+        bool dirty = false;
+    };
+    static constexpr size_t PoolCacheLimit = 4096;
+    std::unordered_map<uint64_t, PoolStats> poolStats;
+    void FlushPools()
+    {
+        for( auto& [pool, stats] : poolStats )
+        {
+            if( !stats.dirty ) continue;
+            auto s = db.Prep( "UPDATE memory_pools SET allocations=?,active=?,usage=?,frees=?,low=?,high=? WHERE id=?" );
+            Int( s, 1, stats.allocations );
+            Int( s, 2, stats.active );
+            Blob( s, 3, { reinterpret_cast<const uint8_t*>( &stats.usage ), 8 } );
+            Int( s, 4, stats.frees );
+            if( stats.low ) Text( s, 5, *stats.low );
+            else sqlite3_bind_null( s, 5 );
+            if( stats.high ) Text( s, 6, *stats.high );
+            else sqlite3_bind_null( s, 6 );
+            Int( s, 7, pool );
+            db.Run( s );
+            stats.dirty = false;
+        }
+    }
+    PoolStats& Pool( uint64_t pool )
+    {
+        const auto found = poolStats.find( pool );
+        if( found != poolStats.end() ) return found->second;
+        if( poolStats.size() >= PoolCacheLimit )
+        {
+            FlushPools();
+            poolStats.clear();
+        }
+        auto s = db.Prep( "SELECT allocations,active,usage,frees,low,high FROM memory_pools WHERE id=?" );
+        Int( s, 1, pool );
+        Require( db.Step( s ), "Missing memory pool" );
+        PoolStats stats;
+        stats.allocations = sqlite3_column_int64( s, 0 );
+        stats.active = sqlite3_column_int64( s, 1 );
+        if( sqlite3_column_bytes( s, 2 ) != 8 )
+        {
+            sqlite3_reset( s );
+            throw std::runtime_error( "Invalid memory usage field" );
+        }
+        memcpy( &stats.usage, sqlite3_column_blob( s, 2 ), 8 );
+        stats.frees = sqlite3_column_int64( s, 3 );
+        if( sqlite3_column_type( s, 4 ) != SQLITE_NULL ) stats.low = Col( s, 4 );
+        if( sqlite3_column_type( s, 5 ) != SQLITE_NULL ) stats.high = Col( s, 5 );
+        sqlite3_reset( s );
+        return poolStats.emplace( pool, std::move( stats ) ).first->second;
+    }
     uint64_t MemoryPool( uint64_t id, bool named )
     {
         Require( named ? memoryName != 0 : memoryName == 0, "Memory pool payload mismatch" );
         const auto pool = memoryName;
         memoryName = 0;
+        // A cached pool has its row.
+        if( poolStats.count( pool ) ) return pool;
         auto s = db.Prep( "INSERT OR IGNORE INTO memory_pools(id,event,usage) VALUES(?,?,zeroblob(8))" );
         Int( s, 1, pool );
         Int( s, 2, id );
@@ -1796,50 +1953,37 @@ private:
         Int( s, 2, e.ptr );
         Int( s, 3, id );
         db.Run( s );
-        s = db.Prep( "SELECT usage FROM memory_pools WHERE id=?" );
-        Int( s, 1, pool );
-        Require( db.Step( s ), "Missing memory pool" );
-        uint64_t usage;
-        Require( sqlite3_column_bytes( s, 0 ) == 8, "Invalid memory usage field" );
-        memcpy( &usage, sqlite3_column_blob( s, 0 ), 8 );
-        sqlite3_reset( s );
-        s = db.Prep( "UPDATE memory_pools SET allocations=allocations+1,active=active+1,usage=?1,low=CASE WHEN low IS NULL OR ?2<low THEN ?2 ELSE low END,high=CASE WHEN high IS NULL OR ?3>high THEN ?3 ELSE high END WHERE id=?4" );
-        const auto total = usage + size;
-        Blob( s, 1, { reinterpret_cast<const uint8_t*>( &total ), 8 } );
-        Text( s, 2, AddressKey( e.ptr ) );
-        Text( s, 3, AddressKey( e.ptr + size ) );
-        Int( s, 4, pool );
-        db.Run( s );
+        auto& stats = Pool( pool );
+        ++stats.allocations;
+        ++stats.active;
+        stats.usage += size;
+        // Address keys have a fixed width, so they compare as the addresses.
+        auto low = AddressKey( e.ptr ), high = AddressKey( e.ptr + size );
+        if( !stats.low || low < *stats.low ) stats.low = std::move( low );
+        if( !stats.high || high > *stats.high ) stats.high = std::move( high );
+        stats.dirty = true;
         Thread( e.thread );
-        Range( "INSERT INTO allocation_range VALUES(?1,?2,?3)", id, time, {} );
+        // Offline builds index allocations once in Finish().
+        if( incremental ) Range( "INSERT INTO allocation_range VALUES(?1,?2,?3)", id, time, {} );
         info.lastNs = std::max( info.lastNs, time );
     }
     void ReleaseAllocation( uint64_t pool, uint64_t id, uint64_t size, I time, uint32_t tid, uint64_t stack )
     {
-        auto s = db.Prep( "UPDATE allocations SET freed=?,free_thread=?,free_stack=? WHERE id=?" );
+        auto& stats = Pool( pool );
+        --stats.active;
+        stats.usage -= size;
+        ++stats.frees;
+        stats.dirty = true;
+        auto s = db.Prep( "UPDATE allocations SET freed=?,free_thread=?,free_stack=? WHERE id=? RETURNING allocated" );
         Int( s, 1, uint64_t( time ) );
         Int( s, 2, tid );
         Int( s, 3, stack );
         Int( s, 4, id );
-        db.Run( s );
-        s = db.Prep( "SELECT usage FROM memory_pools WHERE id=?" );
-        Int( s, 1, pool );
-        Require( db.Step( s ) && sqlite3_column_bytes( s, 0 ) == 8, "Invalid memory usage field" );
-        uint64_t usage;
-        memcpy( &usage, sqlite3_column_blob( s, 0 ), 8 );
-        sqlite3_reset( s );
-        usage -= size;
-        s = db.Prep( "UPDATE memory_pools SET active=active-1,usage=?,frees=frees+1 WHERE id=?" );
-        Blob( s, 1, { reinterpret_cast<const uint8_t*>( &usage ), 8 } );
-        Int( s, 2, pool );
-        db.Run( s );
-        s = db.Prep( "SELECT allocated FROM allocations WHERE id=?" );
-        Int( s, 1, id );
         Require( db.Step( s ), "Missing allocation" );
         const auto begin = sqlite3_column_int64( s, 0 );
-        sqlite3_reset( s );
+        Require( !db.Step( s ), "Unexpected SQL row" );
         Require( time >= begin, "Allocation free precedes allocation" );
-        Range( "UPDATE allocation_range SET mint=?2,maxt=?3 WHERE id=?1", id, begin, time );
+        if( incremental ) Range( "UPDATE allocation_range SET mint=?2,maxt=?3 WHERE id=?1", id, begin, time );
         Thread( tid );
         info.lastNs = std::max( info.lastNs, time );
     }
@@ -1905,18 +2049,30 @@ private:
         Int( s, 1, set );
         Int( s, 2, bytes.size() / sizeof( JnGpuReferenceSetEntry ) );
         db.Run( s );
+        // A set has hundreds of entries; they go in statements of
+        // EntryChunk rows, since executing a statement cost more than its row.
+        constexpr int EntryChunk = 32;
+        static const std::string chunk = [] {
+            std::string sql = "INSERT INTO gpu_ref_entries VALUES(?,?,?,?)";
+            for( int n = 1; n < EntryChunk; ++n ) sql += ",(?,?,?,?)";
+            return sql;
+        }();
         uint64_t ordinal = 0;
         while( !bytes.empty() )
         {
-            JnGpuReferenceSetEntry e;
-            memcpy( &e, bytes.data(), sizeof( e ) );
-            bytes = bytes.subspan( sizeof( e ) );
-            Require( e.resourceId != 0, "GPU resource set has a zero resource ID" );
-            s = db.Prep( "INSERT INTO gpu_ref_entries VALUES(?,?,?,?)" );
-            Int( s, 1, set );
-            Int( s, 2, ordinal++ );
-            Int( s, 3, e.resourceId );
-            Int( s, 4, e.usageMask );
+            const int rows = bytes.size() >= EntryChunk * sizeof( JnGpuReferenceSetEntry ) ? EntryChunk : 1;
+            s = rows == EntryChunk ? db.PrepStatic( chunk.c_str() ) : db.Prep( "INSERT INTO gpu_ref_entries VALUES(?,?,?,?)" );
+            for( int n = 0; n < rows; ++n )
+            {
+                JnGpuReferenceSetEntry e;
+                memcpy( &e, bytes.data(), sizeof( e ) );
+                bytes = bytes.subspan( sizeof( e ) );
+                Require( e.resourceId != 0, "GPU resource set has a zero resource ID" );
+                Int( s, 4 * n + 1, set );
+                Int( s, 4 * n + 2, ordinal++ );
+                Int( s, 4 * n + 3, e.resourceId );
+                Int( s, 4 * n + 4, e.usageMask );
+            }
             db.Run( s );
         }
     }
@@ -2956,6 +3112,7 @@ private:
     // whole-capture interval that the placeholder insert gave it.
     // Offline builds index every Job and I/O request once.
     static constexpr RangeTable JobRanges{ "job_range", "SELECT id,COALESCE(first_time,schedule,0),completed FROM jobs ORDER BY id", "INSERT INTO job_range_rowid VALUES(?,?)", "INSERT INTO job_range_parent VALUES(?,?)", "INSERT OR REPLACE INTO job_range_node VALUES(?,?)" };
+    static constexpr RangeTable AllocationRanges{ "allocation_range", "SELECT id,allocated,freed FROM allocations ORDER BY id", "INSERT INTO allocation_range_rowid VALUES(?,?)", "INSERT INTO allocation_range_parent VALUES(?,?)", "INSERT OR REPLACE INTO allocation_range_node VALUES(?,?)" };
     static constexpr RangeTable IoRanges{ "io_range", "SELECT id,COALESCE(first_time,queued,0),end FROM io_requests ORDER BY id", "INSERT INTO io_range_rowid VALUES(?,?)", "INSERT INTO io_range_parent VALUES(?,?)", "INSERT OR REPLACE INTO io_range_node VALUES(?,?)" };
     void LoadRanges( const RangeTable& table )
     {
@@ -3070,14 +3227,75 @@ private:
         Text( s, 3, text );
         db.Run( s );
     }
+    // The thread's innermost open zone, which a zone end applies to; the end
+    // must carry that zone's validation.
     uint64_t ValidTop( uint64_t tid )
     {
         auto& t = CachedThread( tid );
         Require( t.present && t.top != 0, "CPU zone stack is empty" );
-        Require( t.validation == TopFrame( t ).validation, "CPU zone validation mismatch" );
+        if( t.validation != TopFrame( t ).validation ) throw std::runtime_error( ZoneMismatch( t ) );
         t.validation = 0;
         t.dirty = true;
         return t.top;
+    }
+    // The thread's innermost open zone, which a zone text, name, color or
+    // value applies to, or 0 when the event carries another zone's validation
+    // or no zone is open. Such an event was written for a zone that is not
+    // innermost; attaching it here would misattribute it, so it is dropped and
+    // counted.
+    uint64_t MatchedTop( uint64_t tid )
+    {
+        auto& t = CachedThread( tid );
+        const bool match = t.present && t.top != 0 && t.validation == TopFrame( t ).validation;
+        if( t.present )
+        {
+            t.validation = 0;
+            t.dirty = true;
+        }
+        if( match ) return t.top;
+        ++info.misplacedZoneEvents;
+        return 0;
+    }
+    // A source location's name, or its function, for error reports.
+    std::string SourceText( uint8_t kind, uint64_t key )
+    {
+        auto s = db.Prep( kind == 1 ? "SELECT name,function FROM sources WHERE kind=1 AND key=?"
+                                    : "SELECT (SELECT value FROM strings WHERE key=s.nkey LIMIT 1),(SELECT value FROM strings WHERE key=s.fkey LIMIT 1) FROM sources s WHERE kind=0 AND key=?" );
+        Int( s, 1, key );
+        std::string text;
+        if( db.Step( s ) )
+        {
+            text = Col( s, 0 );
+            if( text.empty() ) text = Col( s, 1 );
+        }
+        sqlite3_reset( s );
+        return text.empty() ? "?" : text;
+    }
+    // Why a zone event did not match the thread's innermost open zone: the
+    // validation it carried, the open zones from the top with their sources,
+    // and where the zone it meant is among them.
+    std::string ZoneMismatch( ThreadState& t )
+    {
+        auto s = db.Prep( "SELECT value FROM strings WHERE kind=? AND key=?" );
+        Int( s, 1, uint8_t( QueueType::ThreadName ) );
+        Int( s, 2, t.id );
+        const auto thread = db.Step( s ) ? Col( s, 0 ) : std::string( "?" );
+        sqlite3_reset( s );
+        std::string m = "CPU zone validation mismatch: thread " + std::to_string( t.id ) + " (" + thread + "): zone end for validation " +
+                        std::to_string( t.validation ) + ", but the innermost open zone has validation " + std::to_string( TopFrame( t ).validation ) + ". Open zones from the top:";
+        int meant = -1;
+        for( uint32_t i = 0; i < t.frames; i++ )
+        {
+            const auto& f = t.window[( t.head + ZoneWindow - i ) % ZoneWindow];
+            if( meant < 0 && f.validation == t.validation ) meant = int( i );
+            if( i < 12 )
+                m += " [validation " + std::to_string( f.validation ) + ", " + ( f.hasName ? f.name + " / " : std::string() ) + SourceText( f.skind, f.skey ) +
+                     ", depth " + std::to_string( f.depth ) + ", start " + std::to_string( f.start ) + " ns]";
+        }
+        if( t.frames > 12 ) m += " ... " + std::to_string( t.frames - 12 ) + " more in the window";
+        if( meant > 0 ) m += ". The zone it meant is " + std::to_string( meant ) + " below the top: its end arrived before the zones above it ended.";
+        else m += ". No open zone in the window (" + std::to_string( t.frames ) + " zones) has that validation: it never began on this thread, already ended, or is deeper.";
+        return m;
     }
     void FlushZones( uint64_t tid, ZoneBuffer& z )
     {
@@ -3354,6 +3572,8 @@ private:
         f.slot = uint32_t( z.count++ );
         f.node = node;
         f.coverEnd = start;
+        f.skey = source;
+        f.skind = uint8_t( kind );
         ++bufferedZones;
         t.top = id;
         t.validation = 0;
@@ -3841,29 +4061,32 @@ private:
             break;
         case QueueType::ZoneText:
         case QueueType::ZoneValue: {
-            auto zone = ValidTop( Logical() );
             std::string text;
             if( t == QueueType::ZoneText ) text = Take();
-            else
+            const auto tid = Logical();
+            const auto zone = MatchedTop( tid );
+            if( !zone ) break;
+            if( t == QueueType::ZoneValue )
             {
                 char b[64];
                 std::snprintf( b, sizeof( b ), "%llu [0x%llx]", (unsigned long long)e.zoneValue.value, (unsigned long long)e.zoneValue.value );
                 text = b;
             }
-            AppendText( Logical(), zone, id, std::move( text ) );
+            AppendText( tid, zone, id, std::move( text ) );
             break;
         }
         case QueueType::ZoneName: {
+            auto name = Take();
             const auto tid = Logical();
-            ValidTop( tid );
+            if( !MatchedTop( tid ) ) break;
             auto& f = TopFrame( CachedThread( tid ) );
-            f.name = Take();
+            f.name = std::move( name );
             f.hasName = true;
             break;
         }
         case QueueType::ZoneColor: {
             const auto tid = Logical();
-            ValidTop( tid );
+            if( !MatchedTop( tid ) ) break;
             auto& f = TopFrame( CachedThread( tid ) );
             f.color = ( uint32_t( e.zoneColor.b ) << 16 ) | ( uint32_t( e.zoneColor.g ) << 8 ) | e.zoneColor.r;
             f.hasColor = true;
@@ -4203,7 +4426,11 @@ public:
         }
     }
     uint64_t queryCount = 0;
-    void Consume( const RecordInfo& r, std::span<const uint8_t> p )
+    void Consume( const RecordInfo& r, std::span<const uint8_t> p ) { Consume( r, p, nullptr ); }
+    // `frame` is the record's frame when RecordPrefetch decoded it ahead with
+    // a FrameDecoder of the same journal, empty if it did not decode. Every
+    // record of a journal is consumed either way.
+    void Consume( const RecordInfo& r, std::span<const uint8_t> p, const std::span<const uint8_t>* frame )
     {
         TranscriptRecord( r, p );
         if( r.type == RecordType::SessionEnd )
@@ -4266,26 +4493,13 @@ public:
         uint32_t size;
         memcpy( &size, p.data(), 4 );
         Require( size && size <= LZ4Size && p.size() == size + 4, "Invalid LZ4 envelope" );
-        int n = LZ4_decompress_safe_usingDict( reinterpret_cast<const char*>( p.data() + 4 ), decoded.data(), int( size ), TargetFrameSize, dictionary.data(), int( dictionarySize ) );
-        Require( n > 0, "LZ4 frame decode failed" );
-        std::span<const uint8_t> events( reinterpret_cast<const uint8_t*>( decoded.data() ), size_t( n ) );
+        auto events = frame ? *frame : std::span<const uint8_t>( reinterpret_cast<const uint8_t*>( decoded.data() ), frames.Decode( p, decoded ) );
+        Require( !events.empty(), "LZ4 frame decode failed" );
         while( !events.empty() )
         {
             ProtocolEventView e;
             Require( ReadProtocolEvent( events, e ), "Malformed protocol event" );
             Event( e );
-        }
-        if( size_t( n ) >= dictionary.size() )
-        {
-            memcpy( dictionary.data(), decoded.data() + n - dictionary.size(), dictionary.size() );
-            dictionarySize = dictionary.size();
-        }
-        else
-        {
-            size_t retain = std::min( dictionarySize, dictionary.size() - size_t( n ) );
-            memmove( dictionary.data(), dictionary.data() + dictionarySize - retain, retain );
-            memcpy( dictionary.data() + retain, decoded.data(), n );
-            dictionarySize = retain + n;
         }
     }
     void Finish( bool partial = false )
@@ -4296,6 +4510,8 @@ public:
         FinishZones();
         FlushThreads();
         FlushJobs();
+        FlushPlots();
+        FlushPools();
         FlushAllPackets();
         FlushGpu();
         FlushZoneTree();
@@ -4343,23 +4559,26 @@ public:
                 Int( update, 2, job );
                 db.Run( update );
             }
-            else
+            else if( sqlite3_column_type( stacks, 4 ) == SQLITE_NULL )
             {
                 auto update = db.Prep( "UPDATE jobs SET callsite=? WHERE id=?" );
                 Int( update, 1, sqlite3_column_int64( stacks, 3 ) );
                 Int( update, 2, job );
                 db.Run( update );
-                if( sqlite3_column_type( stacks, 4 ) != SQLITE_NULL )
-                {
-                    update = db.Prep( "UPDATE jobs SET stack=?1,stack_provenance=?2,stack_reason=CASE WHEN ?3!=0 THEN ?3 ELSE stack_reason END WHERE id=?4" );
-                    Int( update, 1, sqlite3_column_int64( stacks, 4 ) );
-                    Int( update, 2, sqlite3_column_int64( stacks, 5 ) );
-                    // The Worker keeps a previously reported unavailable
-                    // reason when a later definition has no reason.
-                    Int( update, 3, sqlite3_column_int64( stacks, 6 ) );
-                    Int( update, 4, job );
-                    db.Run( update );
-                }
+            }
+            else
+            {
+                // The callsite and its definition's stack, in one rewrite of
+                // the row: a Job row is wide, and every Job has such a stage.
+                auto update = db.Prep( "UPDATE jobs SET callsite=?1,stack=?2,stack_provenance=?3,stack_reason=CASE WHEN ?4!=0 THEN ?4 ELSE stack_reason END WHERE id=?5" );
+                Int( update, 1, sqlite3_column_int64( stacks, 3 ) );
+                Int( update, 2, sqlite3_column_int64( stacks, 4 ) );
+                Int( update, 3, sqlite3_column_int64( stacks, 5 ) );
+                // The Worker keeps a previously reported unavailable
+                // reason when a later definition has no reason.
+                Int( update, 4, sqlite3_column_int64( stacks, 6 ) );
+                Int( update, 5, job );
+                db.Run( update );
             }
         }
         sqlite3_reset( stacks );
@@ -4428,9 +4647,11 @@ public:
         else
         {
             // An offline build calls Finish() once, so every Job and I/O
-            // request is dirty and its final interval is indexed directly.
+            // request is dirty and its final interval is indexed directly,
+            // as is every allocation.
             LoadRanges( JobRanges );
             LoadRanges( IoRanges );
+            LoadRanges( AllocationRanges );
         }
         db.Exec( "DELETE FROM dirty_jobs;DELETE FROM dirty_io;" );
         ++taskGeneration; // Known tasks no longer have their dirty mark.
@@ -4451,16 +4672,191 @@ public:
         info.unresolvedDefinitions += db.Scalar( "SELECT COUNT(*) FROM queries WHERE used=0 AND type IN(11,12,13)" );
     }
 };
-std::vector<uint8_t> Payload( std::ifstream& f, const RecordInfo& r )
+void ReadPayload( std::ifstream& f, const RecordInfo& r, std::vector<uint8_t>& p )
 {
     Require( r.payloadSize <= uint64_t( LZ4Size ) + 4, "Record exceeds decoder budget" );
-    std::vector<uint8_t> p( size_t( r.payloadSize ) );
+    p.resize( size_t( r.payloadSize ) );
     f.clear();
     f.seekg( std::streamoff( r.offset + RecordHeaderSize ) );
     f.read( reinterpret_cast<char*>( p.data() ), p.size() );
     Require( bool( f ), "Record read failed" );
+}
+std::vector<uint8_t> Payload( std::ifstream& f, const RecordInfo& r )
+{
+    std::vector<uint8_t> p;
+    ReadPayload( f, r, p );
     return p;
 }
+// Reads journal records ahead of the ingestion on a thread of its own: the
+// journal reads, record checks and frame decoding overlap the ingestion,
+// which takes the records in order. At most Depth records wait, each with
+// its payload and decoded frame.
+class RecordPrefetch
+{
+public:
+    struct Item
+    {
+        RecordInfo record;
+        std::vector<uint8_t> payload;
+        std::vector<char> frame = std::vector<char>( TargetFrameSize );
+        size_t frameSize = 0;
+        bool decoded = false;
+        // The `frame` argument of Ingest::Consume.
+        const std::span<const uint8_t>* Frame()
+        {
+            span = { reinterpret_cast<const uint8_t*>( frame.data() ), frameSize };
+            return decoded ? &span : nullptr;
+        }
+
+    private:
+        std::span<const uint8_t> span;
+    };
+    explicit RecordPrefetch( const std::filesystem::path& p )
+        : input( p, std::ios::binary )
+    {
+        Require( bool( input ), "Cannot open journal for reading" );
+        for( auto& item : items ) free.push_back( &item );
+    }
+    RecordPrefetch( const RecordPrefetch& ) = delete;
+    RecordPrefetch& operator=( const RecordPrefetch& ) = delete;
+    ~RecordPrefetch() { Stop(); }
+    // Runs `source( *this )` on the worker; it calls Emit() for every record,
+    // in journal order.
+    template<class F>
+    void Start( F&& source )
+    {
+        worker = std::thread( [this, source = std::forward<F>( source )]() mutable { Run( [&] { source( *this ); } ); } );
+    }
+    // The worker reads the records the ingestion asks for with Request().
+    void StartRequests()
+    {
+        worker = std::thread( [this] { Run( [this] { Serve(); } ); } );
+    }
+    // On the worker: reads record `r` and decodes its frame into a free slot.
+    void Emit( const RecordInfo& r )
+    {
+        Item* item;
+        {
+            std::unique_lock l( lock );
+            changed.wait( l, [&] { return stopping.load() || !free.empty(); } );
+            if( stopping ) throw Stopped();
+            item = free.back();
+            free.pop_back();
+        }
+        item->record = r;
+        ReadPayload( input, r, item->payload );
+        item->decoded = FrameDecoder::Carries( r, item->payload );
+        item->frameSize = item->decoded ? decoder.Decode( item->payload, item->frame ) : 0;
+        {
+            std::lock_guard l( lock );
+            ready.push_back( item );
+        }
+        changed.notify_all();
+    }
+    void Request( const RecordInfo& r )
+    {
+        {
+            std::lock_guard l( lock );
+            requests.push_back( r );
+        }
+        changed.notify_all();
+    }
+    bool Stopping() const { return stopping.load(); }
+    // The next record in order, or nullptr when the source has ended; rethrows
+    // a failure of the worker once the records before it were taken.
+    Item* Next()
+    {
+        std::unique_lock l( lock );
+        changed.wait( l, [&] { return !ready.empty() || done; } );
+        if( ready.empty() )
+        {
+            if( error ) std::rethrow_exception( error );
+            return nullptr;
+        }
+        auto* item = ready.front();
+        ready.pop_front();
+        return item;
+    }
+    void Release( Item* item )
+    {
+        {
+            std::lock_guard l( lock );
+            free.push_back( item );
+        }
+        changed.notify_all();
+    }
+    // Stops the worker and rethrows its failure, if any.
+    void Finish()
+    {
+        Stop();
+        if( error ) std::rethrow_exception( error );
+    }
+
+private:
+    static constexpr size_t Depth = 4;
+    struct Stopped
+    {
+    };
+    template<class F>
+    void Run( F&& body )
+    {
+        std::exception_ptr failure;
+        try
+        {
+            body();
+        }
+        catch( const Stopped& )
+        {
+        }
+        catch( ... )
+        {
+            if( !stopping ) failure = std::current_exception();
+        }
+        {
+            std::lock_guard l( lock );
+            error = failure;
+            done = true;
+        }
+        changed.notify_all();
+    }
+    void Serve()
+    {
+        for( ;; )
+        {
+            RecordInfo r;
+            {
+                std::unique_lock l( lock );
+                changed.wait( l, [&] { return stopping.load() || !requests.empty(); } );
+                if( stopping ) throw Stopped();
+                r = requests.front();
+                requests.pop_front();
+            }
+            Emit( r );
+        }
+    }
+    void Stop()
+    {
+        if( !worker.joinable() ) return;
+        {
+            std::lock_guard l( lock );
+            stopping = true;
+        }
+        changed.notify_all();
+        worker.join();
+    }
+    std::ifstream input;
+    FrameDecoder decoder;
+    std::array<Item, Depth> items;
+    std::vector<Item*> free;
+    std::deque<Item*> ready;
+    std::deque<RecordInfo> requests;
+    std::mutex lock;
+    std::condition_variable changed;
+    std::atomic<bool> stopping{ false };
+    bool done = false;
+    std::exception_ptr error;
+    std::thread worker;
+};
 std::string SnapshotCallsiteJoin()
 {
     return "LEFT JOIN callsites matched ON matched.id=(SELECT candidate.id FROM callsites candidate WHERE z.skind=0 AND candidate.source=z.skey AND candidate.stack=CASE WHEN z.stack!=0 THEN z.stack ELSE COALESCE(c.stack,0) END ORDER BY candidate.event LIMIT 1) ";
@@ -5045,6 +5441,7 @@ StoreInfo BuildStore( const std::filesystem::path& p, const StoreOptions& o, Fee
         // The build connection stays on this thread for its whole lifetime.
         Db db( work / "events.sqlite", true, o, true );
         BlockFile blocks( work / "events.blocks", true );
+        blocks.WriteInBackground();
         db.Exec( "BEGIN IMMEDIATE" );
         Schema( db );
         // This directory is unpublished until the final durable commit and hash.
@@ -5131,8 +5528,26 @@ StoreInfo EventStore::Build( const std::filesystem::path& p, const StoreOptions&
         i.validBytes = scan.validSize;
         i.revision = scan.lastSequence;
         stage( "Index journal" );
-        s.recordVisitor = [&]( const RecordInfo& r ) {if(o.cancelled&&o.cancelled())throw std::runtime_error("Cancelled");auto b=Payload(input,r);ingest.Consume(r,b);if(o.progress)o.progress(r.offset+RecordHeaderSize+r.payloadSize+RecordTrailerSize,scan.validSize); };
-        auto end = ScanJournalPrefix( p, scan.validSize, s );
+        // The worker checks and reads the records and decodes their frames
+        // while this thread ingests the ones before.
+        ScanResult end;
+        RecordPrefetch prefetch( p );
+        prefetch.Start( [&]( RecordPrefetch& feed ) {
+            ScanOptions read;
+            read.maxCollectedRecords = 0;
+            read.cancelled = [&] { return feed.Stopping(); };
+            read.recordVisitor = [&]( const RecordInfo& r ) { feed.Emit( r ); };
+            end = ScanJournalPrefix( p, scan.validSize, read );
+        } );
+        while( auto* item = prefetch.Next() )
+        {
+            if( o.cancelled && o.cancelled() ) throw std::runtime_error( "Cancelled" );
+            const auto& r = item->record;
+            ingest.Consume( r, item->payload, item->Frame() );
+            if( o.progress ) o.progress( r.offset + RecordHeaderSize + r.payloadSize + RecordTrailerSize, scan.validSize );
+            prefetch.Release( item );
+        }
+        prefetch.Finish();
         Require( end.validSize == scan.validSize && end.prefixCrc32c == scan.prefixCrc32c, "Journal changed during build" );
     } );
 }
@@ -5153,6 +5568,10 @@ StoreInfo EventStore::BuildFollowing( const std::filesystem::path& p, const std:
         // history on every poll, then verify the full prefix before committing.
         JournalTailReader reader( p, JournalTailReader::PrefixValidation::Deferred );
         std::ifstream input( p, std::ios::binary );
+        // The worker reads and decodes the records released for ingestion
+        // while this thread ingests the ones before.
+        RecordPrefetch prefetch( p );
+        prefetch.StartRequests();
         std::deque<RecordInfo> pending;
         uint64_t pendingBytes = 0;
         bool ended = false;
@@ -5177,17 +5596,28 @@ StoreInfo EventStore::BuildFollowing( const std::filesystem::path& p, const std:
             Require( last.code != ScanCode::CorruptTail && last.code != ScanCode::IoError, "Corrupt journal input" );
             if( last.HasValidHeader() ) Require( last.header.protocolVersion == ProtocolVersion, "Invalid journal or protocol" );
             const bool final = last.complete || ( ended && added == 0 );
+            size_t released = 0;
             while( !pending.empty() && ( final || pendingBytes > LagBytes ) )
             {
                 const auto r = pending.front();
                 pending.pop_front();
                 pendingBytes -= r.payloadSize + RecordHeaderSize + RecordTrailerSize;
-                ingest.Consume( r, Payload( input, r ) );
+                prefetch.Request( r );
+                ++released;
+            }
+            for( ; released != 0; --released )
+            {
+                auto* item = prefetch.Next();
+                Require( item != nullptr, "Journal prefetch ended early" );
+                const auto& r = item->record;
+                ingest.Consume( r, item->payload, item->Frame() );
                 if( o.progress ) o.progress( r.offset + RecordHeaderSize + r.payloadSize + RecordTrailerSize, last.validSize );
+                prefetch.Release( item );
             }
             if( final ) break;
             if( added == 0 ) std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
         }
+        prefetch.Finish();
         Require( last.HasRecoverablePrefix(), "Invalid journal or protocol" );
         stage( "Verify followed journal prefix" );
         reader.VerifyPrefix( o.cancelled );

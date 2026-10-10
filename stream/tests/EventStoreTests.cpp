@@ -136,6 +136,71 @@ void Fixture( const std::filesystem::path& p, size_t extraFrames = 0, bool empty
     data[4] = 3;
     append( RecordType::SessionEnd, RecordFlagTerminal, data );
 }
+// A zone text, name or color carries the validation of the zone it is for.
+// One written for an outer zone while an inner zone is open cannot be attached
+// to the zone it names, so it is dropped and counted; a zone end for an outer
+// zone while an inner zone is open breaks the stack and is rejected.
+void ZoneEventFixture( const std::filesystem::path& p, bool misnestedEnd )
+{
+    std::string error;
+    auto writer = JournalWriter::CreateFileJournal( p, MakeFileHeader( ProtocolVersion ), false, {}, error );
+    Check( bool( writer ), error.c_str() );
+    uint64_t now = 0;
+    auto append = [&]( RecordType type, uint32_t flags, std::span<const uint8_t> data ) { Check( writer->Append( type, flags, data, ++now, error ), error.c_str() ); };
+    const uint32_t version = ProtocolVersion;
+    std::vector<uint8_t> data( 24 );
+    data[0] = 2;
+    data[2] = 24;
+    memcpy( data.data() + 4, &version, 4 );
+    append( RecordType::SessionBegin, 0, data );
+    const uint8_t welcomeStatus = HandshakeWelcome;
+    append( RecordType::ClientToServer, RecordFlagHandshake, { &welcomeStatus, 1 } );
+    WelcomeMessage welcome{};
+    welcome.timerMul = 1;
+    welcome.initBegin = 1000;
+    welcome.initEnd = 1010;
+    strcpy_s( welcome.programName, "ZoneEventFixture" );
+    append( RecordType::ClientToServer, RecordFlagHandshake, { reinterpret_cast<const uint8_t*>( &welcome ), sizeof( welcome ) } );
+    ServerQueryPacket query{ ServerQuerySourceLocation, 0x123, 0 };
+    append( RecordType::ServerToClient, RecordFlagServerQuery, { reinterpret_cast<const uint8_t*>( &query ), sizeof( query ) } );
+    data.clear();
+    Event( data, QueueType::SourceLocation, QueueSourceLocation{ 0, 0, 0, 1, 0, 0, 0 } );
+    Event( data, QueueType::ThreadContext, QueueThreadContext{ 5 } );
+    const auto text = [&]( uint32_t validation, const char* value ) {
+        Event( data, QueueType::ZoneValidation, QueueZoneValidation{ validation } );
+        InlineString( data, QueueType::SingleStringData, value );
+        data.push_back( uint8_t( QueueType::ZoneText ) );
+    };
+    Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 7 } );
+    Event( data, QueueType::ZoneBegin, QueueZoneBegin{ { 1100 }, 0x123 } );
+    Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 8 } );
+    Event( data, QueueType::ZoneBegin, QueueZoneBegin{ { 10 }, 0x123 } );
+    if( misnestedEnd )
+    {
+        Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 7 } );
+        Event( data, QueueType::ZoneEnd, QueueZoneEnd{ 10 } );
+    }
+    text( 7, "outer late" );
+    Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 7 } );
+    Event( data, QueueType::ZoneColor, QueueZoneColor{ 1, 2, 3 } );
+    text( 8, "inner note" );
+    Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 8 } );
+    Event( data, QueueType::ZoneEnd, QueueZoneEnd{ 10 } );
+    text( 7, "outer note" );
+    Event( data, QueueType::ZoneValidation, QueueZoneValidation{ 7 } );
+    Event( data, QueueType::ZoneEnd, QueueZoneEnd{ 10 } );
+    std::vector<uint8_t> compressed( LZ4Size + 4 );
+    int size = LZ4_compress_default( reinterpret_cast<const char*>( data.data() ), reinterpret_cast<char*>( compressed.data() + 4 ), int( data.size() ), LZ4Size );
+    Check( size > 0, "compress zone event fixture" );
+    memcpy( compressed.data(), &size, 4 );
+    compressed.resize( size + 4 );
+    append( RecordType::ClientToServer, RecordFlagCompressedFrame, compressed );
+    data.assign( 32, 0 );
+    data[0] = 1;
+    data[2] = 32;
+    data[4] = 3;
+    append( RecordType::SessionEnd, RecordFlagTerminal, data );
+}
 int main()
 {
     auto root = std::filesystem::temp_directory_path() / std::filesystem::path( "tracy-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
@@ -451,6 +516,22 @@ int main()
             rejected = true;
         }
         Check( rejected, "changed source identity rejects the old store" );
+        const auto misplaced = root / "misplaced.tracy-stream";
+        ZoneEventFixture( misplaced, false );
+        const auto misplacedInfo = EventStore::Build( misplaced );
+        Check( misplacedInfo.cpuZones == 2 && misplacedInfo.openZones == 0 && misplacedInfo.misplacedZoneEvents == 2, "a text and a color for a zone that is not innermost are dropped and counted" );
+        auto misplacedStore = EventStore::Open( misplaced );
+        Check( misplacedStore->Info().misplacedZoneEvents == 2, "the dropped zone events stay counted in the store" );
+        const auto misplacedZones = misplacedStore->Zones( INT64_MIN, INT64_MAX, 5 ).values;
+        Check( misplacedZones.size() == 2 && misplacedZones[1].parent == misplacedZones[0].id, "the zones keep their nesting" );
+        Check( misplacedZones[0].text == "outer note" && misplacedZones[1].text == "inner note", "a misplaced text is attached to neither zone" );
+        misplacedStore.reset();
+        const auto misnested = root / "misnested.tracy-stream";
+        ZoneEventFixture( misnested, true );
+        std::string misnestedError;
+        try { EventStore::Build( misnested ); }
+        catch( const std::exception& e ) { misnestedError = e.what(); }
+        Check( misnestedError.find( "zone end for validation 7" ) != std::string::npos && misnestedError.find( "1 below the top" ) != std::string::npos, "an end for a zone that is not innermost is rejected with its place in the stack" );
         std::cout << "Event store behavior tests passed.\n";
         return 0;
     }

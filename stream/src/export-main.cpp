@@ -8,7 +8,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 namespace
 {
 std::atomic<bool> cancelled{ false };
@@ -71,6 +73,7 @@ std::string QualityJson( const tracy::stream::StoreInfo& i )
     finding( "warning", "INCOMPLETE_CAPTURE", "the journal ends without a clean session end", i.cleanEnd ? 0 : 1 );
     finding( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no end event", i.openZones );
     finding( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones lack a timestamp or CPU end", i.incompleteGpuZones );
+    finding( "warning", "MISPLACED_ZONE_EVENTS", "zone texts, names or colors written for a zone that was not innermost were dropped", i.misplacedZoneEvents );
     finding( "warning", "UNRESOLVED_DEFINITIONS", "events reference definitions absent from the journal", i.unresolvedDefinitions );
     finding( "warning", "TRUNCATED_STREAM_TAIL", "the journal has bytes after its last complete record", i.sourceBytes > i.validBytes ? 1 : 0 );
     std::ostringstream out;
@@ -78,7 +81,7 @@ std::string QualityJson( const tracy::stream::StoreInfo& i )
         << ",\"source_sha256\":\"" << i.sourceSha256 << "\",\"data_sha256\":\"" << i.dataSha256 << "\",\"source_bytes\":" << i.sourceBytes << ",\"valid_bytes\":" << i.validBytes
         << ",\"revision\":" << i.revision << ",\"first_ns\":" << i.firstNs << ",\"last_ns\":" << i.lastNs << ",\"clean_end\":" << ( i.cleanEnd ? "true" : "false" )
         << ",\"transcript_verified\":" << ( i.transcriptVerified ? "true" : "false" ) << ",\"counts\":{\"events\":" << i.events << ",\"cpu_zones\":" << i.cpuZones
-        << ",\"open_zones\":" << i.openZones << ",\"gpu_zones\":" << i.gpuZones << ",\"incomplete_gpu_zones\":" << i.incompleteGpuZones << ",\"frames\":" << i.frames
+        << ",\"open_zones\":" << i.openZones << ",\"misplaced_zone_events\":" << i.misplacedZoneEvents << ",\"gpu_zones\":" << i.gpuZones << ",\"incomplete_gpu_zones\":" << i.incompleteGpuZones << ",\"frames\":" << i.frames
         << ",\"messages\":" << i.messages << ",\"plot_points\":" << i.plotPoints << ",\"lock_events\":" << i.lockEvents << ",\"jobs\":" << i.jobs << ",\"io_requests\":" << i.ioRequests
         << ",\"allocations\":" << i.allocations << ",\"samples\":" << i.samples << ",\"context_regions\":" << i.contextRegions << ",\"auxiliary_events\":" << i.auxiliaryEvents
         << ",\"frame_images\":" << i.frameImages << ",\"unresolved_definitions\":" << i.unresolvedDefinitions << ",\"call_tree_nodes\":" << i.zoneTreeNodes << "}"
@@ -175,21 +178,46 @@ int ExportMain( int argc, char** argv )
     try
     {
         const auto started = std::chrono::steady_clock::now();
-        auto last = started;
         const auto elapsed = [&] { return std::chrono::duration<double>( std::chrono::steady_clock::now() - started ).count(); };
+        // Index progress is written once a second by its own thread: a write
+        // to a redirected stderr can stall for milliseconds, and the indexing
+        // thread only records where it is. The lock keeps a stage line after
+        // the progress it ends. One write per line: std::cerr is unbuffered.
+        std::mutex output;
+        std::atomic<uint64_t> progressBytes{ 0 }, progressTotal{ 0 };
+        uint64_t printedBytes = 0;
+        std::atomic<bool> progressDone{ false };
+        std::thread progressWriter( [&] {
+            while( !progressDone.load() )
+            {
+                for( int n = 0; n < 10 && !progressDone.load(); ++n ) std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+                std::lock_guard lock( output );
+                const auto bytes = progressBytes.load();
+                if( bytes == printedBytes ) continue;
+                std::cerr << ( "Index " + std::to_string( bytes ) + '/' + std::to_string( progressTotal.load() ) + '\n' );
+                printedBytes = bytes;
+            }
+        } );
+        struct ProgressStop
+        {
+            std::atomic<bool>& done;
+            std::thread& writer;
+            ~ProgressStop()
+            {
+                done = true;
+                writer.join();
+            }
+        } progressStop{ progressDone, progressWriter };
         read.stage = [&]( const char* name ) {
+            std::lock_guard lock( output );
+            printedBytes = progressBytes.load();
             std::cerr << ( std::string( name ) + " elapsed=" + std::to_string( elapsed() ) + "s\n" );
         };
         // This process uses its store handle only from the calling thread.
         read.threadConfined = true;
         read.progress = [&]( uint64_t bytes, uint64_t total ) {
-            const auto now = std::chrono::steady_clock::now();
-            if( now - last >= std::chrono::seconds( 1 ) )
-            {
-                // One write per line: std::cerr is unbuffered.
-                std::cerr << ( "Index " + std::to_string( bytes ) + '/' + std::to_string( total ) + '\n' );
-                last = now;
-            }
+            progressTotal.store( total, std::memory_order_relaxed );
+            progressBytes.store( bytes, std::memory_order_relaxed );
         };
         auto build = read;
         build.cacheBytes = std::max<uint64_t>( cacheBytes / 2, 4ull << 20 );

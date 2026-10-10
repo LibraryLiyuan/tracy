@@ -60,6 +60,9 @@ struct StoreInfo
     uint64_t blockBytes = 0;
     uint64_t sourceBytes = 0, validBytes = 0, revision = 0, events = 0, cpuZones = 0, frames = 0;
     uint64_t openZones = 0, unresolvedDefinitions = 0;
+    // Zone texts, names, colors and values dropped because they carried the
+    // validation of a zone that was not the thread's innermost open zone.
+    uint64_t misplacedZoneEvents = 0;
     uint64_t gpuZones = 0, incompleteGpuZones = 0;
     uint64_t samples = 0, pendingSamples = 0, contextRegions = 0, cpuRegions = 0;
     uint64_t messages = 0, plotPoints = 0, lockEvents = 0;

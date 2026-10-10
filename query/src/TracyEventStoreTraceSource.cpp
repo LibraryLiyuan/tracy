@@ -80,7 +80,19 @@ std::filesystem::path EnsureSkeleton( const std::filesystem::path& journal, cons
     store::StoreExportOptions options;
     options.skeleton = true;
     options.overwrite = true;
-    events.ExportSnapshot( skeleton, options );
+    // Budget the temporary mappings separately from the source page cache;
+    // both share SQLite's heap limit with statements and other connections.
+    options.cacheBytes = 64ull << 20;
+    std::string stage = "initialization";
+    options.progress = [&]( const char* value, uint64_t ) { stage = value; };
+    try
+    {
+        events.ExportSnapshot( skeleton, options );
+    }
+    catch( const std::exception& error )
+    {
+        throw std::runtime_error( "query skeleton export (" + stage + "): " + error.what() );
+    }
     auto temporary = WithSuffix( manifest, ".tmp" );
     {
         std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
@@ -1977,9 +1989,17 @@ std::unique_ptr<TraceSource> EventStoreTraceSource::Open( const std::filesystem:
     // The manifest records each file's size, write time and id; an unchanged
     // store opens without hashing its files.
     options.verifyContent = false;
-    options.cacheBytes = 256ull << 20;
+    options.cacheBytes = 64ull << 20;
     options.resultBytes = 64ull << 20;
-    auto events = store::EventStore::Open( journal, options );
+    std::unique_ptr<store::EventStore> events;
+    try
+    {
+        events = store::EventStore::Open( journal, options );
+    }
+    catch( const std::exception& error )
+    {
+        throw std::runtime_error( std::string( "query event store open: " ) + error.what() );
+    }
     if( !events ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "the event store cannot be opened" );
     const auto skeleton = EnsureSkeleton( journal, *events, stateCallback );
     auto worker = WorkerTraceSource::Open( skeleton, {}, events->Info().sourceSha256, WorkerTraceLoadMode::Full );

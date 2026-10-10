@@ -39,6 +39,62 @@ class BlockFile
 {
     HANDLE handle = INVALID_HANDLE_VALUE;
     uint64_t end = 0;
+    // Background writing (WriteInBackground): appended bytes wait here, in
+    // order, until the writer thread has written them. At most QueueLimit
+    // bytes wait, so the queue stays within the build's memory bound.
+    struct Pending
+    {
+        uint64_t offset = 0;
+        std::vector<uint8_t> bytes;
+    };
+    static constexpr size_t QueueLimit = 8u << 20;
+    mutable std::mutex lock;
+    mutable std::condition_variable changed;
+    std::deque<Pending> queue;
+    size_t queuedBytes = 0;
+    bool stopping = false, failed = false;
+    std::thread writer;
+    bool Write( uint64_t offset, std::span<const uint8_t> bytes )
+    {
+        for( size_t done = 0; done < bytes.size(); )
+        {
+            OVERLAPPED o{};
+            const auto at = offset + done;
+            o.Offset = DWORD( at );
+            o.OffsetHigh = DWORD( at >> 32 );
+            const auto n = DWORD( std::min<size_t>( bytes.size() - done, 1u << 30 ) );
+            DWORD written = 0;
+            if( WriteFile( handle, bytes.data() + done, n, &written, &o ) == 0 || written != n ) return false;
+            done += n;
+        }
+        return true;
+    }
+    void WriteQueued()
+    {
+        std::unique_lock l( lock );
+        for( ;; )
+        {
+            changed.wait( l, [&] { return stopping || !queue.empty(); } );
+            if( stopping ) return;
+            // Appends only add at the back, so the front stays put unlocked.
+            const auto& item = queue.front();
+            l.unlock();
+            const bool ok = Write( item.offset, item.bytes );
+            l.lock();
+            queuedBytes -= item.bytes.size();
+            queue.pop_front();
+            if( !ok ) failed = true;
+            changed.notify_all();
+        }
+    }
+    // Waits until every appended byte has been written.
+    void Drain() const
+    {
+        if( !writer.joinable() ) return;
+        std::unique_lock l( lock );
+        changed.wait( l, [&] { return failed || queue.empty(); } );
+        Require( !failed, "Event block write failed" );
+    }
 
 public:
     BlockFile( const std::filesystem::path& p, bool write )
@@ -53,28 +109,44 @@ public:
     BlockFile& operator=( const BlockFile& ) = delete;
     ~BlockFile()
     {
+        if( writer.joinable() )
+        {
+            {
+                std::lock_guard l( lock );
+                stopping = true;
+            }
+            changed.notify_all();
+            writer.join();
+        }
         if( handle != INVALID_HANDLE_VALUE ) CloseHandle( handle );
+    }
+    // Appends are then written by a thread of the file's own, so the writer
+    // does not wait for the disk; Read and Flush wait for them first. Only
+    // for a file no other connection reads before Flush.
+    void WriteInBackground()
+    {
+        if( !writer.joinable() ) writer = std::thread( [this] { WriteQueued(); } );
     }
     uint64_t Size() const { return end; }
     uint64_t Append( std::span<const uint8_t> bytes )
     {
         const auto offset = end;
-        for( size_t done = 0; done < bytes.size(); )
+        if( !writer.joinable() ) Require( Write( offset, bytes ), "Event block write failed" );
+        else
         {
-            OVERLAPPED o{};
-            const auto at = offset + done;
-            o.Offset = DWORD( at );
-            o.OffsetHigh = DWORD( at >> 32 );
-            const auto n = DWORD( std::min<size_t>( bytes.size() - done, 1u << 30 ) );
-            DWORD written = 0;
-            Require( WriteFile( handle, bytes.data() + done, n, &written, &o ) != 0 && written == n, "Event block write failed" );
-            done += n;
+            std::unique_lock l( lock );
+            changed.wait( l, [&] { return failed || queue.empty() || queuedBytes + bytes.size() <= QueueLimit; } );
+            Require( !failed, "Event block write failed" );
+            queue.push_back( { offset, { bytes.begin(), bytes.end() } } );
+            queuedBytes += bytes.size();
+            changed.notify_all();
         }
         end += bytes.size();
         return offset;
     }
     void Read( uint64_t offset, std::span<uint8_t> out ) const
     {
+        Drain();
         for( size_t done = 0; done < out.size(); )
         {
             OVERLAPPED o{};
@@ -87,7 +159,11 @@ public:
             done += n;
         }
     }
-    void Flush() { Require( FlushFileBuffers( handle ) != 0, "Event block flush failed" ); }
+    void Flush()
+    {
+        Drain();
+        Require( FlushFileBuffers( handle ) != 0, "Event block flush failed" );
+    }
 };
 #endif
 struct BlockLocation

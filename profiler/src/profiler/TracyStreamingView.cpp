@@ -1985,6 +1985,7 @@ bool StreamingView::Draw()
                 if( !m_liveError.empty() ) ImGui::TextWrapped( "Indexing stopped; the last revision remains available: %s", m_liveError.c_str() );
             }
             ImGui::Text( "%s | %llu zones | %llu frames | %llu open zones | %llu unresolved definitions", r.info.program.c_str(), (unsigned long long)r.info.cpuZones, (unsigned long long)r.info.frames, (unsigned long long)r.info.openZones, (unsigned long long)r.info.unresolvedDefinitions );
+            if( r.info.misplacedZoneEvents ) ImGui::TextDisabled( "%llu zone texts, names or colors were written for a zone that was not innermost and were dropped.", (unsigned long long)r.info.misplacedZoneEvents );
             switch( m_contentState.load() )
             {
             case 1: ImGui::TextUnformatted( "Verifying store and journal content in the background..." ); break;
