@@ -1,0 +1,5 @@
+{
+  "tool_root": "PATH_TO_TRACY/profiler/stream-report-viewer",
+  "profiler": "PATH_TO_VERIFIED/tracy-profiler.exe",
+  "profiler_sha256": "REPLACE_WITH_VERIFIED_SHA256"
+}

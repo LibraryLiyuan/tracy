@@ -1,0 +1,112 @@
+{
+  "schema_version": 2,
+  "report_identity": {
+    "report_id": "G01-REGRESSION-PARTIAL-EVIDENCE",
+    "title": "G01 单 Trace 深度诊断回归",
+    "generated_at": "2026-08-30T00:00:00+08:00",
+    "trace_id": "trace-1",
+    "trace_sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+    "configuration": {
+      "local_profile": { "path": "config/local-profile.json", "sha256": "8b798bc684fa0b8413c593a70a6e7ce37ff9e4c7f1304b653f08f5fcaf0a04aa" },
+      "project_profile": { "path": "config/project-profile.json", "sha256": "d4b1fa80124b7ef41191f07993a40e9aa8aaa7bd62bc6b573bbd00ff7569dd9a" },
+      "performance_budgets": { "path": "config/performance-budgets.json", "sha256": "98a97952fa346c39efc269f55ae8ab61c592f15942f90fab6b2f79ffaccf6023" },
+      "marker_attribution": { "path": "config/marker-attribution.json", "sha256": "f47ebee0d73f945469c0e40c07e9453266f75a18b1ab29ead433d30b9c1bbbed" }
+    }
+  },
+  "analysis_scope": {
+    "mode": "user_selected",
+    "start_ns": 133448161153,
+    "end_ns": 133850025884,
+    "valid_frame_count": 1,
+    "excluded_frame_count": 0
+  },
+  "trace_quality": {
+    "status": "completed_with_degradation",
+    "warnings": ["frame.explain exhausted max_edges and max_nodes on attempt 3"],
+    "partial_domains": ["critical_path"]
+  },
+  "frame_class_summary": [
+    { "class": "IsolatedSpike", "count": 1, "ratio": 1.0, "flags": ["BudgetMiss", "DataQualityDegraded", "UserSelected"] }
+  ],
+  "bottleneck_signatures": [
+    {
+      "id": "SIG-G01-UNRESOLVED-LONG-FRAME",
+      "stable_key": "Frame.Unknown/Unknown/Unresolved.MainPlayerLoopWallClock",
+      "significance_reasons": ["severe_isolated", "user_selected"],
+      "affected_frames": ["281474976711184"],
+      "affected_ranges": [[133448161153, 133850025884]],
+      "frequency": { "count": 1, "per_minute": null },
+      "budget_debt": { "total_ms": 385.198064, "per_minute_ms": null },
+      "severity": "critical",
+      "primary_limiter": "Unknown",
+      "secondary_contributors": [],
+      "representative_instances": [
+        { "role": "worst", "frame_id": "281474976711184", "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"] }
+      ],
+      "causal_chain": [],
+      "hypothesis_ledger": [
+        {
+          "hypothesis": "Main.PlayerLoop 的长墙钟由 Render/GPU 下游等待传播控制",
+          "required_evidence": ["complete correlated timeline", "untruncated typed relations"],
+          "mcp_queries": ["frame.explain", "frame.correlated_timeline"],
+          "supporting_evidence": ["EVD-G01-FRAME-527-PARTIAL"],
+          "contradicting_evidence": [],
+          "status": "Unresolved"
+        }
+      ],
+      "deepest_level": "L1",
+      "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"],
+      "stack_source_provenance": ["SiteReusedNative"],
+      "supported_claims": ["该完整帧墙钟为 401.864731 ms", "Main.PlayerLoop 覆盖该帧绝大部分墙钟"],
+      "unsupported_claims": ["不能由截断的 frame.explain 确认 Primary Limiter", "不能把 Main.PlayerLoop 的 inclusive wall time 当作 Main CPU active time"],
+      "optimization_direction": ["先取得未截断的相关时间线与 typed wait relation，再按实际 limiter 选择优化点"],
+      "functional_risk": ["在 limiter 未解析前优化最长 Marker 可能优化错误子系统"],
+      "theoretical_upper_bound": { "value_ms": null, "basis": "unresolved_critical_path" },
+      "retest_metrics": ["完整 relation 覆盖率", "Primary Limiter 可解析率", "Player.Frame P95"],
+      "confidence": "high_for_symptom_low_for_cause",
+      "conclusion_status": "Unresolved",
+      "evidence_gap": {
+        "blocked_by": "QueryTruncated:max_edges,max_nodes",
+        "minimum_additional_evidence": ["分页或缩小窗口后的完整 correlated timeline", "Main→Render→GPU typed relation"],
+        "reason": "UnresolvedWaitChain"
+      }
+    }
+  ],
+  "evidence_cards": [
+    {
+      "id": "CARD-G01-UNRESOLVED-LONG-FRAME",
+      "signature_id": "SIG-G01-UNRESOLVED-LONG-FRAME",
+      "title": "G01 Frame 527 long wall-clock evidence gap",
+      "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"],
+      "visuals": ["evidence_unavailable_timeline", "hypothesis_ledger"]
+    }
+  ],
+  "domain_health": [
+    { "domain": "CPU", "status": "partial", "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"] },
+    { "domain": "Job", "status": "present_not_deeply_resolved", "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"] },
+    { "domain": "GPU", "status": "present_not_deeply_resolved", "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"] },
+    { "domain": "GPU Memory", "status": "resource_nodes_present_not_validated_by_this_fixture", "evidence_refs": ["EVD-G01-FRAME-527-PARTIAL"] }
+  ],
+  "cpu_memory_findings": [],
+  "gpu_memory_findings": [],
+  "tracy_findings": {
+    "total_capture_overhead": "NotMeasuredSingleTrace",
+    "runtime_findings": ["本 Fixture 不能独立测量总体录制开销"],
+    "analysis_findings": []
+  },
+  "evidence_gaps": [
+    {
+      "id": "GAP-G01-CRITICAL-PATH-TRUNCATED",
+      "reason": "QueryTruncated",
+      "minimum_additional_evidence": ["完成 frame relation 分页或缩小查询范围"]
+    }
+  ],
+  "query_audit_refs": ["EVD-G01-FRAME-527-PARTIAL"],
+  "report_versions": {
+    "analysis_result_schema": 2,
+    "evidence_manifest_schema": 1,
+    "report_builder": "1.1.1",
+    "template": "1.1.1",
+    "analysis_workflow": "1.1.1"
+  }
+}

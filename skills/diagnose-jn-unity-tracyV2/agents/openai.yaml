@@ -1,0 +1,7 @@
+interface:
+  display_name: "JN Unity × Tracy 性能诊断"
+  short_description: "直接分析 Tracy stream，按 CPU/GPU、线程和函数输出卡顿证据与优化清单"
+  default_prompt: "使用 $diagnose-jn-unity-tracy 分析现有捕获，按输入格式选择 stream EXE 或普通 Tracy MCP，核验全部卡顿候选和代表覆盖，按 CPU/GPU、线程、具体函数与证据输出 P0/P1/P2 优化清单，每个问题附真实帧/事件的网页内嵌 Tracy 链接及原生预览，并明确归因和展示缺口。"
+
+policy:
+  allow_implicit_invocation: true

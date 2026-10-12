@@ -1,0 +1,23 @@
+# Copy this file to JNTracy.AnalysisProfile.yaml and change only project policy.
+# Machine-specific executable and output roots are supplied explicitly to the
+# launcher; they are never inferred from trace strings.
+schema_version: 1
+profile_name: Example 60 FPS single-trace analysis
+frame_budget:
+  target_fps: 60.0
+  frame_ms: 16.666667
+module_budgets: []
+resource_budgets:
+  cpu_memory: {value: 16.0, unit: GB, status: provisional}
+  gpu_memory: {value: 6.4, unit: GB, status: fixed}
+candidate_policy:
+  top_n: 10
+  cumulative_contribution: 0.8
+  per_domain_limit: 50
+  priorities: [P0, P1, P2, P3, P4]
+limits:
+  query_memory_target_bytes: 8589934592
+  query_memory_hard_bytes: 17179869184
+  cache_max_bytes: 137438953472
+  minimum_free_disk_bytes: 68719476736
+user_focus: []

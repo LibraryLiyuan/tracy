@@ -1,0 +1,110 @@
+{
+  "schema_version": 4,
+  "capture_quality": [],
+  "task": {
+    "id": "",
+    "state": "created",
+    "created_at": "",
+    "updated_at": "",
+    "state_history": []
+  },
+  "profile": {
+    "authoring_path": "",
+    "authoring_sha256": "",
+    "resolved_json_path": "",
+    "resolved_yaml_path": "",
+    "profile_identity": "",
+    "query_validation_evidence": ""
+  },
+  "query": {
+    "executable": "",
+    "executable_sha256": "",
+    "schema": "",
+    "mcp_session_state": "not_started",
+    "process_id": 0,
+    "process_start_identity": "",
+    "initialize_evidence": "",
+    "capability_evidence": "",
+    "attempts": [],
+    "last_request": null,
+    "crash_evidence": []
+  },
+  "trace": {
+    "input_path": "",
+    "input_kind": "",
+    "trace_id": "",
+    "strong_identity": "",
+    "size_bytes": 0,
+    "sha256": "",
+    "status": "unknown",
+    "completeness": "unknown",
+    "right_censored": false,
+    "quality": {},
+    "open_evidence": ""
+  },
+  "scan": {
+    "scan_id": "",
+    "state": "not_started",
+    "resumable": false,
+    "completed": false,
+    "closed": false,
+    "progress_completed": "0",
+    "progress_total": "0",
+    "stage": "",
+    "error": null,
+    "aggregate_content_sha256": "",
+    "candidate_content_sha256": "",
+    "aggregate_reused": null,
+    "summary_evidence": "",
+    "quality_evidence": ""
+  },
+  "candidate_manifest": {
+    "schema_version": 1,
+    "content_sha256": "",
+    "page_evidence": [],
+    "page_count": 0,
+    "candidate_count": 0,
+    "pagination_complete": false
+  },
+  "investigations": {
+    "queue": [],
+    "active": null,
+    "completed": [],
+    "backlog": [],
+    "coverage": {
+      "candidate_total": 0,
+      "required_total": 0,
+      "required_completed": 0,
+      "investigated_total": 0,
+      "uninvestigated_total": 0
+    }
+  },
+  "ledgers": {
+    "mcp_queries": [],
+    "source_evidence": [],
+    "hypotheses": []
+  },
+  "domain_health": [],
+  "evidence_gaps": [],
+  "report_build": {
+    "analysis_result_path": "",
+    "candidate_manifest_path": "",
+    "evidence_manifest_path": "",
+    "output_directory": "",
+    "state": "not_started",
+    "validation_path": ""
+  },
+  "outputs": {
+    "markdown_report": "",
+    "analysis_process_report": "",
+    "manual_verification_guide": "",
+    "evidence_index": "",
+    "state_json": "",
+    "resolved_profile": ""
+  },
+  "self_check": {
+    "status": "not_run",
+    "checks": [],
+    "failures": []
+  }
+}

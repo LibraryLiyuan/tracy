@@ -1,0 +1,67 @@
+{
+  "passed": true,
+  "scope": "Backup integrity, package lint, analyzer startup/help, Python entry points, display geometry; no new capture analysis or live viewer launched",
+  "checks": [
+    {
+      "name": "skill-lint",
+      "argv": [
+        "C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
+        "-B",
+        "-X",
+        "utf8",
+        "scripts/lint-skill.py"
+      ],
+      "exit_code": 0,
+      "stdout": "{\"passed\": true, \"errors\": [], \"scope\": \"package syntax, links and required contract terms\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "analyzer-help",
+      "argv": [
+        "E:\\tracy\\skills\\diagnose-jn-unity-tracyV2\\bin\\tracy-analyze.exe",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "tracy-analyze v4 --trace capture.tracy-stream --output-dir NEW_DIRECTORY [--mode shortlist|triage|diagnose]\n[--fps 60] [--workers 4] [--vram-limit-bytes 5368709120] [--max-representatives 24]\n[--cache-dir DIR] [--resume PREVIOUS_OUTPUT] [--no-cache] [--plan plan.json] [--skip-triage]\nDefault triage scans all domains and retains every candidate. Diagnose additionally reads short representative windows.\nShortlist reads frames and recorded VRAM samples only; CPU/GPU coverage remains not-scanned.\nBoth 5 GB and 5 GiB reference exceedances are recorded. Resume reuses a verified complete triage stage into a NEW output.\n",
+      "stderr": ""
+    },
+    {
+      "name": "workflow-help",
+      "argv": [
+        "C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
+        "-B",
+        "-X",
+        "utf8",
+        "scripts/stream_workflow.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "usage: stream_workflow.py [-h] {run,audit,evidence-plan} ...\n\nRun native stream analysis and audit saved receipts; never parse trace/store\nevents.\n\npositional arguments:\n  {run,audit,evidence-plan}\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "stderr": ""
+    },
+    {
+      "name": "viewer-prepare-help",
+      "argv": [
+        "C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
+        "-B",
+        "-X",
+        "utf8",
+        "tools/stream-report-viewer/prepare.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "usage: prepare.py [-h] --analysis ANALYSIS --spec SPEC --profiler PROFILER\n                  --output OUTPUT\n\nBuild a native view registry from verified native analysis receipts.\n\noptions:\n  -h, --help           show this help message and exit\n  --analysis ANALYSIS\n  --spec SPEC\n  --profiler PROFILER\n  --output OUTPUT\n",
+      "stderr": ""
+    },
+    {
+      "name": "display-geometry",
+      "argv": [
+        "node",
+        "tools/stream-report-viewer/test_display.js"
+      ],
+      "exit_code": 0,
+      "stdout": "{\"passed\":true,\"geometry_and_hit_checks\":36,\"dpr\":[1,1.25,1.5,2],\"viewport_widths\":[345,1915,2560]}\n",
+      "stderr": ""
+    }
+  ]
+}

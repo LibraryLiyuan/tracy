@@ -1,0 +1,35 @@
+{
+  "created_at": "2026-10-12T15:05:47.555079+08:00",
+  "skill_version": "2.6.3",
+  "source_skill": "C:\\Users\\Admin\\.codex\\skills\\diagnose-jn-unity-tracy",
+  "backup_root": "E:\\tracy\\skills\\diagnose-jn-unity-tracyV2",
+  "source_skill_file_count": 147,
+  "viewer_tool_file_count": 14,
+  "binaries": [
+    {
+      "destination": "bin/tracy-analyze.exe",
+      "source": "E:\\tracy\\_build-all\\query-dev\\Release\\tracy-analyze.exe",
+      "sha256": "49c7a53af1a70878f3410a2cab113bbcf695f5928cb371fe6edd4de137e6eedd",
+      "bytes": 21225472
+    },
+    {
+      "destination": "bin/tracy-profiler-offscreen.exe",
+      "source": "F:\\JNTracyCapture\\Player_20261011_212310\\analysis-skill-check-20261011\\tracy-web-open-fix-20261012\\tracy-profiler-offscreen.exe",
+      "sha256": "9c18b11a105016a5a373a4c766c68f6c6dd3744925f53c4718323b37291c5288",
+      "bytes": 30108672
+    }
+  ],
+  "tracy_git_branch": "codex/backup-tracy-skill-v2-20261012",
+  "tracy_git_head": "c015f497cf8295b13af5e3a3d78e65ffa6335a3e",
+  "workspace_has_uncommitted_changes": true,
+  "backup_committed": false,
+  "original_stream_analyzer_path_missing": true,
+  "analyzer_recovered_from_build_output_with_identical_sha256": true,
+  "rebased_configs": [
+    "config/stream-local.json",
+    "config/stream-viewer-local.json"
+  ],
+  "source_files_verified": true,
+  "viewer_sources_verified": true,
+  "scope": "Skill and compiled stream tools backup, not a full native source or capture backup"
+}

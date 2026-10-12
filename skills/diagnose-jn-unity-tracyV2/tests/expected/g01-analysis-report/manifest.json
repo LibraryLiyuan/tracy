@@ -1,0 +1,70 @@
+{
+  "artifacts": [
+    {
+      "bytes": 388,
+      "path": "Analysis-Process-and-Query-Audit.md",
+      "sha256": "efb8d7a0e7b25d5d7289a4daa6897acf4e9d2616e5507869d638df45a588925c"
+    },
+    {
+      "bytes": 279,
+      "path": "Evidence-Index.md",
+      "sha256": "f9b95e7f7cc31c8a82f0fafbb8e50a539674cfecda3337ba2c5ff36c6e880d65"
+    },
+    {
+      "bytes": 4989,
+      "path": "Performance-Analysis-Report.md",
+      "sha256": "4b62972c77efd65d48d8ae4c943e5c2287c68ce6bd7fc584ecff8ac4d0e2c0b8"
+    },
+    {
+      "bytes": 6293,
+      "path": "analysis-result.json",
+      "sha256": "179275fa3288eeea0291e215e500d6030913120f3fddd36fcb371a0236d84270"
+    },
+    {
+      "bytes": 1408,
+      "path": "evidence-data/frame-explain-527.json",
+      "sha256": "6661f2c5d1517450d2d362705c32418ce3309da1c75324a9c63f911e298c476a"
+    },
+    {
+      "bytes": 1449,
+      "path": "evidence-manifest.json",
+      "sha256": "7c7b542a1be7ec37ea165455cbec5c4173d190a3d0d23081e938cbe937fca95a"
+    },
+    {
+      "bytes": 80,
+      "path": "report-validation.json",
+      "sha256": "775b16cc89e3f88928eecaf210d6a3dad7f384d7646b2a2941f868a8b08f6413"
+    }
+  ],
+  "configuration": {
+    "local_profile": {
+      "path": "config/local-profile.json",
+      "sha256": "8b798bc684fa0b8413c593a70a6e7ce37ff9e4c7f1304b653f08f5fcaf0a04aa"
+    },
+    "marker_attribution": {
+      "path": "config/marker-attribution.json",
+      "sha256": "f47ebee0d73f945469c0e40c07e9453266f75a18b1ab29ead433d30b9c1bbbed"
+    },
+    "performance_budgets": {
+      "path": "config/performance-budgets.json",
+      "sha256": "98a97952fa346c39efc269f55ae8ab61c592f15942f90fab6b2f79ffaccf6023"
+    },
+    "project_profile": {
+      "path": "config/project-profile.json",
+      "sha256": "d4b1fa80124b7ef41191f07993a40e9aa8aaa7bd62bc6b573bbd00ff7569dd9a"
+    }
+  },
+  "deterministic": true,
+  "generated_at": "2026-08-30T00:00:00+08:00",
+  "report_id": "G01-REGRESSION-PARTIAL-EVIDENCE",
+  "schema_version": 1,
+  "trace_id": "trace-1",
+  "trace_sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+  "versions": {
+    "analysis_result_schema": 2,
+    "analysis_workflow": "1.1.1",
+    "evidence_manifest_schema": 1,
+    "report_builder": "1.1.1",
+    "template": "1.1.1"
+  }
+}

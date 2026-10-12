@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "status": "passed_with_intentional_packaging_warnings",
+  "implementation_stages": {
+    "S0_red_baseline": "passed",
+    "S1_schema_and_config": "passed",
+    "S2_diagnostic_tree": "passed",
+    "S3_full_scan_and_selection": "passed",
+    "S4_evidence_and_depth_validation": "passed",
+    "S5_fixed_report_builder": "passed",
+    "S6_tests_and_real_regression": "passed"
+  },
+  "tests": {
+    "powershell_suite": "passed",
+    "python_unittest_count": 10,
+    "long_trace_frames": 5000,
+    "deterministic_double_build": "passed",
+    "g01_real_evidence_regression": "passed",
+    "report_validation": "passed"
+  },
+  "agent_skill_linter": {
+    "error_count": 0,
+    "accepted_warnings": [
+      "LICENSE missing: internal draft does not declare a distribution license",
+      "README missing: the approved plan explicitly forbids generating README",
+      "CI workflow missing: this is a standalone draft skill, not a repository root"
+    ],
+    "accepted_info": [
+      "agents directory is required by Codex skill discovery",
+      "config directory is required by the four-file configuration contract",
+      "schemas directory is required by the public JSON contracts"
+    ]
+  },
+  "temporary_dependencies_cleaned": true
+}

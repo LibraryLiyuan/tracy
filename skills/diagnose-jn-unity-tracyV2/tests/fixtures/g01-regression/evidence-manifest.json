@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "trace": {
+    "trace_id": "trace-1",
+    "sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57"
+  },
+  "evidence": [
+    {
+      "evidence_id": "EVD-G01-FRAME-527-PARTIAL",
+      "trace_id": "trace-1",
+      "trace_sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+      "type": "frame_explain_excerpt",
+      "mcp": {
+        "method": "frame.explain",
+        "params": { "frame_id": "281474976711184" }
+      },
+      "request": {
+        "path": "requests/0048-frame-explain-527-attempt-3.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "response": {
+        "path": "evidence-data/frame-explain-527.json",
+        "sha256": "6661f2c5d1517450d2d362705c32418ce3309da1c75324a9c63f911e298c476a"
+      },
+      "refs": {
+        "frames": ["281474976711184"],
+        "time_ranges_ns": [["133448161153", "133850025884"]],
+        "threads": ["tracy:v1:0083175da9ff46f8:thread:3c10"],
+        "queues": [],
+        "entities": ["tracy:v1:0083175da9ff46f8:evidence-node:12cd"]
+      },
+      "partial": true,
+      "truncated": true,
+      "next_cursor": null,
+      "attempt": 3,
+      "quality": "truncated",
+      "data_path": "evidence-data/frame-explain-527.json"
+    }
+  ]
+}

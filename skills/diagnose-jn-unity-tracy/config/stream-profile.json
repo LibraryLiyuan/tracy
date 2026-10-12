@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "target_fps": 60.0,
+  "vram_limit_bytes": 5368709120,
+  "max_representatives": 64,
+  "workers": 4
+}

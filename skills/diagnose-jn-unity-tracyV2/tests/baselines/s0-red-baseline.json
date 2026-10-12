@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-30T00:00:00+08:00",
+  "scope": "pre-implementation behavior baseline",
+  "existing_powershell_tests": {
+    "status": "blocked_by_stale_local_toolchain_path",
+    "path_before_fix": "C:\\LegacyTracy\\build-n27-tools\\Release"
+  },
+  "new_contract_tests": {
+    "status": "red",
+    "failures": [
+      "scripts/build_report.py did not exist",
+      "scripts/validate_analysis_result.py did not exist",
+      "legacy report lacked Frame Class and stable Bottleneck Signature contracts",
+      "legacy report lacked per-signature Hypothesis Ledger and L0-L6 depth gate",
+      "legacy report was not generated from a shared Analysis Result and Evidence Manifest"
+    ]
+  },
+  "legacy_behavior_baseline": "G01-Static-20260826-200012-analysis/skill-analysis/report/performance-report.md",
+  "fixture": "tests/fixtures/g01-regression/evidence-data/frame-explain-527.json"
+}

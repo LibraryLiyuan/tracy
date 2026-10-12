@@ -1,0 +1,19 @@
+{
+  "frames": [
+    { "frame_number": 100, "duration_ms": 14.0, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 101, "duration_ms": 14.2, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 102, "duration_ms": 14.4, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 103, "duration_ms": 14.6, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 104, "duration_ms": 14.8, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 105, "duration_ms": 17.2, "complete": true, "structure_fingerprint": "job-wait" },
+    { "frame_number": 106, "duration_ms": 18.1, "complete": true, "structure_fingerprint": "job-wait" },
+    { "frame_number": 107, "duration_ms": 14.3, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 108, "duration_ms": 31.0, "complete": true, "structure_fingerprint": "streaming-spike", "selection_reasons": ["LargestIoRequest"] },
+    { "frame_number": 109, "duration_ms": 14.1, "complete": true, "structure_fingerprint": "normal" },
+    { "frame_number": 110, "duration_ms": 40.0, "complete": true, "capture_perturbed": true, "frame_image_checkpoint": true, "structure_fingerprint": "frame-image" },
+    { "frame_number": 111, "duration_ms": 13.9, "complete": true, "transition": true, "excluded_reason": "scene_transition", "structure_fingerprint": "transition" },
+    { "frame_number": 200, "duration_ms": 20.0, "complete": true, "loading_activity": true, "structure_fingerprint": "load" },
+    { "frame_number": 201, "duration_ms": 25.0, "complete": true, "loading_activity": true, "structure_fingerprint": "load" },
+    { "frame_number": 202, "duration_ms": 35.0, "complete": true, "loading_activity": true, "structure_fingerprint": "shader-warmup" }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "evidence": [
+    {
+      "attempt": 3,
+      "data_path": "evidence-data/frame-explain-527.json",
+      "evidence_id": "EVD-G01-FRAME-527-PARTIAL",
+      "mcp": {
+        "method": "frame.explain",
+        "params": {
+          "frame_id": "281474976711184"
+        }
+      },
+      "next_cursor": null,
+      "partial": true,
+      "quality": "truncated",
+      "refs": {
+        "entities": [
+          "tracy:v1:0083175da9ff46f8:evidence-node:12cd"
+        ],
+        "frames": [
+          "281474976711184"
+        ],
+        "queues": [],
+        "threads": [
+          "tracy:v1:0083175da9ff46f8:thread:3c10"
+        ],
+        "time_ranges_ns": [
+          [
+            "133448161153",
+            "133850025884"
+          ]
+        ]
+      },
+      "request": {
+        "path": "requests/0048-frame-explain-527-attempt-3.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "response": {
+        "path": "evidence-data/frame-explain-527.json",
+        "sha256": "6661f2c5d1517450d2d362705c32418ce3309da1c75324a9c63f911e298c476a"
+      },
+      "trace_id": "trace-1",
+      "trace_sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+      "truncated": true,
+      "type": "frame_explain_excerpt"
+    }
+  ],
+  "schema_version": 1,
+  "trace": {
+    "sha256": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+    "trace_id": "trace-1"
+  }
+}
