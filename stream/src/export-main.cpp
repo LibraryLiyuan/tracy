@@ -74,6 +74,7 @@ std::string QualityJson( const tracy::stream::StoreInfo& i )
     finding( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no end event", i.openZones );
     finding( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones lack a timestamp or CPU end", i.incompleteGpuZones );
     finding( "warning", "MISPLACED_ZONE_EVENTS", "zone texts, names or colors written for a zone that was not innermost were dropped", i.misplacedZoneEvents );
+    finding( "warning", "CONTEXT_SWITCH_GAPS", "context switches did not continue their thread or CPU: Windows dropped events, or the capture left out other programs' threads; they were applied as Tracy's viewer applies them", i.contextSwitchGaps );
     finding( "warning", "UNRESOLVED_DEFINITIONS", "events reference definitions absent from the journal", i.unresolvedDefinitions );
     finding( "warning", "TRUNCATED_STREAM_TAIL", "the journal has bytes after its last complete record", i.sourceBytes > i.validBytes ? 1 : 0 );
     std::ostringstream out;
@@ -81,7 +82,7 @@ std::string QualityJson( const tracy::stream::StoreInfo& i )
         << ",\"source_sha256\":\"" << i.sourceSha256 << "\",\"data_sha256\":\"" << i.dataSha256 << "\",\"source_bytes\":" << i.sourceBytes << ",\"valid_bytes\":" << i.validBytes
         << ",\"revision\":" << i.revision << ",\"first_ns\":" << i.firstNs << ",\"last_ns\":" << i.lastNs << ",\"clean_end\":" << ( i.cleanEnd ? "true" : "false" )
         << ",\"transcript_verified\":" << ( i.transcriptVerified ? "true" : "false" ) << ",\"counts\":{\"events\":" << i.events << ",\"cpu_zones\":" << i.cpuZones
-        << ",\"open_zones\":" << i.openZones << ",\"misplaced_zone_events\":" << i.misplacedZoneEvents << ",\"gpu_zones\":" << i.gpuZones << ",\"incomplete_gpu_zones\":" << i.incompleteGpuZones << ",\"frames\":" << i.frames
+        << ",\"open_zones\":" << i.openZones << ",\"misplaced_zone_events\":" << i.misplacedZoneEvents << ",\"context_switch_gaps\":" << i.contextSwitchGaps << ",\"gpu_zones\":" << i.gpuZones << ",\"incomplete_gpu_zones\":" << i.incompleteGpuZones << ",\"frames\":" << i.frames
         << ",\"messages\":" << i.messages << ",\"plot_points\":" << i.plotPoints << ",\"lock_events\":" << i.lockEvents << ",\"jobs\":" << i.jobs << ",\"io_requests\":" << i.ioRequests
         << ",\"allocations\":" << i.allocations << ",\"samples\":" << i.samples << ",\"context_regions\":" << i.contextRegions << ",\"auxiliary_events\":" << i.auxiliaryEvents
         << ",\"frame_images\":" << i.frameImages << ",\"unresolved_definitions\":" << i.unresolvedDefinitions << ",\"call_tree_nodes\":" << i.zoneTreeNodes << "}"

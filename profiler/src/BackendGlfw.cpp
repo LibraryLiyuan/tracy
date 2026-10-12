@@ -10,6 +10,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 
 #include "profiler/TracyConfig.hpp"
 #include "profiler/TracyImGui.hpp"
@@ -41,6 +43,7 @@ static bool s_streamFrameTimed = false;
 static double s_streamCpuStart = -1, s_streamFrameCpu = -1;
 static bool s_streamAdaptivePresentation = false;
 static double s_streamFramePresent = 0;
+static bool s_streamWeb = false;
 void ConfigureStreamingPresentation( bool active, bool unpaced )
 {
     static int interval = 1;
@@ -145,6 +148,7 @@ double StreamingFrameUiMilliseconds() { return s_streamFrameUi; }
 double StreamingFrameRenderMilliseconds() { return s_streamFrameRender; }
 double StreamingFramePresentMilliseconds() { return s_streamFramePresent; }
 double StreamingFrameCpuMilliseconds() { return s_streamFrameCpu; }
+#include "StreamingWebFrame.inl"
 #endif
 
 #ifdef __APPLE__
@@ -305,7 +309,11 @@ void Backend::Run()
 {
     while( !glfwWindowShouldClose( s_window ) )
     {
-        if( s_iconified )
+        if( s_iconified
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+            && !s_streamWeb
+#endif
+            )
         {
             glfwWaitEvents();
         }
@@ -316,7 +324,11 @@ void Backend::Run()
 #endif
             glfwPollEvents();
             s_redraw();
-            if( tracy::s_config.focusLostLimit && !glfwGetWindowAttrib( s_window, GLFW_FOCUSED ) ) std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
+            if( tracy::s_config.focusLostLimit && !glfwGetWindowAttrib( s_window, GLFW_FOCUSED )
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+                && !s_streamWeb
+#endif
+                ) std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
             s_mainThreadTasks->Run();
 #if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
             if( s_streamAdaptivePresentation && !glfwWindowShouldClose( s_window ) )
@@ -341,7 +353,11 @@ void Backend::Attention()
 
 void Backend::NewFrame( int& w, int& h )
 {
-    const auto scale = GetDpiScale();
+    const auto scale =
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+        s_streamWeb ? 1.f :
+#endif
+        GetDpiScale();
     if( scale != s_prevScale )
     {
         s_prevScale = scale;
@@ -358,6 +374,15 @@ void Backend::NewFrame( int& w, int& h )
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+    if(s_streamWeb)
+    {
+        // Desktop maximize/DPI/monitor changes cannot resize the web transport.
+        w=m_w=StreamingWebWidth;h=m_h=StreamingWebHeight;
+        ImGui::GetIO().DisplaySize=ImVec2(float(w),float(h));
+        ImGui::GetIO().DisplayFramebufferScale=ImVec2(1,1);
+    }
+#endif
 }
 
 void Backend::EndFrame()
@@ -369,18 +394,23 @@ void Backend::EndFrame()
     const ImVec4 clear_color = ImColor( 20, 20, 17 );
 
     ImGui::Render();
+#if defined(_WIN32) && defined(TRACY_STREAM_VIEW)
+    if(s_streamWeb)s_bindWebFramebuffer(WebFramebuffer,s_webFramebuffer);
+#endif
     glViewport( 0, 0, m_w, m_h );
     glClearColor( clear_color.x, clear_color.y, clear_color.z, clear_color.w );
     glClear( GL_COLOR_BUFFER_BIT );
     ImGui_ImplOpenGL3_RenderDrawData( ImGui::GetDrawData() );
 
 #if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )
+    PublishStreamingWebFrame(m_w,m_h);
     if( !s_streamScreenshot.empty() )
     {
         WriteStreamingScreenshot( m_w, m_h );
         s_streamScreenshot.clear();
     }
     const auto presentStart = std::chrono::steady_clock::now();
+    if(s_streamWeb)s_bindWebFramebuffer(WebFramebuffer,0);
 #endif
     glfwSwapBuffers( s_window );
 #if defined( _WIN32 ) && defined( TRACY_STREAM_VIEW )

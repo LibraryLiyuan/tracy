@@ -66,21 +66,66 @@ void Text(const std::string &s)
 {
     ImGui::TextWrapped("%s", s.c_str());
 }
-void Muted(const std::string &s)
+void Colored(const ImVec4 &color, const std::string &s)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.62f, .68f, .76f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
     Text(s);
     ImGui::PopStyleColor();
 }
-// The preset named `name` in the folder of `exe`, if listed; a running
-// game or editor reads JNTracy.ini from its own folder.
-std::string IniBeside(const std::vector<std::string> &presets, const std::string &exe, const char *name)
+void Muted(const std::string &s)
 {
-    auto wanted = PathText(fs::path(Wide(exe)).parent_path() / name);
-    for (auto &p : presets)
-        if (p == wanted)
-            return p;
-    return "";
+    Colored(ImVec4(.62f, .68f, .76f, 1), s);
+}
+// Whether the selected INI is the one the game read when it started, and the
+// ways to make it so: a running game never switches to another INI.
+void IniState(Settings &settings, const ProcessIdentity &selected, const Preflight &check, bool &restart, std::string &notice)
+{
+    const bool checked = check.target.pid == selected.pid && check.target.created == selected.created;
+    if (!selected.pid || (checked && !check.alive))
+    {
+        Muted(settings.existing ? "选择目标进程后，这里显示它启动时实际读取的 INI。"
+                                : "启动游戏时使用所选 INI；不会覆盖游戏原配置。");
+        return;
+    }
+    if (!checked)
+    {
+        Muted("正在核对游戏启动时读取的 INI…");
+        return;
+    }
+    const auto loaded = PathText(fs::path(Wide(check.loaded.path)).filename());
+    const std::string inferred = check.loaded.source == "inferred" ? "（按游戏启动参数判断）" : "";
+    if (check.match == IniMatch::Same)
+    {
+        Colored(ImVec4(.45f, .85f, .55f, 1), "已生效：游戏启动时读取的就是这份配置" + inferred);
+        return;
+    }
+    if (check.match == IniMatch::Unknown)
+    {
+        Muted("无法确认游戏使用的 INI；录制文件里会记录游戏自己报告的配置。");
+        return;
+    }
+    Colored(ImVec4(1.f, .7f, .32f, 1),
+            (check.loaded.sha256.empty() ? "未生效：游戏启动时没有找到 INI（" + check.loaded.path + "），使用的是内置默认配置。"
+                                         : "未生效：游戏启动时读取的是 " + loaded + "。") +
+                inferred + "INI 只在游戏启动时读取，运行中的游戏不会切换。");
+    if (IsEditor(settings.player))
+    {
+        const auto argument = "-jn-tracy-config \"" + PathText(fs::absolute(Wide(settings.ini))) + "\"";
+        Muted("请关闭 Editor，并在它的启动参数中加入 " + argument + " 后重新打开。");
+        if (ImGui::Button("复制启动参数"))
+        {
+            ImGui::SetClipboardText(argument.c_str());
+            notice = "启动参数已复制";
+        }
+    }
+    else if (ImGui::Button("用所选配置重启游戏"))
+        restart = true;
+    if (check.loadedFileUnchanged)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("改用游戏正在使用的配置"))
+            settings.ini = check.loaded.path;
+    }
 }
 void Heading(const char *title)
 {
@@ -218,6 +263,16 @@ void ResultActions(const Json &task, const Settings &settings, std::string &noti
 } // namespace
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
+    // An elevated copy of this program restarts a game that runs elevated.
+    int argc = 0;
+    if (auto **argv = CommandLineToArgvW(GetCommandLineW(), &argc))
+    {
+        const bool restart = argc > 1 && wcscmp(argv[1], L"--restart-player") == 0;
+        const int code = restart ? RunElevatedRestart(argc, argv) : 0;
+        LocalFree(argv);
+        if (restart)
+            return code;
+    }
     HANDLE instance = CreateMutexW(nullptr, FALSE, L"Local\\JNTracyCaptureGui-v1");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -307,9 +362,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         for (auto &p : presets)
             if (settings.ini.empty() && p.ends_with("JNTracy.HighEvidence.ini"))
                 settings.ini = p;
-        std::future<std::vector<std::string>> preflightFuture;
-        std::vector<std::string> preflight = {"正在检查目标与配置"};
+        std::future<Preflight> preflightFuture;
+        Preflight preflight;
+        preflight.errors = {"正在检查目标与配置"};
         std::string preflightSignature;
+        // The game this program last started; a new one becomes the target.
+        ProcessIdentity started{};
+        bool restartRequested = false;
         auto nextPreflight = std::chrono::steady_clock::now();
         bool running = true;
         int tab = 0;
@@ -320,8 +379,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             auto view = core.Snapshot();
             if (discovery.valid() && discovery.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
                 processes = discovery.get();
-            if (view.target.pid && !settings.existing)
+            if (view.target.pid &&
+                (!settings.existing || view.target.pid != started.pid || view.target.created != started.created))
                 selected = view.target;
+            started = view.target;
             if (view.state != previousState)
             {
                 if (!view.busy)
@@ -349,20 +410,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                 }
                 catch (const std::exception &e)
                 {
-                    preflight = {e.what()};
+                    preflight = Preflight{};
+                    preflight.errors = {e.what()};
                 }
             }
             if (!preflightFuture.valid() &&
                 (signature != preflightSignature || std::chrono::steady_clock::now() >= nextPreflight))
             {
+                // The INI state of the same game stays shown while it is checked again.
                 if (signature != preflightSignature)
-                    preflight = {"正在检查目标与配置"};
+                    preflight.errors = {"正在检查目标与配置"};
                 preflightSignature = signature;
                 nextPreflight = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 auto copy = settings;
                 auto target = selected;
                 preflightFuture =
-                    std::async(std::launch::async, [copy, target] { return PreflightErrors(copy, target); });
+                    std::async(std::launch::async, [copy, target] { return RunPreflight(copy, target); });
             }
             auto start = [&] {
                 try
@@ -380,7 +443,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                 hotkeyPressed = false;
                 if (view.state == "recording" || view.state == "connecting")
                     core.Stop();
-                else if (!view.busy && settings.ready && preflight.empty())
+                else if (!view.busy && settings.ready && preflight.errors.empty())
                     start();
             }
             ImGui_ImplOpenGL3_NewFrame();
@@ -456,14 +519,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                             {
                                 auto name = PathText(fs::path(Wide(path)).filename()) + " · PID " +
                                             std::to_string(id.pid);
+                                // The selected INI stays: the INI state below
+                                // shows whether the game read it.
                                 if (ImGui::Selectable(name.c_str(), id.pid == selected.pid))
                                 {
                                     selected = id;
                                     settings.player = path;
                                     settings.ready = false;
                                     presets = IniFiles(settings);
-                                    if (auto own = IniBeside(presets, path, "JNTracy.ini"); !own.empty())
-                                        settings.ini = own;
                                 }
                             }
                             ImGui::EndCombo();
@@ -496,10 +559,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         ImGui::EndCombo();
                     }
                     PathField("INI 文件", settings.ini, false, L"INI files\0*.ini\0");
-                    Muted(settings.existing ? "已运行的 Editor / Player 读取自身目录下的 JNTracy.ini（或其 -jn-tracy-config 指定的文件）；"
-                                              "这里的选择不会改变它，只作为核对记录写入录制文件。"
-                          : selected.pid    ? "更改配置将在下次启动时使用；不会热切换当前游戏。"
-                                            : "启动时使用所选 INI；不会覆盖游戏原配置。");
+                    IniState(settings, selected, preflight, restartRequested, notice);
+                    if (restartRequested)
+                    {
+                        restartRequested = false;
+                        ImGui::OpenPopup("用所选配置重启游戏");
+                    }
+                    if (ImGui::BeginPopupModal("用所选配置重启游戏", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                    {
+                        Text("将关闭游戏（PID " + std::to_string(selected.pid) + "），再用 " +
+                             PathText(fs::path(Wide(settings.ini)).filename()) + " 启动它；启动参数、目录和管理员权限不变。");
+                        Text("游戏中未保存的进度会丢失；重启后请重新进入要录制的场景。");
+                        if (ImGui::Button("关闭并重启"))
+                        {
+                            core.Restart(settings, selected);
+                            settings.ready = false;
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("取消"))
+                            ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
                     if (!settings.existing)
                     {
                         if (ImGui::Button("启动游戏"))
@@ -543,12 +624,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                     ImGui::EndTable();
                     ImGui::EndChild();
                     ImGui::Checkbox("场景已就绪，可以开始录制", &settings.ready);
-                    ImGui::BeginDisabled(!settings.ready || !preflight.empty());
+                    ImGui::BeginDisabled(!settings.ready || !preflight.errors.empty());
                     if (ImGui::Button("开始录制", ImVec2(210, 42)))
                         start();
                     ImGui::EndDisabled();
                     ImGui::SameLine();
-                    Muted(preflight.empty() ? "检查通过 · 停止后自动转换与校验" : preflight.front());
+                    Muted(preflight.errors.empty() ? "检查通过 · 停止后自动转换与校验" : preflight.errors.front());
                 }
                 else
                 {
@@ -558,7 +639,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         Text("录制时长：" + RecordingDuration(view.task));
                     const auto stopReason = RecordingStopReason(view.task);
                     if (!stopReason.empty()) Text("停止原因：" + stopReason);
-                    if (view.busy)
+                    // Starting the game records nothing yet.
+                    if (view.busy && view.state == "launching")
+                        Muted("游戏启动后回到录制设置。管理员确认窗口可能只在任务栏闪烁。");
+                    else if (view.busy)
                     {
                         ProcessingPanel(view);
                         Heading(("录制时长  " + FormatDuration(view.elapsedMs)).c_str());

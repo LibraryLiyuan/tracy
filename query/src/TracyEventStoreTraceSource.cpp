@@ -262,7 +262,11 @@ public:
         return result;
     }
 
-    TraceReadView AcquireReadView() const override { return m_worker->AcquireReadView(); }
+    TraceReadView AcquireReadView() const override
+    {
+        const auto& info = m_events->Info();
+        return { TraceSourceKind::Segment, TraceSourceState::Ready, info.revision, info.lastNs, info.cleanEnd };
+    }
 
     TraceInfoDto GetTraceInfo() const override
     {
@@ -314,15 +318,56 @@ public:
                 scan.matched = index;
                 scan.nextOffset = range.offset;
             }
-            else StartThread( scan, 0, 0 );
+            else
+            {
+                scan.chunks.clear();
+                scan.chunk = 0;
+                for( size_t thread = 0; thread < m_threads.size(); ++thread )
+                {
+                    const auto count = m_threads[thread].zones;
+                    if( count == 0 ) continue;
+                    const auto add = [&]( uint64_t begin, uint64_t end ) {
+                        if( !scan.chunks.empty() && scan.chunks.back().thread == thread && scan.chunks.back().end == begin )
+                            scan.chunks.back().end = end;
+                        else scan.chunks.push_back( { thread, begin, end } );
+                    };
+                    // Each saved bucket starts at a root and its bounds include
+                    // every descendant. Missing bounds must retain the old full
+                    // traversal, rather than silently omit a partial timeline.
+                    if( thread >= m_zoneRoots.size() || thread >= m_zoneRootStarts.size() || thread >= m_zoneRootEnds.size() ||
+                        m_zoneRoots[thread].empty() || m_zoneRoots[thread].front() != 0 ||
+                        m_zoneRoots[thread].size() != m_zoneRootStarts[thread].size() ||
+                        m_zoneRoots[thread].size() != m_zoneRootEnds[thread].size() )
+                    {
+                        add( 0, count );
+                        continue;
+                    }
+                    const auto& roots = m_zoneRoots[thread];
+                    for( size_t bucket = 0; bucket < roots.size(); ++bucket )
+                        if( m_zoneRootStarts[thread][bucket] < range.endNs && m_zoneRootEnds[thread][bucket] > range.startNs )
+                            add( roots[bucket], bucket + 1 < roots.size() ? roots[bucket + 1] : count );
+                }
+                StartCpuRangeChunk( scan );
+            }
         }
         store::StoreZoneRecord zone;
         while( result.size() < range.limit )
         {
             if( scan.thread >= m_threads.size() ) break;
+            if( !full && m_scanCursor->Ordinal() >= scan.chunks[scan.chunk].end )
+            {
+                ++scan.chunk;
+                StartCpuRangeChunk( scan );
+                continue;
+            }
             if( !m_scanCursor->Next( zone ) )
             {
-                StartThread( scan, scan.thread + 1, scan.thread + 1 < m_threads.size() ? m_threadBase[scan.thread + 1] : m_threadBase.back() );
+                if( full ) StartThread( scan, scan.thread + 1, scan.thread + 1 < m_threads.size() ? m_threadBase[scan.thread + 1] : m_threadBase.back() );
+                else
+                {
+                    ++scan.chunk;
+                    StartCpuRangeChunk( scan );
+                }
                 continue;
             }
             const auto ordinal = m_scanCursor->Ordinal() - 1;
@@ -1157,11 +1202,14 @@ private:
 
     struct ZoneScan
     {
+        struct Chunk { size_t thread; uint64_t begin, end; };
         bool valid = false;
         int64_t startNs = 0, endNs = 0;
         size_t nextOffset = 0, thread = 0;
         uint64_t matched = 0;
         std::vector<Ancestor> ancestors;
+        std::vector<Chunk> chunks;
+        size_t chunk = 0;
     };
 
     std::string Ref( const char* kind, uint64_t id ) const
@@ -1834,6 +1882,18 @@ private:
         if( thread < m_threads.size() ) m_scanCursor->Seek( m_threads[thread].thread, globalIndex - m_threadBase[thread] );
     }
 
+    void StartCpuRangeChunk( ZoneScan& scan ) const
+    {
+        if( scan.chunk >= scan.chunks.size() )
+        {
+            scan.thread = m_threads.size();
+            scan.ancestors.clear();
+            return;
+        }
+        const auto& chunk = scan.chunks[scan.chunk];
+        StartThread( scan, chunk.thread, m_threadBase[chunk.thread] + chunk.begin );
+    }
+
     std::optional<uint64_t> ParentOrdinal( std::vector<Ancestor>& ancestors, size_t thread, const store::StoreZoneRecord& zone, uint64_t ordinal ) const
     {
         return ::tracy::query::ParentOrdinal( *m_events, m_threads[thread].thread, ancestors, zone, ordinal );
@@ -1996,6 +2056,7 @@ std::unique_ptr<TraceSource> EventStoreTraceSource::Open( const std::filesystem:
     {
         events = store::EventStore::Open( journal, options );
     }
+
     catch( const std::exception& error )
     {
         throw std::runtime_error( std::string( "query event store open: " ) + error.what() );

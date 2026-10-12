@@ -150,6 +150,8 @@ endif()
 
 add_executable(tracy-query src/main.cpp)
 target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
+add_executable(tracy-analyze src/analyze.cpp)
+target_link_libraries(tracy-analyze PRIVATE TracyQueryProtocol)
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT tracy-query)
 
 option(JN_STREAM_CONVERT_SEMANTIC_TOOLS "Build local stream-convert semantic acceptance tools" OFF)
@@ -158,10 +160,14 @@ if(JN_STREAM_CONVERT_SEMANTIC_TOOLS)
     target_link_libraries(tracy-job-semantic-hash PRIVATE TracyQueryProtocol)
 endif()
 
-install(TARGETS tracy-query DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS tracy-query tracy-analyze DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-analyze-gpu-store-tests ../stream/tests/EventStoreGpuTests.cpp)
+    target_link_libraries(tracy-analyze-gpu-store-tests PRIVATE TracyEventStore TracyStoreCodec)
+    add_test(NAME tracy-analyze-gpu-store COMMAND tracy-analyze-gpu-store-tests)
+
     function(tracy_query_enable_assertions target)
         # Keep assertions active in Release test builds and avoid LTCG for the
         # deliberately large Worker integration translation unit. MSVC 19.5x
@@ -173,6 +179,15 @@ if(BUILD_TESTING)
             target_compile_options(${target} PRIVATE -UNDEBUG)
         endif()
     endfunction()
+
+    add_executable(tracy-event-store-window-scan-tests tests/EventStoreWindowScanTests.cpp)
+    target_link_libraries(tracy-event-store-window-scan-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-event-store-window-scan-tests)
+    add_test(NAME tracy-event-store-window-scan COMMAND tracy-event-store-window-scan-tests)
+    add_executable(tracy-frame-triage-tests tests/FrameTriageTests.cpp)
+    target_link_libraries(tracy-frame-triage-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-frame-triage-tests)
+    add_test(NAME tracy-frame-triage COMMAND tracy-frame-triage-tests)
 
     add_executable(tracy-paged-record-store-tests tests/PagedRecordStoreTests.cpp)
     add_executable(tracy-memory-attribution-tests tests/MemoryAttributionTests.cpp)

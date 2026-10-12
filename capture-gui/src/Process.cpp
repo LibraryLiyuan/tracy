@@ -195,6 +195,96 @@ ProcessIdentity LaunchPlayer(const Settings &s)
     CloseHandle(info.hProcess);
     return identity;
 }
+ProcessIdentity RestartPlayer(const Settings &s, const ProcessIdentity &running)
+{
+    Settings launch = s;
+    if (const auto info = ReadLaunchInfo(running); !info.exe.empty())
+    {
+        launch.player = info.exe;
+        launch.arguments = info.arguments;
+        launch.workingDirectory = info.directory;
+    }
+    // The game comes back as elevated as it was: elevation enables CPU
+    // sampling and context switches, which changes what is recorded.
+    launch.admin = RunsElevated(running);
+    if (!fs::is_regular_file(Wide(launch.ini)))
+        throw std::runtime_error("INI 文件不存在");
+    if (!CloseProcess(running, 10000))
+    {
+        // An elevated copy of this program closes the game and, when the game
+        // is to run elevated, starts it, so the user confirms once.
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        const uint64_t requested = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+        const auto self = ExecutableDirectory() / L"tracy-capture-gui.exe";
+        const std::wstring parameters = L"--restart-player " + std::to_wstring(running.pid) + L" " +
+                                        std::to_wstring(running.created) + L" " + (launch.admin ? L"1 " : L"0 ") +
+                                        Quote(Wide(launch.player)) + L" " + Quote(Wide(launch.workingDirectory)) + L" " +
+                                        Quote(fs::absolute(Wide(launch.ini)).wstring()) + L" " + Quote(Wide(launch.arguments));
+        SHELLEXECUTEINFOW info{sizeof(info)};
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        info.lpVerb = L"runas";
+        info.lpFile = self.c_str();
+        info.lpParameters = parameters.c_str();
+        info.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&info))
+            throw std::runtime_error(GetLastError() == ERROR_CANCELLED ? "已取消管理员确认，游戏仍在运行" : ErrorText());
+        WaitForSingleObject(info.hProcess, 120000);
+        DWORD code = 1;
+        GetExitCodeProcess(info.hProcess, &code);
+        CloseHandle(info.hProcess);
+        if (code == 2)
+            throw std::runtime_error("无法关闭游戏，它仍在运行");
+        if (code != 0)
+            throw std::runtime_error("游戏已关闭，但没有重新启动（退出码 " + std::to_string(code) + "）");
+        if (launch.admin)
+        {
+            // The new game is the latest start of the player since the request.
+            ProcessIdentity started{};
+            for (auto &[identity, path] : LocalProcesses())
+                if (identity.created >= requested && identity.created > started.created &&
+                    _wcsicmp(Wide(path).c_str(), Wide(launch.player).c_str()) == 0)
+                    started = identity;
+            if (!started.pid)
+                throw std::runtime_error("游戏已重新启动，但找不到它的进程");
+            return started;
+        }
+    }
+    try
+    {
+        return LaunchPlayer(launch);
+    }
+    catch (const std::exception &e)
+    {
+        throw std::runtime_error(std::string("游戏已关闭，但没有重新启动：") + e.what());
+    }
+}
+int RunElevatedRestart(int argc, wchar_t **argv)
+{
+    try
+    {
+        if (argc != 9)
+            return 3;
+        const ProcessIdentity running{DWORD(std::stoul(argv[2])), std::stoull(argv[3])};
+        if (!CloseProcess(running, 10000))
+            return 2;
+        if (wcscmp(argv[4], L"1") != 0)
+            return 0;
+        Settings launch;
+        launch.player = Utf8(argv[5]);
+        launch.workingDirectory = Utf8(argv[6]);
+        launch.ini = Utf8(argv[7]);
+        launch.arguments = Utf8(argv[8]);
+        // This copy runs elevated, so a plain start keeps the game elevated.
+        launch.admin = false;
+        LaunchPlayer(launch);
+        return 0;
+    }
+    catch (...)
+    {
+        return 4;
+    }
+}
 Json Mcp::Request(const std::string &method, const Json &params)
 {
     int id = ++m_next;

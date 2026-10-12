@@ -3,6 +3,7 @@
 #include <array>
 #include <bcrypt.h>
 #include <commdlg.h>
+#include <cstddef>
 #include <fstream>
 #include <iomanip>
 #include <set>
@@ -11,6 +12,7 @@
 #include <shobjidl.h>
 #include <sstream>
 #include <tlhelp32.h>
+#include <winternl.h>
 namespace capturegui
 {
 std::wstring Wide(const std::string &s)
@@ -474,14 +476,343 @@ std::vector<std::string> IniFiles(const Settings &s)
     }
     return {files.begin(), files.end()};
 }
-std::vector<std::string> PreflightErrors(const Settings &s, ProcessIdentity target)
+namespace
 {
-    std::vector<std::string> errors;
-    if (!target.pid || !Alive(target))
+using QueryProcess = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+QueryProcess NtQuery()
+{
+    static const auto query =
+        reinterpret_cast<QueryProcess>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    return query;
+}
+// The x64 layout of the process parameters read here, unchanged since
+// Windows Vista: the PEB points to them at 0x20.
+struct RemoteString
+{
+    USHORT length, maximum;
+    ULONG padding;
+    ULONG64 buffer;
+};
+struct RemoteParameters
+{
+    BYTE header[0x38];
+    RemoteString currentDirectory;
+    ULONG64 currentDirectoryHandle;
+    RemoteString dllPath, imagePath, commandLine;
+    ULONG64 environment;
+};
+static_assert(offsetof(RemoteParameters, currentDirectory) == 0x38 && offsetof(RemoteParameters, commandLine) == 0x70 &&
+              offsetof(RemoteParameters, environment) == 0x80);
+constexpr ULONG64 PebParameters = 0x20, EnvironmentSize = 0x3F0, EnvironmentLimit = 4ull << 20;
+bool ReadRemote(HANDLE process, ULONG64 address, void *out, size_t size)
+{
+    SIZE_T read = 0;
+    return ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), out, size, &read) && read == size;
+}
+std::wstring ReadRemoteString(HANDLE process, const RemoteString &s)
+{
+    if (!s.buffer || !s.length || s.length % 2)
+        return {};
+    std::wstring text(s.length / 2, L'\0');
+    return ReadRemote(process, s.buffer, text.data(), s.length) ? text : std::wstring();
+}
+// A process's command line, current directory and environment, from its
+// memory; empty when it cannot be read.
+struct RemoteProcess
+{
+    std::wstring commandLine, directory, environment;
+};
+RemoteProcess ReadRemoteProcess(HANDLE process)
+{
+    RemoteProcess result;
+    BOOL wow64 = FALSE;
+    PROCESS_BASIC_INFORMATION basic{};
+    ULONG64 parameters = 0;
+    RemoteParameters p{};
+    const auto query = NtQuery();
+    if (!query || !IsWow64Process(process, &wow64) || wow64 ||
+        query(process, 0, &basic, sizeof(basic), nullptr) < 0 || !basic.PebBaseAddress ||
+        !ReadRemote(process, ULONG64(basic.PebBaseAddress) + PebParameters, &parameters, sizeof(parameters)) ||
+        !parameters || !ReadRemote(process, parameters, &p, sizeof(p)))
+        return result;
+    result.commandLine = ReadRemoteString(process, p.commandLine);
+    result.directory = ReadRemoteString(process, p.currentDirectory);
+    if (!p.environment)
+        return result;
+    // The block is read up to its recorded size, or else to the end of its
+    // memory region; it ends at the first empty entry.
+    ULONG64 size = 0;
+    if (!ReadRemote(process, parameters + EnvironmentSize, &size, sizeof(size)) || !size || size > EnvironmentLimit)
+    {
+        MEMORY_BASIC_INFORMATION region{};
+        size = 0;
+        if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(p.environment), &region, sizeof(region)))
+            size = (std::min)(ULONG64(region.RegionSize) - (p.environment - ULONG64(region.BaseAddress)), EnvironmentLimit);
+    }
+    std::wstring block(size_t(size / 2), L'\0');
+    if (!block.empty() && ReadRemote(process, p.environment, block.data(), block.size() * 2))
+        result.environment = std::move(block);
+    return result;
+}
+// The command line of a process this program may not read the memory of.
+std::wstring QueryCommandLine(HANDLE process)
+{
+    const auto query = NtQuery();
+    ULONG size = 0;
+    if (!query)
+        return {};
+    query(process, 60 /* ProcessCommandLineInformation */, nullptr, 0, &size);
+    if (size < sizeof(UNICODE_STRING) || size > (1u << 20))
+        return {};
+    std::vector<BYTE> bytes(size);
+    if (query(process, 60, bytes.data(), size, &size) < 0)
+        return {};
+    const auto *text = reinterpret_cast<const UNICODE_STRING *>(bytes.data());
+    return text->Buffer ? std::wstring(text->Buffer, text->Length / 2) : std::wstring();
+}
+std::wstring ImagePath(HANDLE process)
+{
+    std::wstring path(32768, L'\0');
+    DWORD size = DWORD(path.size());
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &size))
+        return {};
+    path.resize(size);
+    return path;
+}
+std::string Lower(std::string text)
+{
+    for (auto &c : text)
+        c = char(tolower((unsigned char)c));
+    return text;
+}
+// Opens the process for reading its memory where allowed, else for querying.
+HANDLE OpenForQuery(const ProcessIdentity &target, bool &memory)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target.pid);
+    memory = h != nullptr;
+    if (!h)
+        h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+    if (h)
+    {
+        try
+        {
+            if (Identify(h).created == target.created)
+                return h;
+        }
+        catch (...)
+        {
+        }
+        CloseHandle(h);
+    }
+    return nullptr;
+}
+std::wstring QuoteArgument(const std::wstring &argument)
+{
+    return argument.empty() || argument.find_first_of(L" \t\"") != std::wstring::npos ? Quote(argument) : argument;
+}
+} // namespace
+Json LoadedIni::ToJson() const
+{
+    return {{"source", source}, {"path", path}, {"sha256", sha256}, {"status", status}, {"preset", preset}};
+}
+std::wstring EnvironmentValue(const std::wstring &block, const std::wstring &name)
+{
+    for (size_t start = 0; start < block.size();)
+    {
+        const auto end = block.find(L'\0', start);
+        const std::wstring_view entry(block.data() + start, (end == std::wstring::npos ? block.size() : end) - start);
+        if (entry.empty())
+            break;
+        // Names are case-insensitive; an entry such as "=C:=C:\" has an empty name.
+        if (entry.size() > name.size() && entry[name.size()] == L'=' &&
+            CompareStringOrdinal(entry.data(), int(name.size()), name.data(), int(name.size()), TRUE) == CSTR_EQUAL)
+            return std::wstring(entry.substr(name.size() + 1));
+        if (end == std::wstring::npos)
+            break;
+        start = end + 1;
+    }
+    return {};
+}
+std::pair<std::wstring, std::wstring> SplitIniArgument(const std::wstring &commandLine)
+{
+    std::pair<std::wstring, std::wstring> result;
+    int count = 0;
+    if (commandLine.empty())
+        return result;
+    auto **argv = CommandLineToArgvW(commandLine.c_str(), &count);
+    if (!argv)
+        return result;
+    for (int i = 1; i < count; ++i)
+    {
+        const std::wstring argument = argv[i];
+        if (_wcsicmp(argument.c_str(), L"-jn-tracy-config") == 0 || _wcsicmp(argument.c_str(), L"--jn-tracy-config") == 0)
+        {
+            if (i + 1 < count)
+                result.second = argv[++i];
+            continue;
+        }
+        if (!result.first.empty())
+            result.first += L' ';
+        result.first += QuoteArgument(argument);
+    }
+    LocalFree(argv);
+    return result;
+}
+LoadedIni QueryLoadedIni(const ProcessIdentity &target)
+{
+    LoadedIni loaded;
+    bool memory = false;
+    HANDLE h = target.pid ? OpenForQuery(target, memory) : nullptr;
+    if (!h)
+        return loaded;
+    struct Close
+    {
+        HANDLE value;
+        ~Close() { CloseHandle(value); }
+    } close{h};
+    const auto remote = memory ? ReadRemoteProcess(h) : RemoteProcess{};
+    if (const auto status = EnvironmentValue(remote.environment, L"JN_TRACY_INI_STATUS"); !status.empty())
+    {
+        loaded.source = "reported";
+        loaded.status = Utf8(status);
+        loaded.path = Utf8(EnvironmentValue(remote.environment, L"JN_TRACY_INI_PATH"));
+        loaded.sha256 = Lower(Utf8(EnvironmentValue(remote.environment, L"JN_TRACY_INI_SHA256")));
+        loaded.preset = Utf8(EnvironmentValue(remote.environment, L"JN_TRACY_INI_PRESET"));
+        return loaded;
+    }
+    // The engine's lookup: -jn-tracy-config, else JNTracy.ini beside
+    // JNTracyClient.dll, which sits beside the program; a program without it
+    // is no JN Tracy game.
+    const auto image = ImagePath(h);
+    const auto commandLine = remote.commandLine.empty() ? QueryCommandLine(h) : remote.commandLine;
+    std::error_code e;
+    if (image.empty() || !fs::is_regular_file(fs::path(image).parent_path() / L"JNTracyClient.dll", e))
+        return loaded;
+    const auto option = SplitIniArgument(commandLine).second;
+    fs::path path = option.empty() ? fs::path(image).parent_path() / L"JNTracy.ini" : fs::path(option);
+    if (path.is_relative())
+        path = (remote.directory.empty() ? fs::path(image).parent_path() : fs::path(remote.directory)) / path;
+    loaded.source = "inferred";
+    loaded.path = PathText(path.lexically_normal());
+    if (fs::is_regular_file(path, e))
+    {
+        loaded.status = "inferred";
+        loaded.sha256 = Sha256(path);
+    }
+    else
+        loaded.status = "not_found";
+    return loaded;
+}
+IniMatch CompareIni(const LoadedIni &loaded, const std::string &ini)
+{
+    std::error_code e;
+    if (loaded.source == "unknown" || ini.empty() || !fs::is_regular_file(Wide(ini), e))
+        return IniMatch::Unknown;
+    // Without a file the game runs the compiled defaults.
+    if (loaded.sha256.empty())
+        return IniMatch::Different;
+    return Lower(Sha256(Wide(ini))) == Lower(loaded.sha256) ? IniMatch::Same : IniMatch::Different;
+}
+LaunchInfo ReadLaunchInfo(const ProcessIdentity &target)
+{
+    LaunchInfo info;
+    bool memory = false;
+    HANDLE h = OpenForQuery(target, memory);
+    if (!h)
+        return info;
+    const auto remote = memory ? ReadRemoteProcess(h) : RemoteProcess{};
+    const auto commandLine = remote.commandLine.empty() ? QueryCommandLine(h) : remote.commandLine;
+    info.exe = Utf8(ImagePath(h));
+    info.arguments = Utf8(SplitIniArgument(commandLine).first);
+    info.directory = Utf8(remote.directory);
+    CloseHandle(h);
+    return info;
+}
+bool CloseProcess(const ProcessIdentity &target, DWORD graceMs)
+{
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+    if (!h)
+        return GetLastError() != ERROR_ACCESS_DENIED || !Alive(target);
+    struct Close
+    {
+        HANDLE value;
+        ~Close() { CloseHandle(value); }
+    } close{h};
+    try
+    {
+        if (Identify(h).created != target.created)
+            return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (WaitForSingleObject(h, 0) != WAIT_TIMEOUT)
+        return true;
+    // Its visible top-level windows get the close button's message.
+    EnumWindows(
+        [](HWND window, LPARAM pid) -> BOOL {
+            DWORD owner = 0;
+            GetWindowThreadProcessId(window, &owner);
+            if (owner == DWORD(pid) && IsWindowVisible(window) && !GetWindow(window, GW_OWNER))
+                PostMessageW(window, WM_CLOSE, 0, 0);
+            return TRUE;
+        },
+        LPARAM(target.pid));
+    if (WaitForSingleObject(h, graceMs) == WAIT_TIMEOUT)
+    {
+        if (!TerminateProcess(h, 1))
+            return false;
+        WaitForSingleObject(h, 10000);
+    }
+    return WaitForSingleObject(h, 0) != WAIT_TIMEOUT;
+}
+bool RunsElevated(const ProcessIdentity &target)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+    if (!h)
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    bool elevated = true;
+    HANDLE token = nullptr;
+    if (OpenProcessToken(h, TOKEN_QUERY, &token))
+    {
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size))
+            elevated = elevation.TokenIsElevated != 0;
+        CloseHandle(token);
+    }
+    CloseHandle(h);
+    return elevated;
+}
+bool IsEditor(const std::string &exe)
+{
+    return _wcsicmp(fs::path(Wide(exe)).filename().c_str(), L"Unity.exe") == 0;
+}
+Preflight RunPreflight(const Settings &s, ProcessIdentity target)
+{
+    Preflight result;
+    auto &errors = result.errors;
+    result.target = target;
+    result.alive = target.pid && Alive(target);
+    if (!result.alive)
         errors.push_back("请选择存活的 Player / Editor");
     std::error_code ec;
     if (!fs::is_regular_file(Wide(s.ini), ec))
         errors.push_back("请选择存在的 INI 文件");
+    else if (result.alive)
+    {
+        result.loaded = QueryLoadedIni(target);
+        result.match = CompareIni(result.loaded, s.ini);
+        if (result.match == IniMatch::Different)
+        {
+            errors.push_back("所选 INI 未生效：游戏启动时读取的是 " +
+                             PathText(fs::path(Wide(result.loaded.path)).filename()) + "，需要用所选配置重启游戏");
+            const fs::path loaded = Wide(result.loaded.path);
+            result.loadedFileUnchanged = !result.loaded.sha256.empty() && fs::is_regular_file(loaded, ec) &&
+                                         Sha256(loaded) == result.loaded.sha256;
+        }
+    }
     for (auto name : {L"tracy-capture.exe", L"tracy-stream-export.exe", L"tracy-query.exe"})
         if (!fs::is_regular_file(fs::path(Wide(s.toolDirectory)) / name, ec))
             errors.push_back("缺少工具：" + Utf8(name));
@@ -495,7 +826,11 @@ std::vector<std::string> PreflightErrors(const Settings &s, ProcessIdentity targ
         errors.push_back("定时时长必须大于零");
     if (s.stopGiB >= s.warnGiB || !s.memoryMiB || s.drainSeconds < 0 || s.drainSeconds > 3600)
         errors.push_back("资源保护或排空参数无效");
-    return errors;
+    return result;
+}
+std::vector<std::string> PreflightErrors(const Settings &s, ProcessIdentity target)
+{
+    return RunPreflight(s, target).errors;
 }
 
 } // namespace capturegui

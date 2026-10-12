@@ -51,6 +51,26 @@ void Fixture( const std::filesystem::path& path, bool combine = false, int fault
     append( RecordType::ClientToServer, RecordFlagHandshake, { reinterpret_cast<const uint8_t*>( &welcome ), sizeof( welcome ) } );
     b.clear();
     auto frame = [&] {std::vector<uint8_t>out(LZ4Size+4);int n=LZ4_compress_default(reinterpret_cast<char*>(b.data()),reinterpret_cast<char*>(out.data()+4),int(b.size()),LZ4Size);Check(n>0,"compress scheduler frame");memcpy(out.data(),&n,4);out.resize(n+4);append(RecordType::ClientToServer,RecordFlagCompressedFrame,out);b.clear(); };
+    auto end = [&] {
+        b.assign( 32, 0 );
+        b[0] = 1;
+        b[2] = 32;
+        b[4] = 3;
+        append( RecordType::SessionEnd, RecordFlagTerminal, b );
+    };
+    if( fault == 3 )
+    {
+        // Windows dropped events: thread 9 leaves CPU 1 where thread 7 runs,
+        // thread 7 enters CPU 2 without having left CPU 1, and leaves CPU 2 twice.
+        Event( b, QueueType::ContextSwitch, QueueContextSwitch{ 1110, 0, 7, 1, 0, 0, 0, 0, 0 } );
+        Event( b, QueueType::ContextSwitch, QueueContextSwitch{ 10, 9, 0, 1, 6, 5, 0, 0, 0 } );
+        Event( b, QueueType::ContextSwitch, QueueContextSwitch{ 10, 0, 7, 2, 0, 0, 0, 0, 0 } );
+        Event( b, QueueType::ContextSwitch, QueueContextSwitch{ 10, 7, 0, 2, 6, 5, 0, 0, 0 } );
+        Event( b, QueueType::ContextSwitch, QueueContextSwitch{ 10, 7, 0, 2, 6, 5, 0, 0, 0 } );
+        frame();
+        end();
+        return;
+    }
     Event( b, QueueType::CallstackSampleDictionary, QueueStringTransfer{ 1 } );
     Bytes( b, uint16_t( 8 ) );
     Bytes( b, uint64_t( 0x12345 ) );
@@ -79,11 +99,7 @@ void Fixture( const std::filesystem::path& path, bool combine = false, int fault
         Bytes( b, uint64_t( 0x12345 ) );
     }
     frame();
-    b.assign( 32, 0 );
-    b[0] = 1;
-    b[2] = 32;
-    b[4] = 3;
-    append( RecordType::SessionEnd, RecordFlagTerminal, b );
+    end();
 }
 }
 int main()
@@ -141,6 +157,17 @@ int main()
             }
             Check( rejected && !std::filesystem::exists( EventStore::Directory( bad ) ), "missing or duplicate sample dictionary rejects publication" );
         }
+        auto gaps = root / "gaps.tracy-stream";
+        Fixture( gaps, false, 3 );
+        Check( EventStore::Build( gaps ).contextSwitchGaps == 3, "context switches after dropped events are applied and counted" );
+        auto gs = EventStore::Open( gaps );
+        Check( gs->Info().contextSwitchGaps == 3, "the context switch gaps stay counted in the store" );
+        auto threadRegions = gs->ContextRegions( 0, 1000, 7 ).values;
+        Check( threadRegions.size() == 2 && threadRegions[0].start == 110 && threadRegions[0].end == 130 && threadRegions[1].start == 130 && threadRegions[1].end == 140,
+               "a thread switched in while it shows running stops there first; a second switch-out changes nothing" );
+        auto cpuRegions = gs->CpuRegions( 0, 1000 ).values;
+        Check( cpuRegions.size() == 2 && cpuRegions[0].cpu == 1 && cpuRegions[0].end == 120 && cpuRegions[1].cpu == 2 && cpuRegions[1].end == 140,
+               "a switch-out ends the CPU's running region whichever thread it showed" );
         std::cout << "Scheduler tests passed. Evidence: " << root.string() << '\n';
         return 0;
     }

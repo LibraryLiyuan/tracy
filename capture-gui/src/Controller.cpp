@@ -152,6 +152,33 @@ bool Controller::Launch(const Settings &s)
     });
     return true;
 }
+bool Controller::Restart(const Settings &s, ProcessIdentity running)
+{
+    if (Snapshot().busy)
+        return false;
+    m_directory.clear();
+    m_task = Json::object();
+    Spawn([this, s, running] {
+        State("launching", "正在关闭游戏，随后用所选 INI 重新启动；可能显示管理员确认");
+        ProcessIdentity target;
+        try
+        {
+            target = RestartPlayer(s, running);
+        }
+        catch (const std::exception &e)
+        {
+            // The setup stays open, so the game can be started from it.
+            State("ready", std::string("没有完成重启：") + e.what());
+            return;
+        }
+        {
+            std::lock_guard lock(m_mutex);
+            m_view.target = target;
+        }
+        State("waiting_ready", "游戏已用所选 INI 重新启动，请准备场景并确认就绪");
+    });
+    return true;
+}
 bool Controller::Start(const Settings &s, ProcessIdentity t)
 {
     if (Snapshot().busy)
@@ -231,6 +258,10 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         throw std::runtime_error("请明确选择存活目标并确认场景已就绪");
     if (!restoring && (!fs::is_regular_file(Wide(s.ini))))
         throw std::runtime_error("请选择实际存在的 INI 文件");
+    // The game read its INI when it started; a recording never claims another.
+    const auto loaded = restoring ? LoadedIni{} : QueryLoadedIni(target);
+    if (!restoring && CompareIni(loaded, s.ini) == IniMatch::Different)
+        throw std::runtime_error("所选 INI 未生效：游戏启动时读取的是 " + loaded.path + "；请用所选配置重启游戏");
     if (restoring)
     {
         m_directory = fs::absolute(recover);
@@ -251,6 +282,7 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
                   {"attempt", 0}};
         fs::copy_file(Wide(s.ini), m_directory / L"requested.ini");
         m_task["requested_ini_sha256"] = Sha256(m_directory / L"requested.ini");
+        m_task["loaded_ini"] = loaded.ToJson();
     }
     auto previous = m_task.value("processes", Json::array());
     int attempt = m_task.value("attempt", 0) + 1;
@@ -269,6 +301,13 @@ void Controller::Work(Settings s, ProcessIdentity target, const fs::path &recove
         m_view = ViewState{};
         m_view.busy = true;
         m_view.target = target;
+        if (m_task.contains("loaded_ini"))
+        {
+            const auto &ini = m_task["loaded_ini"];
+            const auto source = ini.value("source", "");
+            m_view.actualConfig = "游戏启动时读取的 INI：" + ini.value("path", "") +
+                                  (source == "reported" ? "（游戏报告）" : source == "inferred" ? "（按启动参数推断）" : "（无法确认）");
+        }
     }
     State("preflight", "检查工具与任务身份");
     // Query is a single long-lived session for this attempt, never an AI process.

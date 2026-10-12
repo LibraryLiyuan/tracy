@@ -9,21 +9,41 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <nlohmann/json.hpp>
+#include <deque>
 
 namespace tracy
 {
 class StreamingView
 {
 public:
-    explicit StreamingView( std::filesystem::path journal, bool live = false );
+    explicit StreamingView( std::filesystem::path journal, bool live = false, std::filesystem::path reportChannel = {} );
     ~StreamingView();
     bool Draw();
     // The panels' smoke test, then the timeline's.
     bool SmokeStep();
     bool Busy() const { return m_busy.load(); }
-    bool WasActive() { return m_redraw.exchange( false ) || Busy() || ( m_timeline && m_timeline->Active() ); }
+    bool WasActive() { const bool web = PollWeb(); const bool report = PollReport(); return web || report || m_redraw.exchange( false ) || Busy() || ( m_timeline && m_timeline->Active() ); }
 
 private:
+    bool PollReport();
+    bool PollWeb();
+    void UpdateWeb();
+    std::deque<nlohmann::json> m_webEvents;
+    uint64_t m_webSequence=0,m_webDraw=0;
+    uint64_t m_webReceived=0;
+    std::chrono::steady_clock::time_point m_webUntil{};
+    bool m_webPending=false,m_webCapture=false;
+    ImVec2 m_webMouse=ImVec2(-100,-100);
+    bool UpdateReport( const stream::StoreInfo& info );
+    void WriteReportState();
+    std::filesystem::path m_reportChannel;
+    std::unique_ptr<stream::EventStore> m_reportStore;
+    nlohmann::json m_reportInput, m_reportReply;
+    std::chrono::steady_clock::time_point m_reportPollAt{};
+    uint64_t m_reportSequence = 0, m_reportDraw = 0;
+    bool m_reportPending = false, m_reportApplied = false, m_reportScreenshotQueued = false;
+    std::filesystem::path m_reportImage;
     struct Request
     {
         uint64_t generation = 0, after = 0, selected = 0, childAfter = 0, textAfter = 0, stackAfter = 0;

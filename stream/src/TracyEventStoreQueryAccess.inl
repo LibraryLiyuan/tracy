@@ -372,9 +372,16 @@ struct StoreGpuZoneCursor::Impl
         std::unordered_map<uint64_t, size_t> position;
         position.reserve( rows.size() );
         for( size_t n = 0; n < rows.size(); ++n ) position.emplace( rows[n].id, n );
-        q = d.Prep( std::string( "SELECT " ) + Columns + " FROM gpu_zones WHERE parent BETWEEN ?1 AND ?2 ORDER BY parent,id" );
+        // Zone IDs interleave contexts. A sparse Copy queue batch can span
+        // millions of Direct/Compute zones. Probe only the actual parents in
+        // this batch instead of decoding every other queue's children in the
+        // numeric ID range. The existing parent and context indexes suffice.
+        q = d.Prep( std::string( "SELECT " ) + Columns +
+            " FROM gpu_zones WHERE parent IN(SELECT id FROM gpu_zones WHERE context=?3 AND thread=?4 AND id>=?1 AND id<=?2) ORDER BY parent,id" );
         Int( q, 1, rows.front().id );
         Int( q, 2, rows.back().id );
+        Int( q, 3, g.context );
+        Int( q, 4, g.thread );
         while( d.Step( q ) )
         {
             Read( q, z );

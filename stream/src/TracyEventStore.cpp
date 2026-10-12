@@ -327,6 +327,7 @@ void Save( Db& d, const StoreInfo& i )
     Meta( d, "catalog_present", i.catalogPresent ? "1" : "0" );
     Meta( d, "catalog_valid", i.catalogValid ? "1" : "0" );
     Meta( d, "zone_events_misplaced", std::to_string( i.misplacedZoneEvents ) );
+    Meta( d, "context_switch_gaps", std::to_string( i.contextSwitchGaps ) );
     for( auto [k, v] : std::array<std::pair<const char*, uint64_t>, 11>{ { { "bytes", i.sourceBytes }, { "valid", i.validBytes }, { "revision", i.revision }, { "events", i.events }, { "zones", i.cpuZones }, { "frames", i.frames }, { "open", i.openZones }, { "unresolved", i.unresolvedDefinitions }, { "first", uint64_t( i.firstNs ) }, { "last", uint64_t( i.lastNs ) }, { "clean", i.cleanEnd ? 1 : 0 } } } ) Meta( d, k, std::to_string( v ) );
 }
 StoreInfo Load( Db& d )
@@ -375,6 +376,7 @@ StoreInfo Load( Db& d )
     i.fibers = n( "fibers" );
     // Absent in stores built before misplaced zone events were counted.
     if( d.Scalar( "SELECT COUNT(*) FROM metadata WHERE key='zone_events_misplaced'" ) != 0 ) i.misplacedZoneEvents = n( "zone_events_misplaced" );
+    if( d.Scalar( "SELECT COUNT(*) FROM metadata WHERE key='context_switch_gaps'" ) != 0 ) i.contextSwitchGaps = n( "context_switch_gaps" );
     i.hardwareSamples = n( "hardware_samples" );
     i.hardwareAddresses = n( "hardware_addresses" );
     i.symbols = n( "symbol_resources" );
@@ -1356,9 +1358,32 @@ private:
         Int( s, 2, id );
         db.Run( s );
     }
+    // Ends a thread's running region at a switch-out.
+    void EndContextRegion( uint64_t region, uint64_t thread, I start, I time, int8_t reason, int8_t state )
+    {
+        auto s = db.Prep( "UPDATE context_regions SET end=?,reason=?,state=? WHERE id=?" );
+        Int( s, 1, uint64_t( time ) );
+        Int( s, 2, uint64_t( reason ) );
+        Int( s, 3, uint64_t( state ) );
+        Int( s, 4, region );
+        db.Run( s );
+        Range( "UPDATE context_range SET mint=?2,maxt=?3 WHERE id=?1", region, start, time );
+        s = db.Prep( "UPDATE context_threads SET running=running+? WHERE thread=?" );
+        Int( s, 1, uint64_t( Sub( time, start ) ) );
+        Int( s, 2, thread );
+        db.Run( s );
+    }
+    // Windows drops context switch events under load, and a capture scoped to
+    // the game leaves out other programs' threads, so a switch may not
+    // continue what was recorded for its thread or CPU. It is applied as
+    // Tracy's viewer applies it, and counted: a switch-out ends the CPU's
+    // running region whichever thread that showed, and a thread switched in
+    // while it still shows running stops there first. A region is never ended
+    // before it started or ended twice.
     void Switch( uint64_t id, const QueueContextSwitch& e )
     {
         const auto time = ContextDelta( e.time );
+        bool gap = false;
         if( e.oldThread )
         {
             const auto top = ContextTop( e.oldThread );
@@ -1368,19 +1393,10 @@ private:
                 Int( s, 1, top );
                 Require( db.Step( s ), "Missing switched-out region" );
                 const I start = sqlite3_column_int64( s, 0 );
-                Require( sqlite3_column_type( s, 1 ) == SQLITE_NULL && start <= time, "Invalid context switch-out" );
+                const bool running = sqlite3_column_type( s, 1 ) == SQLITE_NULL && start <= time;
                 sqlite3_reset( s );
-                s = db.Prep( "UPDATE context_regions SET end=?,reason=?,state=? WHERE id=?" );
-                Int( s, 1, uint64_t( time ) );
-                Int( s, 2, uint64_t( int8_t( e.oldThreadWaitReason ) ) );
-                Int( s, 3, uint64_t( int8_t( e.oldThreadState ) ) );
-                Int( s, 4, top );
-                db.Run( s );
-                Range( "UPDATE context_range SET mint=?2,maxt=?3 WHERE id=?1", top, start, time );
-                s = db.Prep( "UPDATE context_threads SET running=running+? WHERE thread=?" );
-                Int( s, 1, uint64_t( Sub( time, start ) ) );
-                Int( s, 2, e.oldThread );
-                db.Run( s );
+                if( running ) EndContextRegion( top, e.oldThread, start, time, int8_t( e.oldThreadWaitReason ), int8_t( e.oldThreadState ) );
+                else gap = true;
             }
             auto s = db.Prep( "SELECT c.top,r.start,r.thread,r.end FROM context_cpus c JOIN cpu_regions r ON r.id=c.top WHERE c.cpu=?" );
             Int( s, 1, e.cpu );
@@ -1388,17 +1404,26 @@ private:
             {
                 const uint64_t cpuTop = sqlite3_column_int64( s, 0 );
                 const I start = sqlite3_column_int64( s, 1 );
-                Require( uint64_t( sqlite3_column_int64( s, 2 ) ) == e.oldThread && sqlite3_column_type( s, 3 ) == SQLITE_NULL && start <= time, "CPU switch-out owner mismatch" );
+                const bool owner = uint64_t( sqlite3_column_int64( s, 2 ) ) == e.oldThread;
+                const bool running = sqlite3_column_type( s, 3 ) == SQLITE_NULL && start <= time;
                 sqlite3_reset( s );
-                s = db.Prep( "UPDATE cpu_regions SET end=? WHERE id=?" );
-                Int( s, 1, uint64_t( time ) );
-                Int( s, 2, cpuTop );
-                db.Run( s );
-                Range( "UPDATE cpu_region_range SET mint=?2,maxt=?3 WHERE id=?1", cpuTop, start, time );
+                gap = gap || !owner || !running;
+                if( running )
+                {
+                    s = db.Prep( "UPDATE cpu_regions SET end=? WHERE id=?" );
+                    Int( s, 1, uint64_t( time ) );
+                    Int( s, 2, cpuTop );
+                    db.Run( s );
+                    Range( "UPDATE cpu_region_range SET mint=?2,maxt=?3 WHERE id=?1", cpuTop, start, time );
+                }
             }
             sqlite3_reset( s );
         }
-        if( !e.newThread ) return;
+        if( !e.newThread )
+        {
+            if( gap ) ++info.contextSwitchGaps;
+            return;
+        }
         const auto top = ContextTop( e.newThread );
         uint64_t region = id;
         I wakeup = time;
@@ -1406,27 +1431,32 @@ private:
         bool placeholder = false;
         if( top )
         {
-            auto s = db.Prep( "SELECT r.reason,r.cpu,r.wakeup,t.pending_wake,t.pending_cpu,t.last_cpu FROM context_regions r JOIN context_threads t ON t.top=r.id WHERE t.thread=?" );
+            auto s = db.Prep( "SELECT r.reason,r.cpu,r.wakeup,t.pending_wake,t.pending_cpu,t.last_cpu,r.start,r.end FROM context_regions r JOIN context_threads t ON t.top=r.id WHERE t.thread=?" );
             Int( s, 1, e.newThread );
             Require( db.Step( s ), "Missing switch-in state" );
             placeholder = sqlite3_column_int( s, 0 ) == -2;
+            const I previousWake = sqlite3_column_int64( s, 2 ), pending = sqlite3_column_int64( s, 3 ), start = sqlite3_column_int64( s, 6 );
+            const uint8_t pendingCpu = uint8_t( sqlite3_column_int( s, 4 ) );
+            const bool migration = sqlite3_column_type( s, 5 ) != SQLITE_NULL && sqlite3_column_int( s, 5 ) != e.cpu;
+            const bool running = !placeholder && sqlite3_column_type( s, 7 ) == SQLITE_NULL;
+            sqlite3_reset( s );
             if( placeholder )
             {
                 region = top;
-                wakeup = sqlite3_column_int64( s, 2 );
+                wakeup = previousWake;
                 wakeCpu = 0;
             }
-            else
+            else if( pending != 0 && previousWake <= pending && pending <= time )
             {
-                const I pending = sqlite3_column_int64( s, 3 ), previousWake = sqlite3_column_int64( s, 2 );
-                if( pending != 0 && previousWake <= pending && pending <= time )
-                {
-                    wakeup = pending;
-                    wakeCpu = uint8_t( sqlite3_column_int( s, 4 ) );
-                }
+                wakeup = pending;
+                wakeCpu = pendingCpu;
             }
-            const bool migration = sqlite3_column_type( s, 5 ) != SQLITE_NULL && sqlite3_column_int( s, 5 ) != e.cpu;
-            sqlite3_reset( s );
+            if( running )
+            {
+                // Its switch-out was dropped.
+                gap = true;
+                if( start <= time ) EndContextRegion( top, e.newThread, start, time, -1, -1 );
+            }
             if( migration )
             {
                 s = db.Prep( "UPDATE context_threads SET migrations=migrations+1 WHERE thread=?" );
@@ -1472,6 +1502,7 @@ private:
         Int( s, 1, e.cpu );
         Int( s, 2, id );
         db.Run( s );
+        if( gap ) ++info.contextSwitchGaps;
     }
     void Message( uint64_t id, const QueueItem& e, QueueType type )
     {

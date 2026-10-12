@@ -63,6 +63,11 @@ struct StoreInfo
     // Zone texts, names, colors and values dropped because they carried the
     // validation of a zone that was not the thread's innermost open zone.
     uint64_t misplacedZoneEvents = 0;
+    // Context switches that do not continue what the journal recorded for
+    // their thread or CPU, because Windows dropped events in between or the
+    // capture left out other programs' threads; they are applied as Tracy's
+    // viewer applies them.
+    uint64_t contextSwitchGaps = 0;
     uint64_t gpuZones = 0, incompleteGpuZones = 0;
     uint64_t samples = 0, pendingSamples = 0, contextRegions = 0, cpuRegions = 0;
     uint64_t messages = 0, plotPoints = 0, lockEvents = 0;

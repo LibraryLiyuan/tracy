@@ -39,6 +39,14 @@ class Process
     std::string m_buffer;
 };
 ProcessIdentity LaunchPlayer(const Settings &settings);
+// Starts the running player again with the selected INI, the same program,
+// arguments and directory: the INI is read only at startup. When it runs
+// elevated and this program does not, an elevated copy of this program
+// closes it (RunElevatedRestart).
+ProcessIdentity RestartPlayer(const Settings &settings, const ProcessIdentity &running);
+// The elevated half: tracy-capture-gui.exe --restart-player <pid> <created>
+// <start 0|1> <player> <directory> <ini> <arguments>. Exit code 0 on success.
+int RunElevatedRestart(int argc, wchar_t **argv);
 class Mcp
 {
   public:

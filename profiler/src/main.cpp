@@ -42,6 +42,8 @@
 #include "profiler/TracyStreamingView.hpp"
 static std::unique_ptr<tracy::StreamingView> streamView;
 static std::string streamPath;
+static std::string streamReportChannel;
+static bool streamReportWeb = false;
 static bool streamSmoke=false;
 static bool streamLive=false;
 static int streamSmokeResult=0;
@@ -284,6 +286,7 @@ int main( int argc, char** argv )
 #ifdef TRACY_STREAM_VIEW
             printf( "    Open a long capture through its event store:\n      %s file.tracy-stream\n\n",argv[0] );
             printf( "    Follow a growing recording with immutable revisions:\n      %s --stream-live file.tracy-stream\n\n",argv[0] );
+            printf( "    Registered report navigation (native stream view):\n      %s --stream file.tracy-stream --report-channel directory\n\n",argv[0] );
 #endif
             printf( "    Connect to a running client:\n" );
             printf( "      %s -a address [-p port]\n", argv[0] );
@@ -327,6 +330,8 @@ int main( int argc, char** argv )
         {
 #ifdef TRACY_STREAM_VIEW
             if( strcmp(argv[1],"--stream")==0 || strcmp(argv[1],"--stream-smoke")==0 || strcmp(argv[1],"--stream-live")==0 || strcmp(argv[1],"--stream-live-smoke")==0 ){streamSmoke=strcmp(argv[1],"--stream-smoke")==0 || strcmp(argv[1],"--stream-live-smoke")==0;streamLive=strcmp(argv[1],"--stream-live")==0 || strcmp(argv[1],"--stream-live-smoke")==0;streamPath=argv[2];}
+            else if( strcmp(argv[1],"--report-channel")==0 ) streamReportChannel=argv[2];
+            else if( strcmp(argv[1],"--report-web")==0 ) streamReportWeb=strcmp(argv[2],"1")==0;
             else
 #endif
             if( strcmp( argv[1], "-a" ) == 0 )
@@ -443,7 +448,14 @@ int main( int argc, char** argv )
     tracy::Fileselector::Init();
     s_isElevated = IsElevated();
 
+#ifdef TRACY_STREAM_VIEW
+#ifdef _WIN32
+    if(streamReportWeb) ConfigureStreamingWeb(streamReportChannel.c_str());
+#endif
+    if(!streamReportWeb) backend.Show();
+#else
     backend.Show();
+#endif
     backend.Run();
 
     if( loadThread.joinable() ) loadThread.join();
@@ -685,9 +697,12 @@ static void DrawContents()
     const bool achievementsAttention = tracy::s_config.achievements ? s_achievements->NeedsAttention() : false;
 
     static int activeFrames = 3;
+#ifdef TRACY_STREAM_VIEW
+    const bool streamActive=streamView && streamView->WasActive();
+#endif
     if( tracy::WasActive() || !clients.empty() || ( view && view->WasActive() ) || achievementsAttention
 #ifdef TRACY_STREAM_VIEW
-        || (streamView && streamView->WasActive())
+        || streamActive
 #endif
     )
     {
@@ -731,7 +746,7 @@ static void DrawContents()
 #ifdef TRACY_STREAM_VIEW
     if(!streamPath.empty()&&!streamView)
     {
-        streamView=std::make_unique<tracy::StreamingView>(std::filesystem::u8path(streamPath),streamLive);
+        streamView=std::make_unique<tracy::StreamingView>(std::filesystem::u8path(streamPath),streamLive,std::filesystem::u8path(streamReportChannel));
         // The window title names the capture, as Tracy's does.
         auto name = streamPath.substr( streamPath.find_last_of( "/\\" ) + 1 );
         if( IsStreamJournal( name.c_str() ) ) name.resize( name.size() - strlen( ".tracy-stream" ) );

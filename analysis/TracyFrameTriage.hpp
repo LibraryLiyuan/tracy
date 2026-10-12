@@ -28,6 +28,14 @@ struct FrameTriageOptions
     double segmentSeconds = 0;
     double windowSeconds = 5;
     size_t maxWindows = 6;
+    // Optional bounded streaming export; one native fact row per complete
+    // frame, without retaining an additional JSON array in memory.
+    std::function<void( const nlohmann::json& )> frameSink;
+    // Full candidate ledger; independent of representative/window limits.
+    std::function<void( const nlohmann::json& )> candidateSink;
+    std::function<void( const nlohmann::json& )> nativeSink;
+    int64_t memorySampleMaxAgeNs = 1000000000;
+    size_t maxRepresentatives = 24;
 };
 
 const char* FrameTriageAlgorithmId();

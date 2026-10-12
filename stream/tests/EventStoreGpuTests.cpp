@@ -146,6 +146,24 @@ int main()
         Check( !unresolved.gpuStart && !unresolved.gpuEnd && !unresolved.cpuEnd && info.incompleteGpuZones == 1, "unresolved GPU time remains explicit" );
         Check( calibrated.gpuStart == 1040 && calibrated.gpuEnd == 1080 && calibrated.cpuStart == 400 && calibrated.cpuEnd == 500, "period and calibration with independent serial clock" );
         Check( wrapped.thread == 0 && wrapped.gpuStart == 4294967276ll && wrapped.gpuEnd == 4294967301ll, "32-bit GPU wrap and context-bound thread semantics" );
+        // Cursor batches must retain exact child ownership across contexts.
+        // These child fields feed Query self time and the windowed analyzer.
+        const auto groups = store->GpuZoneGroups();
+        auto cursor = store->GpuZoneCursor();
+        uint64_t cursorCount = 0;
+        for( size_t group = 0; group < groups.size(); ++group )
+        {
+            cursor->Seek( group, 0 );
+            StoreGpuZoneRecord record;
+            while( cursor->Next( record ) )
+            {
+                ++cursorCount;
+                const auto children = store->GpuChildren( record.id );
+                Check( !children.more && record.children == children.values.size(), "GPU cursor child counts match direct parent query" );
+                Check( record.childTime == ( record.id == parent.id ? 10 : 0 ), "GPU cursor child intervals do not include other contexts" );
+            }
+        }
+        Check( cursorCount == 5, "GPU cursor retains every context and unfinished record" );
         StoreAnalysisOptions globalGpu;globalGpu.gpu=true;
         auto analysis=store->Analyze(globalGpu);
         Check(analysis->Info().events==5 && analysis->Info().closed==4 && analysis->Info().unfinished==1,"GPU analysis distinguishes missing timestamps");

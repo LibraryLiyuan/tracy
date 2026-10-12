@@ -64,5 +64,55 @@ bool Alive(const ProcessIdentity &identity);
 void TerminateOwned(const ProcessIdentity &identity);
 std::vector<std::pair<ProcessIdentity, std::string>> LocalProcesses();
 std::vector<std::string> IniFiles(const Settings &settings);
+// The INI a running game or editor loaded. The engine reads it once, at
+// startup, and publishes what it read in the process environment
+// (JN_TRACY_INI_*), so a running process never switches to another INI.
+struct LoadedIni
+{
+    // "reported" when read from the process; "inferred" from its command line
+    // by the engine's lookup when its memory cannot be read (it runs elevated)
+    // or it has not reported yet; otherwise "unknown".
+    std::string source = "unknown", path, sha256, status, preset;
+    Json ToJson() const;
+};
+LoadedIni QueryLoadedIni(const ProcessIdentity &target);
+enum class IniMatch
+{
+    Same,
+    Different,
+    Unknown
+};
+// Same when the file holds what the process loaded, whatever its name.
+IniMatch CompareIni(const LoadedIni &loaded, const std::string &ini);
+// The value of `name` in an environment block (NAME=value\0 ... \0\0).
+std::wstring EnvironmentValue(const std::wstring &block, const std::wstring &name);
+// A command line's arguments after the program without -jn-tracy-config, and
+// that option's value.
+std::pair<std::wstring, std::wstring> SplitIniArgument(const std::wstring &commandLine);
+// What a running process was started with, to start it again.
+struct LaunchInfo
+{
+    std::string exe, arguments, directory;
+};
+LaunchInfo ReadLaunchInfo(const ProcessIdentity &target);
+// Asks the process to close, as its window's close button does, and ends it
+// when it still runs after `graceMs`. False while it runs: Windows refuses
+// when it runs elevated and this program does not.
+bool CloseProcess(const ProcessIdentity &target, DWORD graceMs);
+// Whether the process runs elevated; one this program may not query runs
+// above it.
+bool RunsElevated(const ProcessIdentity &target);
+bool IsEditor(const std::string &exe);
+struct Preflight
+{
+    std::vector<std::string> errors;
+    ProcessIdentity target;
+    bool alive = false;
+    LoadedIni loaded;
+    IniMatch match = IniMatch::Unknown;
+    // The file the game loaded still holds what it read, so it can be selected.
+    bool loadedFileUnchanged = false;
+};
+Preflight RunPreflight(const Settings &settings, ProcessIdentity target);
 std::vector<std::string> PreflightErrors(const Settings &settings, ProcessIdentity target);
 } // namespace capturegui

@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace tracy
 {
@@ -45,6 +46,7 @@ public:
         int64_t plotBegin = 0, plotEnd = 0;
         // A read was drawn, and it covers the view at its resolution.
         bool drawn = false, current = false;
+        bool selectedVisible = false, focusLaneVisible = false;
     };
 
     explicit StreamingTimeline( std::filesystem::path journal );
@@ -108,6 +110,11 @@ public:
     // settled view or the user takes over.
     void ShowVram();
     bool ShowingVram() const { return m_showVram; }
+    // Report navigation verifies the native frame before mutating the view.
+    nlohmann::json ReportNavigate( const nlohmann::json& request, uint64_t focus, bool gpu, uint32_t depth );
+    bool ReportScrolling() const { return m_reportScrolling; }
+    void WebInteraction(bool active) { m_webInteraction=active; }
+    bool m_webInteraction=false;
 
 private:
     enum class Kind : uint8_t { Zone, Folded, Density };
@@ -338,5 +345,9 @@ private:
     uint32_t m_sourceHighlight = 0;
     uint64_t m_draws = 0;
     Stats m_stats;
+    uint64_t m_reportFocusKey = UINT64_MAX - 128;
+    uint32_t m_reportDepth = 0;
+    bool m_reportScrolling = false;
+    unsigned m_reportStable = 0;
 };
 }

@@ -10,6 +10,9 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <map>
+#include <set>
+#include <tuple>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -32,11 +35,14 @@ enum Metric : uint8_t
     MainPacing,         // ... deliberately, to hold a frame rate
     MainLoading,        // loading work on the main thread
     MainGc,             // garbage collection on the main thread
+    MainUnknown,
     RenderBusy,
     RenderWaitGpu,
     RenderWaitOther,
+    RenderUnknown,
     WorkerBusy,         // job work, summed over the job worker threads
     GpuBusy,            // union of the top-level GPU zones of the graphics and compute queues
+    GpuCopyBusy,
     IoActive,           // union of the I/O requests in flight
     MetricCount
 };
@@ -45,7 +51,7 @@ using Cell = std::array<int64_t, MetricCount>;
 
 enum class Role : uint8_t { Main, Render, Worker };
 
-enum class ZoneClass : uint8_t { Active, Pacing, WaitPresent, WaitJob, WaitOther, Loading, Gc };
+enum class ZoneClass : uint8_t { Active, Pacing, WaitPresent, WaitJob, WaitOther, Loading, Gc, Unknown };
 
 enum class Limiter : uint8_t
 {
@@ -90,14 +96,26 @@ bool Has( const std::string& value, std::string_view needle ) { return value.fin
 ZoneClass ClassifyName( std::string_view name )
 {
     const auto n = Lower( name );
+    if( n.empty() || n == "???" || n == "<unknown>" ) return ZoneClass::Unknown;
+    // These are statistics collection scopes executed before pacing, not
+    // the wait itself. A substring match would hide their CPU wall time.
+    if( n == "runtimedrawstatsbeforewaitfortargetfpsupdate" ||
+        n == "runtimedrawstats.beforewaitfortargetfpsupdate" ) return ZoneClass::Active;
+    // Render starvation on the main-thread command queue is not a GPU wait.
+    if( n == "gfx.waitforgfxcommandsfrommainthread" ) return ZoneClass::WaitOther;
     if( Has( n, "waitfortargetfps" ) || Has( n, "wait for target fps" ) || Has( n, "targetframerate" ) ||
         Has( n, "frame pacing" ) || Has( n, "framepacing" ) ) return ZoneClass::Pacing;
     if( Has( n, "clearcompleted" ) ) return ZoneClass::Active;
+    // Unity's ProfilerMutexLock emits this scope only after TryLock fails,
+    // around the blocking lock acquisition (not around the protected work).
+    if( n == "loading.lockpersistentmanager" ) return ZoneClass::WaitOther;
     const bool wait = Has( n, "wait" ) || Has( n, "sleep" ) || Has( n, "idle" ) || Has( n, "semaphore" ) || Has( n, "fence" );
     if( wait && ( Has( n, "job" ) || Has( n, "waitforcompleted" ) ) ) return ZoneClass::WaitJob;
     if( wait && ( Has( n, "gpu" ) || Has( n, "fence" ) || Has( n, "present" ) || Has( n, "gfx" ) || Has( n, "render" ) ) )
         return ZoneClass::WaitPresent;
-    if( Has( n, "gfx.present" ) || Has( n, "presentframe" ) ) return ZoneClass::WaitPresent;
+    // Present is a container, including CPU retirement; self is unexplained,
+    // not confirmed GPU blocking. Its child work and waits classify separately.
+    if( Has( n, "gfx.present" ) || Has( n, "presentframe" ) ) return ZoneClass::Unknown;
     if( wait ) return ZoneClass::WaitOther;
     if( n.starts_with( "loading." ) || Has( n, "loadscene" ) || Has( n, "preloadmanager" ) || Has( n, "asyncread" ) ||
         Has( n, "resources.load" ) || Has( n, "assetbundle" ) || Has( n, "loadasset" ) || Has( n, "asyncinstantiate" ) ||
@@ -176,50 +194,83 @@ private:
     std::vector<Cell> m_cells;
 };
 
-constexpr uint8_t Covered = 1;     // inside a wait or pacing zone already counted
-constexpr uint8_t InLoading = 2;
-constexpr uint8_t InGc = 4;
-
-// One zone's contribution, given the flags its open ancestors pass on; returns
-// the flags its descendants inherit.
-uint8_t Account( Accumulator& accumulator, Role role, ZoneClass cls, bool root, uint8_t flags, int64_t start, int64_t end )
+// Account disjoint self intervals. Child work can override a parent wait;
+// unknown Present self remains unknown, never GPU blocking by name alone.
+void AccountPiece( Accumulator& a, Role role, ZoneClass cls, int64_t start, int64_t end )
 {
-    const bool wait = cls == ZoneClass::WaitPresent || cls == ZoneClass::WaitJob || cls == ZoneClass::WaitOther || cls == ZoneClass::Pacing;
-    switch( role )
+    if( end <= start ) return;
+    const bool wait = cls == ZoneClass::Pacing || cls == ZoneClass::WaitPresent || cls == ZoneClass::WaitJob || cls == ZoneClass::WaitOther;
+    if( role == Role::Main )
     {
-    case Role::Main:
-        if( root ) accumulator.Add( MainBusy, start, end );
-        if( wait && !( flags & Covered ) )
-        {
-            accumulator.Add( cls == ZoneClass::Pacing ? MainPacing : cls == ZoneClass::WaitPresent ? MainWaitPresent :
-                cls == ZoneClass::WaitJob ? MainWaitJob : MainWaitOther, start, end );
-            flags |= Covered;
-        }
-        else if( cls == ZoneClass::Loading && !( flags & ( Covered | InLoading ) ) )
-        {
-            accumulator.Add( MainLoading, start, end );
-            flags |= InLoading;
-        }
-        else if( cls == ZoneClass::Gc && !( flags & ( Covered | InGc ) ) )
-        {
-            accumulator.Add( MainGc, start, end );
-            flags |= InGc;
-        }
-        break;
-    case Role::Render:
-        if( root ) accumulator.Add( RenderBusy, start, end );
-        if( wait && !( flags & Covered ) )
-        {
-            accumulator.Add( cls == ZoneClass::WaitPresent ? RenderWaitGpu : RenderWaitOther, start, end );
-            flags |= Covered;
-        }
-        break;
-    case Role::Worker:
-        if( root && !wait ) accumulator.Add( WorkerBusy, start, end );
-        break;
+        a.Add( MainBusy, start, end );
+        if( wait ) a.Add( cls == ZoneClass::Pacing ? MainPacing : cls == ZoneClass::WaitPresent ? MainWaitPresent : cls == ZoneClass::WaitJob ? MainWaitJob : MainWaitOther, start, end );
+        else if( cls == ZoneClass::Unknown ) a.Add( MainUnknown, start, end );
+        else if( cls == ZoneClass::Loading ) a.Add( MainLoading, start, end );
+        else if( cls == ZoneClass::Gc ) a.Add( MainGc, start, end );
     }
-    return flags;
+    else if( role == Role::Render )
+    {
+        a.Add( RenderBusy, start, end );
+        if( wait ) a.Add( cls == ZoneClass::WaitPresent ? RenderWaitGpu : RenderWaitOther, start, end );
+        else if( cls == ZoneClass::Unknown ) a.Add( RenderUnknown, start, end );
+    }
+    else if( !wait && cls != ZoneClass::Unknown ) a.Add( WorkerBusy, start, end );
 }
+
+// Preorder traversal. A parent's cursor excludes its children's union before
+// the parent closes; emit only self pieces, already clipped to valid nesting.
+// Incomplete parents contribute no fabricated self but valid children survive.
+template<typename Key>
+class SelfPartition
+{
+public:
+    struct Open { Key id; int64_t start, end, cursor; ZoneClass cls; bool valid; };
+    explicit SelfPartition( std::function<void( const Key&, ZoneClass, int64_t, int64_t )> emit ) : m_emit( std::move( emit ) ) {}
+    void Push( const Key& id, const std::optional<Key>& parent, int64_t start, int64_t end, bool valid, ZoneClass cls )
+    {
+        while( !m_stack.empty() && ( !parent || m_stack.back().id != *parent ) ) Pop();
+        if( parent && m_stack.empty() ) ++missingParents;
+        if( valid && end < start ) valid = false;
+        if( !valid ) ++invalid;
+        if( !m_stack.empty() )
+        {
+            auto& p = m_stack.back();
+            if( p.valid )
+            {
+                if( start < p.start || ( valid && end > p.end ) || start < p.cursor ) ++invalid;
+                const auto begin = std::clamp( start, p.cursor, p.end );
+                m_emit( p.id, p.cls, p.cursor, begin );
+                start = begin;
+                if( valid ) end = std::clamp( end, start, p.end );
+                // An unknown child end makes the remaining parent interval
+                // unknown; do not charge it as work or wait.
+                p.cursor = valid ? end : p.end;
+            }
+            // An untyped blocking primitive inherits its nearest typed wait.
+            // Named child work still overrides it (job helping / retirement).
+            if( cls == ZoneClass::WaitOther && ( p.cls == ZoneClass::WaitPresent || p.cls == ZoneClass::WaitJob || p.cls == ZoneClass::Pacing ) ) cls = p.cls;
+            if( cls == ZoneClass::Active && ( p.cls == ZoneClass::Loading || p.cls == ZoneClass::Gc ) ) cls = p.cls;
+        }
+        else if( valid )
+        {
+            if( m_lastRootEnd && start < *m_lastRootEnd ) { ++invalid; start = *m_lastRootEnd; end = std::max( start, end ); }
+            m_lastRootEnd = end;
+        }
+        m_stack.push_back( { id, start, end, start, cls, valid } );
+    }
+    void Finish() { while( !m_stack.empty() ) Pop(); }
+    uint64_t invalid = 0, missingParents = 0;
+private:
+    void Pop()
+    {
+        const auto p = m_stack.back();
+        if( p.valid ) m_emit( p.id, p.cls, p.cursor, p.end );
+        m_stack.pop_back();
+    }
+    std::vector<Open> m_stack;
+    std::optional<int64_t> m_lastRootEnd;
+    std::function<void( const Key&, ZoneClass, int64_t, int64_t )> m_emit;
+};
 
 struct ThreadPick
 {
@@ -230,21 +281,12 @@ struct ThreadPick
     uint64_t zones = 0;
 };
 
-// The thread roles the triage reads: the main and render threads with the most
-// zones, and Unity's job workers.
+// Retain every recognized owner. Per-role totals may overlap when multiple
+// owners coexist; coverage reports this rather than silently dropping one.
 std::vector<ThreadPick> PickThreads( std::vector<ThreadPick> candidates )
 {
-    std::vector<ThreadPick> result;
-    const auto best = [&]( Role role ) {
-        const ThreadPick* found = nullptr;
-        for( const auto& value : candidates )
-            if( value.role == role && ( !found || value.zones > found->zones ) ) found = &value;
-        if( found ) result.push_back( *found );
-    };
-    best( Role::Main );
-    best( Role::Render );
-    for( const auto& value : candidates ) if( value.role == Role::Worker && value.zones != 0 ) result.push_back( value );
-    return result;
+    candidates.erase( std::remove_if( candidates.begin(), candidates.end(), []( const auto& p ) { return p.zones == 0; } ), candidates.end() );
+    return candidates;
 }
 
 std::optional<Role> RoleOf( std::string_view threadName )
@@ -266,6 +308,8 @@ struct CpuRead
 {
     uint64_t zones = 0;
     std::vector<json> threads;
+    uint64_t invalid = 0, missingParents = 0;
+    std::vector<json> nativeCandidates;
 };
 
 // Reads the picked threads' zones as compact records, in chunks that start
@@ -306,13 +350,13 @@ CpuRead ReadCompactZones( const CpuZoneScanSource& zoneSource, const std::vector
     std::mutex merge;
     std::exception_ptr failure;
     std::vector<uint64_t> zonesByPick( picks.size() );
+    uint64_t invalidTotal = 0, missingTotal = 0;
+    std::vector<json> nativeEvents;
     const auto work = [&] {
         try
         {
             auto reader = zoneSource.OpenCpuZoneScanReader();
             std::vector<CpuZoneScanRecord> records;
-            struct Open { uint64_t ordinal; uint8_t flags; };
-            std::vector<Open> stack;
             std::unordered_map<std::string, ZoneClass, NameHash, std::equal_to<>> named;
             for( ;; )
             {
@@ -321,7 +365,19 @@ CpuRead ReadCompactZones( const CpuZoneScanSource& zoneSource, const std::vector
                 const auto& chunk = chunks[index];
                 const auto role = picks[chunk.pick].role;
                 Accumulator accumulator( frames );
-                stack.clear();
+                std::vector<json> native;
+                SelfPartition<uint64_t> partition( [&]( const uint64_t& ordinal, ZoneClass cls, int64_t start, int64_t end ) {
+                    AccountPiece( accumulator, role, cls, start, end );
+                    if( role != Role::Worker && end - start > int64_t( options.frameBudgetMs * 1e6 ) )
+                    {
+                        std::string ref; zoneSource.CpuZoneScanRef( ordinal, ref );
+                        native.push_back( { { "kind", "cpu-self-span" }, { "owner_ref", picks[chunk.pick].ref },
+                            { "role", role == Role::Main ? "main" : "render" }, { "zone_ref", ref },
+                            { "start_ns", std::to_string( start ) }, { "end_ns", std::to_string( end ) },
+                            { "duration_ns", std::to_string( end - start ) }, { "scope_class", int( cls ) } } );
+                        if( native.size() > 1000000 ) throw std::runtime_error( "native_candidate_budget" );
+                    }
+                } );
                 reader->Seek( picks[chunk.pick].index, chunk.begin );
                 uint64_t position = chunk.begin;
                 uint64_t read = 0;
@@ -335,14 +391,6 @@ CpuRead ReadCompactZones( const CpuZoneScanSource& zoneSource, const std::vector
                     read += records.size();
                     for( const auto& zone : records )
                     {
-                        uint8_t inherited = 0;
-                        if( zone.parent == CpuZoneScanRecord::NoParent ) stack.clear();
-                        else
-                        {
-                            while( !stack.empty() && stack.back().ordinal != zone.parent ) stack.pop_back();
-                            if( !stack.empty() ) inherited = stack.back().flags;
-                        }
-                        const bool root = stack.empty();
                         ZoneClass cls;
                         if( zone.hasName )
                         {
@@ -355,13 +403,15 @@ CpuRead ReadCompactZones( const CpuZoneScanSource& zoneSource, const std::vector
                             cls = found->second;
                         }
                         else cls = zone.location < classes.size() ? classes[zone.location] : ZoneClass::Active;
-                        auto flags = inherited;
-                        if( zone.hasEnd && zone.timingValid && zone.endNs >= zone.startNs )
-                            flags = Account( accumulator, role, cls, root, inherited, zone.startNs, zone.endNs );
-                        stack.push_back( { zone.ordinal, flags } );
+                        partition.Push( zone.ordinal, zone.parent == CpuZoneScanRecord::NoParent ? std::nullopt : std::optional<uint64_t>( zone.parent ),
+                            zone.startNs, zone.endNs, zone.hasEnd && zone.complete && zone.timingValid, cls );
                     }
                 }
+                partition.Finish();
                 std::lock_guard lock( merge );
+                invalidTotal += partition.invalid; missingTotal += partition.missingParents;
+                for( auto& event : native ) nativeEvents.push_back( std::move( event ) );
+                if( nativeEvents.size() > 1000000 ) throw std::runtime_error( "native_candidate_budget" );
                 accumulator.MergeInto( cells );
                 zonesByPick[chunk.pick] += read;
             }
@@ -380,6 +430,11 @@ CpuRead ReadCompactZones( const CpuZoneScanSource& zoneSource, const std::vector
     for( auto& thread : pool ) thread.join();
     if( failure ) std::rethrow_exception( failure );
     CpuRead result;
+    result.invalid = invalidTotal; result.missingParents = missingTotal;
+    std::sort( nativeEvents.begin(), nativeEvents.end(), []( const auto& a, const auto& b ) {
+        return std::tie( a["owner_ref"], a["zone_ref"], a["start_ns"] ) < std::tie( b["owner_ref"], b["zone_ref"], b["start_ns"] );
+    } );
+    result.nativeCandidates = std::move( nativeEvents );
     for( size_t p = 0; p < picks.size(); ++p )
     {
         result.zones += zonesByPick[p];
@@ -396,11 +451,21 @@ CpuRead ReadZoneDtos( const TraceSource& source, const std::vector<ThreadPick>& 
 {
     std::unordered_map<std::string, size_t> pickOf;
     for( size_t p = 0; p < picks.size(); ++p ) pickOf.emplace( picks[p].ref, p );
-    struct Open { std::string ref; uint8_t flags; };
-    std::vector<std::vector<Open>> stacks( picks.size() );
     std::vector<uint64_t> zonesByPick( picks.size() );
     std::vector<std::unique_ptr<Accumulator>> accumulators;
-    for( size_t p = 0; p < picks.size(); ++p ) accumulators.push_back( std::make_unique<Accumulator>( frames ) );
+    std::vector<std::unique_ptr<SelfPartition<std::string>>> partitions;
+    CpuRead result;
+    for( size_t p = 0; p < picks.size(); ++p )
+    {
+        accumulators.push_back( std::make_unique<Accumulator>( frames ) );
+        partitions.push_back( std::make_unique<SelfPartition<std::string>>( [&, p]( const auto& ref, ZoneClass cls, int64_t start, int64_t end ) {
+            AccountPiece( *accumulators[p], picks[p].role, cls, start, end );
+            if( picks[p].role != Role::Worker && end - start > int64_t( options.frameBudgetMs * 1e6 ) )
+                result.nativeCandidates.push_back( { { "kind", "cpu-self-span" }, { "owner_ref", picks[p].ref }, { "zone_ref", ref },
+                    { "role", picks[p].role == Role::Main ? "main" : "render" }, { "start_ns", std::to_string( start ) },
+                    { "end_ns", std::to_string( end ) }, { "duration_ns", std::to_string( end - start ) }, { "scope_class", int( cls ) } } );
+        } ) );
+    }
     ScanRange range;
     range.limit = 65536;
     for( ;; )
@@ -411,27 +476,15 @@ CpuRead ReadZoneDtos( const TraceSource& source, const std::vector<ThreadPick>& 
         {
             const auto found = pickOf.find( zone.threadRef );
             if( found == pickOf.end() ) continue;
-            auto& stack = stacks[found->second];
             ++zonesByPick[found->second];
-            uint8_t inherited = 0;
-            if( !zone.parentRef ) stack.clear();
-            else
-            {
-                while( !stack.empty() && stack.back().ref != *zone.parentRef ) stack.pop_back();
-                if( !stack.empty() ) inherited = stack.back().flags;
-            }
-            const bool root = stack.empty();
-            auto flags = inherited;
-            if( zone.endNs && zone.timingValid && *zone.endNs >= zone.startNs )
-                flags = Account( *accumulators[found->second], picks[found->second].role, ClassifyName( zone.name.empty() ? zone.function : zone.name ),
-                    root, inherited, zone.startNs, *zone.endNs );
-            stack.push_back( { zone.ref, flags } );
+            partitions[found->second]->Push( zone.ref, zone.parentRef, zone.startNs, zone.endNs.value_or( zone.startNs ),
+                zone.endNs.has_value() && zone.complete && zone.timingValid, ClassifyName( zone.name.empty() ? zone.function : zone.name ) );
         }
         range.offset += zones.size();
         if( zones.size() < range.limit ) break;
     }
+    for( auto& part : partitions ) { part->Finish(); result.invalid += part->invalid; result.missingParents += part->missingParents; }
     for( const auto& value : accumulators ) value->MergeInto( cells );
-    CpuRead result;
     for( size_t p = 0; p < picks.size(); ++p )
     {
         result.zones += zonesByPick[p];
@@ -459,48 +512,82 @@ void AddUnion( std::vector<std::pair<int64_t, int64_t>> intervals, Metric metric
     accumulator.MergeInto( cells );
 }
 
-// The value of a plot in effect at each frame's end, and the increase of the
-// plot within each frame.
+// Samples and a bounded last-observation hold. A high/low excursion within
+// one frame is retained in peak; atEnd alone is not an overload detector.
 struct PlotSeries
 {
     std::string name;
-    std::vector<double> atEnd;
-    std::vector<double> increase;
+    std::vector<double> atEnd, peak;
+    uint64_t samples = 0, invalid = 0;
+    double maximum = std::numeric_limits<double>::quiet_NaN();
     bool present = false;
 };
 
 PlotSeries SamplePlot( const TraceSource& source, const FrameTriageSource* fast, const PlotDto& plot, const Frames& frames,
-    const FrameTriageOptions& options )
+    const FrameTriageOptions& options, bool memoryUsage = false )
 {
     PlotSeries series;
     series.name = plot.name;
-    series.atEnd.assign( frames.Count(), std::numeric_limits<double>::quiet_NaN() );
-    series.increase.assign( frames.Count(), 0 );
-    size_t frame = 0;
-    double last = std::numeric_limits<double>::quiet_NaN();
+    const auto nan = std::numeric_limits<double>::quiet_NaN();
+    series.atEnd.assign( frames.Count(), nan ); series.peak.assign( frames.Count(), nan );
+    std::vector<std::pair<int64_t, double>> points;
     const auto visit = [&]( int64_t time, double value ) {
-        while( frame < frames.Count() && frames.end[frame] < time ) series.atEnd[frame++] = last;
-        last = value;
-        series.present = true;
+        if( points.size() >= 4000000 ) throw std::runtime_error( "frame_triage_plot_budget" );
+        points.emplace_back( time, value );
     };
     if( fast ) fast->VisitPlotPoints( plot.ref, visit );
     else
     {
-        ScanRange range;
-        range.limit = 65536;
+        ScanRange range; range.limit = 65536;
         for( ;; )
         {
             CheckCancelled( options.cancelled );
-            const auto points = source.ScanPlots( range );
-            for( const auto& point : points ) if( point.plotRef == plot.ref ) visit( point.timeNs, point.value );
-            range.offset += points.size();
-            if( points.size() < range.limit ) break;
+            const auto rows = source.ScanPlots( range );
+            for( const auto& point : rows ) if( point.plotRef == plot.ref ) visit( point.timeNs, point.value );
+            range.offset += rows.size(); if( rows.size() < range.limit ) break;
         }
     }
-    for( ; frame < frames.Count(); ++frame ) series.atEnd[frame] = last;
-    for( size_t n = 1; n < frames.Count(); ++n )
-        if( !std::isnan( series.atEnd[n] ) && !std::isnan( series.atEnd[n - 1] ) )
-            series.increase[n] = std::max( 0.0, series.atEnd[n] - series.atEnd[n - 1] );
+    std::stable_sort( points.begin(), points.end(), []( const auto& a, const auto& b ) { return a.first < b.first; } );
+    series.samples = points.size();
+    size_t frame = 0;
+    double last = nan;
+    int64_t lastTime = 0;
+    const auto valid = []( double v ) { return std::isfinite( v ) && v >= 0 && v <= 9007199254740991.0 && std::floor( v ) == v; };
+    const auto finish = [&]( int64_t until ) {
+        while( frame < frames.Count() && frames.end[frame] <= until )
+        {
+            if( valid( last ) && frames.end[frame] - lastTime <= options.memorySampleMaxAgeNs )
+                series.atEnd[frame] = last;
+            if( valid( last ) && frames.begin[frame] >= lastTime && frames.begin[frame] - lastTime <= options.memorySampleMaxAgeNs )
+                series.peak[frame] = std::isnan( series.peak[frame] ) ? last : std::max( last, series.peak[frame] );
+            ++frame;
+        }
+    };
+    for( size_t n = 0; n < points.size(); ++n )
+    {
+        const auto [time, value] = points[n];
+        finish( time );
+        if( frame < frames.Count() && time > frames.begin[frame] && valid( last ) &&
+            lastTime <= frames.begin[frame] && frames.begin[frame] - lastTime <= options.memorySampleMaxAgeNs )
+            series.peak[frame] = std::isnan( series.peak[frame] ) ? last : std::max( last, series.peak[frame] );
+        if( !valid( value ) ) { ++series.invalid; last = nan; lastTime = time; continue; }
+        series.present = true;
+        series.maximum = std::isnan( series.maximum ) ? value : std::max( value, series.maximum );
+        if( frame < frames.Count() && time >= frames.begin[frame] )
+            series.peak[frame] = std::isnan( series.peak[frame] ) ? value : std::max( value, series.peak[frame] );
+        last = value; lastTime = time;
+        if( memoryUsage && options.nativeSink )
+        {
+            json reasons = json::array();
+            if( options.gpuMemoryBudgetBytes && value > *options.gpuMemoryBudgetBytes ) reasons.push_back( "vram_project_limit" );
+            if( value > 5000000000.0 ) reasons.push_back( "vram_over_5GB" );
+            if( value > double( 5ull << 30 ) ) reasons.push_back( "vram_over_5GiB" );
+            if( !reasons.empty() ) options.nativeSink( { { "kind", "vram-observed-sample" },
+                { "candidate_id", plot.ref + ":sample:" + std::to_string( n ) }, { "plot_ref", plot.ref }, { "name", plot.name },
+                { "time_ns", std::to_string( time ) }, { "usage_bytes", std::to_string( uint64_t( value ) ) }, { "reasons", reasons } } );
+        }
+    }
+    finish( INT64_MAX );
     return series;
 }
 
@@ -551,8 +638,8 @@ Limiter Classify( const Cell& c, int64_t duration, int64_t budget, size_t worker
     if( duration <= budget ) return Limiter::WithinBudget;
     const double f = double( duration );
     const auto share = [&]( int64_t value ) { return double( value ) / f; };
-    const auto mainActive = std::max<int64_t>( 0, c[MainBusy] - c[MainWaitPresent] - c[MainWaitJob] - c[MainWaitOther] - c[MainPacing] );
-    const auto renderActive = std::max<int64_t>( 0, c[RenderBusy] - c[RenderWaitGpu] - c[RenderWaitOther] );
+    const auto mainActive = std::max<int64_t>( 0, c[MainBusy] - c[MainWaitPresent] - c[MainWaitJob] - c[MainWaitOther] - c[MainPacing] - c[MainUnknown] );
+    const auto renderActive = std::max<int64_t>( 0, c[RenderBusy] - c[RenderWaitGpu] - c[RenderWaitOther] - c[RenderUnknown] );
     const double workerUtilization = workers ? double( c[WorkerBusy] ) / ( f * double( workers ) ) : 0;
     if( share( c[MainPacing] ) >= t.pacing ) return Limiter::IntentionalPacing;
     if( share( c[MainLoading] ) >= t.loading || ( share( c[IoActive] ) >= t.ioWithLoading && share( c[MainLoading] ) >= t.loadingWithIo ) )
@@ -589,7 +676,7 @@ struct Window
 
 }
 
-const char* FrameTriageAlgorithmId() { return "frame-triage-v1"; }
+const char* FrameTriageAlgorithmId() { return "frame-triage-v4.1"; }
 
 json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& options )
 {
@@ -602,7 +689,7 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         cost[name] = Round( std::chrono::duration<double, std::milli>( now - stageStart ).count(), 1 );
         stageStart = now;
     };
-    if( !( options.frameBudgetMs > 0 ) ) throw std::invalid_argument( "frame_triage_budget_invalid" );
+    if( !( options.frameBudgetMs > 0 ) || !std::isfinite( options.frameBudgetMs ) || options.frameBudgetMs > 1e9 || options.memorySampleMaxAgeNs < 0 ) throw std::invalid_argument( "frame_triage_budget_invalid" );
     const auto budget = int64_t( options.frameBudgetMs * 1e6 );
     const Thresholds thresholds;
 
@@ -617,17 +704,27 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
     if( !frameSet ) frameSet = &frameSets.front();
     Frames frames;
     std::vector<std::string> frameRefs;
+    std::vector<size_t> frameIndices;
+    size_t excludedTail = 0;
     for( size_t offset = 0;; )
     {
         CheckCancelled( options.cancelled );
         const auto page = source.GetFramesForSet( frameSet->index, offset, 65536 );
         for( const auto& frame : page )
         {
+            // The watermark is not a following FrameMark. This is the same
+            // denominator rule used by FrameCpuScanner.
+            if( frameSet->continuous && frame.index + 1 == frameSet->frameCount )
+            {
+                ++excludedTail;
+                continue;
+            }
             if( !frame.complete || !frame.endNs || *frame.endNs <= frame.beginNs ) continue;
             if( !frames.begin.empty() && frame.beginNs < frames.end.back() ) continue;
             frames.begin.push_back( frame.beginNs );
             frames.end.push_back( *frame.endNs );
             frameRefs.push_back( frame.ref );
+            frameIndices.push_back( frame.index );
         }
         offset += page.size();
         if( page.size() < 65536 ) break;
@@ -636,11 +733,15 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
     if( frames.Count() > 4'000'000 ) throw std::runtime_error( "frame_triage_frame_limit" );
     const auto frameCount = frames.Count();
     std::vector<Cell> cells( frameCount, Cell {} );
+    std::vector<bool> nativeMain( frameCount ), nativeRender( frameCount ), nativeGpu( frameCount );
+    const auto markSpan = [&]( std::vector<bool>& into, int64_t begin, int64_t end ) {
+        for( auto n = frames.First( begin ); n < frameCount && frames.begin[n] < end; ++n ) into[n] = true;
+    };
     stage( "frames" );
 
     // CPU zones of the main, render and job worker threads.
     const auto* zoneSource = dynamic_cast<const CpuZoneScanSource*>( &source );
-    std::vector<ThreadPick> candidates;
+    std::vector<ThreadPick> threadCandidates;
     std::unordered_map<std::string, std::string> threadNames;
     for( const auto& thread : source.GetThreads() ) threadNames.emplace( thread.ref, thread.name );
     if( zoneSource )
@@ -649,7 +750,7 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         for( size_t n = 0; n < threads.size(); ++n )
         {
             const auto name = threadNames.contains( threads[n].ref ) ? threadNames[threads[n].ref] : std::string();
-            if( const auto role = RoleOf( name ) ) candidates.push_back( { n, threads[n].ref, name, *role, threads[n].count } );
+            if( const auto role = RoleOf( name ) ) threadCandidates.push_back( { n, threads[n].ref, name, *role, threads[n].count } );
         }
     }
     else
@@ -657,11 +758,11 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         size_t n = 0;
         for( const auto& thread : source.GetThreads() )
         {
-            if( const auto role = RoleOf( thread.name ) ) candidates.push_back( { n, thread.ref, thread.name, *role, thread.zoneCount } );
+            if( const auto role = RoleOf( thread.name ) ) threadCandidates.push_back( { n, thread.ref, thread.name, *role, thread.zoneCount } );
             ++n;
         }
     }
-    const auto picks = PickThreads( std::move( candidates ) );
+    const auto picks = PickThreads( std::move( threadCandidates ) );
     size_t workerCount = 0;
     bool hasMain = false, hasRender = false;
     for( const auto& pick : picks )
@@ -671,6 +772,14 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         hasRender |= pick.role == Role::Render;
     }
     const auto cpu = zoneSource ? ReadCompactZones( *zoneSource, picks, frames, cells, options ) : ReadZoneDtos( source, picks, frames, cells, options );
+    for( size_t n = 0; n < cpu.nativeCandidates.size(); ++n )
+    {
+        auto candidate = cpu.nativeCandidates[n];
+        markSpan( candidate["role"] == "main" ? nativeMain : nativeRender,
+            std::stoll( candidate["start_ns"].get<std::string>() ), std::stoll( candidate["end_ns"].get<std::string>() ) );
+        candidate["candidate_id"] = "cpu-self-span:" + std::to_string( n );
+        if( options.nativeSink ) options.nativeSink( candidate );
+    }
     stage( "cpu_zones" );
 
     // Top-level GPU zones of the graphics and compute queues.
@@ -683,12 +792,23 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         contextByRef.emplace( context.ref, context.index );
         if( copyQueue.size() <= context.index ) copyQueue.resize( context.index + 1, false );
         copyQueue[context.index] = Has( Lower( context.name ), "copy" );
-        gpuContexts.push_back( { { "ref", context.ref }, { "name", context.name }, { "used", !copyQueue[context.index] } } );
+        gpuContexts.push_back( { { "ref", context.ref }, { "name", context.name }, { "used", true }, { "copy_queue", copyQueue[context.index] } } );
     }
-    std::vector<std::pair<int64_t, int64_t>> gpuIntervals;
+    std::vector<std::pair<int64_t, int64_t>> gpuIntervals, copyIntervals;
+    uint64_t gpuSpanOrdinal = 0, gpuNativeLong = 0;
     const auto addGpu = [&]( size_t context, int64_t start, int64_t end ) {
-        if( context < copyQueue.size() && copyQueue[context] ) return;
-        if( end > start ) gpuIntervals.emplace_back( start, end );
+        if( end <= start ) return;
+        const bool copy = context < copyQueue.size() && copyQueue[context];
+        ( copy ? copyIntervals : gpuIntervals ).emplace_back( start, end );
+        const auto ordinal = gpuSpanOrdinal++;
+        if( end - start > budget )
+        {
+            ++gpuNativeLong; markSpan( nativeGpu, start, end );
+            if( options.nativeSink ) options.nativeSink( { { "candidate_id", "gpu-root-span:" + std::to_string( ordinal ) },
+                { "kind", "gpu-root-span" }, { "context_index", context }, { "copy_queue", copy },
+                { "start_ns", std::to_string( start ) }, { "end_ns", std::to_string( end ) },
+                { "duration_ns", std::to_string( end - start ) }, { "causality", "unattributed_native_gpu_scope" } } );
+        }
     };
     if( fast ) fast->VisitTopLevelGpuZones( addGpu );
     else
@@ -711,6 +831,7 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
     }
     const auto gpuZones = gpuIntervals.size();
     AddUnion( std::move( gpuIntervals ), GpuBusy, frames, cells );
+    AddUnion( std::move( copyIntervals ), GpuCopyBusy, frames, cells );
     stage( "gpu_zones" );
 
     // I/O requests in flight.
@@ -734,10 +855,27 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
 
     // GPU and CPU memory counters.
     const auto plots = source.GetPlotList();
-    const auto sample = [&]( const PlotDto* plot ) {
-        return plot ? SamplePlot( source, fast, *plot, frames, options ) : PlotSeries {};
+    const auto sample = [&]( const PlotDto* plot, bool memoryUsage = false ) {
+        return plot ? SamplePlot( source, fast, *plot, frames, options, memoryUsage ) : PlotSeries {};
     };
-    const auto vramUsage = sample( FindPlot( plots, { "GPU.DXGI.Local.UsageBytes", "D3D12 DXGI Primary Segment Usage" } ) );
+    const auto* primaryUsagePlot = FindPlot( plots, { "GPU.DXGI.Local.UsageBytes", "D3D12 DXGI Primary Segment Usage" } );
+    const auto vramUsage = sample( primaryUsagePlot, true );
+    std::vector<double> vramPeaks = vramUsage.peak;
+    json memorySources = json::array();
+    const auto recordMemory = [&]( const PlotSeries& p ) {
+        memorySources.push_back( { { "name", p.name }, { "samples", p.samples }, { "invalid", p.invalid },
+            { "peak_bytes", std::isfinite( p.maximum ) ? json( std::to_string( uint64_t( p.maximum ) ) ) : json( nullptr ) } } );
+    };
+    if( primaryUsagePlot ) recordMemory( vramUsage );
+    for( const auto& plot : plots )
+    {
+        if( &plot == primaryUsagePlot ) continue;
+        if( plot.name != "GPU.DXGI.Local.UsageBytes" && !plot.name.ends_with( "/D3D12 DXGI Primary Segment Usage" ) ) continue;
+        const auto values = sample( &plot, true ); recordMemory( values );
+        if( vramPeaks.empty() ) vramPeaks = values.peak;
+        else for( size_t n = 0; n < vramPeaks.size(); ++n ) if( std::isfinite( values.peak[n] ) )
+            vramPeaks[n] = std::isnan( vramPeaks[n] ) ? values.peak[n] : std::max( vramPeaks[n], values.peak[n] );
+    }
     const auto vramBudget = sample( FindPlot( plots, { "GPU.DXGI.Local.BudgetBytes", "D3D12 DXGI Primary Segment Budget" } ) );
     const auto evicted = sample( FindPlot( plots, { "GPU.VRAM.Residency.EvictedBytes" } ) );
     const auto cpuMemory = sample( FindPlot( plots, { "App Committed Memory", "System Used Memory" } ) );
@@ -756,10 +894,10 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
             const auto usage = vramUsage.atEnd[n];
             const auto dxgiBudget = vramBudget.present ? vramBudget.atEnd[n] : std::numeric_limits<double>::quiet_NaN();
             fact.vramPressure = ( !std::isnan( usage ) && !std::isnan( dxgiBudget ) && dxgiBudget > 0 && usage >= thresholds.vramUsage * dxgiBudget ) ||
-                ( !std::isnan( usage ) && options.gpuMemoryBudgetBytes && usage >= *options.gpuMemoryBudgetBytes );
+                ( !vramPeaks.empty() && std::isfinite( vramPeaks[n] ) && options.gpuMemoryBudgetBytes && vramPeaks[n] > *options.gpuMemoryBudgetBytes );
         }
-        // Resources evicted from local GPU memory, or more of them than at the previous frame.
-        if( evicted.present && ( evicted.increase[n] > 0 || evicted.atEnd[n] > 0 ) ) fact.vramPressure = true;
+        // EvictedBytes is a stock of resources, not time spent paging. Even
+        // an increase alone cannot establish a frame's memory bottleneck.
         if( cpuMemory.present && options.cpuMemoryBudgetBytes && !std::isnan( cpuMemory.atEnd[n] ) )
             fact.cpuMemoryPressure = cpuMemory.atEnd[n] >= *options.cpuMemoryBudgetBytes;
         vramFrames += fact.vramPressure;
@@ -767,6 +905,92 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         fact.limiter = Classify( cells[n], durations[n], budget, workerCount, fact.vramPressure, fact.cpuMemoryPressure, thresholds );
     }
     const auto debtOf = [&]( size_t n ) { return std::max<int64_t>( 0, durations[n] - budget ); };
+    // Sustained slow intervals are independent of isolated spikes. Their
+    // configuration epoch is unresolved until a verified clock/frame mapping.
+    std::vector<std::pair<size_t, size_t>> sustained;
+    size_t slowCount = 0, firstSlow = 0;
+    const int64_t diagnosticNs = int64_t( options.frameBudgetMs * 1e6 + 333334 );
+    for( size_t last = 0; last < frameCount; ++last )
+    {
+        slowCount += durations[last] > diagnosticNs;
+        while( firstSlow < last && frames.end[last] - frames.begin[firstSlow] > 2000000000 )
+        { slowCount -= durations[firstSlow] > diagnosticNs; ++firstSlow; }
+        if( frames.end[last] - frames.begin[firstSlow] >= 1500000000 && slowCount * 2 >= last - firstSlow + 1 )
+        {
+            if( !sustained.empty() && firstSlow <= sustained.back().second + 1 ) sustained.back().second = last;
+            else sustained.emplace_back( firstSlow, last );
+        }
+    }
+    std::vector<bool> sustainedMember( frameCount );
+    json sustainedJson = json::array();
+    for( const auto& [first, last] : sustained )
+    {
+        for( auto n = first; n <= last; ++n ) sustainedMember[n] = true;
+        sustainedJson.push_back( { { "first_index", frameIndices[first] }, { "last_index", frameIndices[last] },
+            { "start_ns", std::to_string( frames.begin[first] ) }, { "end_ns", std::to_string( frames.end[last] ) }, { "configuration_epoch", "unresolved" } } );
+    }
+    std::vector<int64_t> mainActiveTimes, renderActiveTimes, gpuBusyTimes;
+    std::vector<std::vector<std::string>> reasons( frameCount );
+    std::vector<size_t> candidates;
+    std::map<std::string, uint64_t> reasonCounts;
+    std::map<std::string, std::pair<double, size_t>> bestByReason;
+    uint64_t mainOver = 0, renderOver = 0, gpuOver = 0, cpuAndGpuOver = 0, severeCount = 0;
+    const auto severeNs = int64_t( std::ceil( options.frameBudgetMs * 2e6 ) );
+    for( size_t n = 0; n < frameCount; ++n )
+    {
+        const auto& c = cells[n];
+        const auto main = std::max<int64_t>( 0, c[MainBusy] - c[MainWaitPresent] - c[MainWaitJob] - c[MainWaitOther] - c[MainPacing] - c[MainUnknown] );
+        const auto render = std::max<int64_t>( 0, c[RenderBusy] - c[RenderWaitGpu] - c[RenderWaitOther] - c[RenderUnknown] );
+        mainActiveTimes.push_back( main ); renderActiveTimes.push_back( render ); gpuBusyTimes.push_back( c[GpuBusy] );
+        mainOver += main > budget; renderOver += render > budget; gpuOver += c[GpuBusy] > budget;
+        cpuAndGpuOver += ( main > budget || render > budget ) && c[GpuBusy] > budget;
+        severeCount += durations[n] >= severeNs;
+        const auto add = [&]( bool hit, const char* reason, double score ) {
+            if( !hit ) return;
+            reasons[n].emplace_back( reason ); ++reasonCounts[reason];
+            auto found = bestByReason.find( reason );
+            if( found == bestByReason.end() || score > found->second.first ) bestByReason[reason] = { score, n };
+        };
+        add( durations[n] > budget, "strict_frame_miss", double( durations[n] ) );
+        add( durations[n] >= severeNs, "severe_frame", double( durations[n] ) );
+        add( main > budget, "main_work_budget", double( main ) );
+        add( render > budget, "render_work_budget", double( render ) );
+        add( c[GpuBusy] > budget, "gpu_window_budget", double( c[GpuBusy] ) );
+        add( c[GpuCopyBusy] > budget, "gpu_copy_window_budget", double( c[GpuCopyBusy] ) );
+        add( c[MainWaitPresent] + c[MainWaitJob] + c[MainWaitOther] > budget, "main_wait_scope_budget", double( durations[n] ) );
+        add( c[RenderWaitGpu] + c[RenderWaitOther] > budget, "render_wait_scope_budget", double( durations[n] ) );
+        add( c[MainUnknown] > budget, "main_unknown_scope_budget", double( c[MainUnknown] ) );
+        add( c[RenderUnknown] > budget, "render_unknown_scope_budget", double( c[RenderUnknown] ) );
+        add( nativeMain[n], "main_native_long_self", double( durations[n] ) );
+        add( nativeRender[n], "render_native_long_self", double( durations[n] ) );
+        add( nativeGpu[n], "gpu_native_long_scope", double( durations[n] ) );
+        add( sustainedMember[n], "sustained_slow_member", double( durations[n] ) );
+        const auto peak = vramPeaks.empty() ? std::numeric_limits<double>::quiet_NaN() : vramPeaks[n];
+        add( options.gpuMemoryBudgetBytes && std::isfinite( peak ) && peak > *options.gpuMemoryBudgetBytes, "vram_project_limit", peak );
+        add( std::isfinite( peak ) && peak > 5000000000.0, "vram_over_5GB", peak );
+        add( std::isfinite( peak ) && peak > double( 5ull << 30 ), "vram_over_5GiB", peak );
+        add( facts[n].vramPressure, "vram_pressure_signal", std::isfinite( peak ) ? peak : 0 );
+        json row = {
+            { "ref", frameRefs[n] }, { "index", frameIndices[n] }, { "candidate_id", frameRefs[n] },
+            { "start_ns", Decimal( frames.begin[n] ) }, { "end_ns", Decimal( frames.end[n] ) },
+            { "duration_ns", Decimal( durations[n] ) }, { "main_active_ns", Decimal( main ) }, { "render_active_ns", Decimal( render ) },
+            { "gpu_union_ns", Decimal( c[GpuBusy] ) }, { "gpu_copy_union_ns", Decimal( c[GpuCopyBusy] ) },
+            { "main_unknown_ns", Decimal( c[MainUnknown] ) }, { "render_unknown_ns", Decimal( c[RenderUnknown] ) },
+            { "main_wait_present_ns", Decimal( c[MainWaitPresent] ) }, { "main_wait_job_ns", Decimal( c[MainWaitJob] ) },
+            { "main_wait_other_ns", Decimal( c[MainWaitOther] ) }, { "main_pacing_ns", Decimal( c[MainPacing] ) },
+            { "render_wait_gpu_ns", Decimal( c[RenderWaitGpu] ) }, { "render_wait_other_ns", Decimal( c[RenderWaitOther] ) },
+            { "duration_ms", Ms( durations[n] ) }, { "main_active_ms", Ms( main ) }, { "render_active_ms", Ms( render ) },
+            { "main_wait_present_ms", Ms( c[MainWaitPresent] ) }, { "main_wait_job_ms", Ms( c[MainWaitJob] ) },
+            { "main_wait_other_ms", Ms( c[MainWaitOther] ) }, { "main_pacing_ms", Ms( c[MainPacing] ) },
+            { "render_wait_gpu_ms", Ms( c[RenderWaitGpu] ) }, { "render_wait_other_ms", Ms( c[RenderWaitOther] ) },
+            { "gpu_union_ms", Ms( c[GpuBusy] ) }, { "limiter_hypothesis", LimiterNames[size_t( facts[n].limiter )] },
+            { "vram_peak_observed_or_fresh_hold_bytes", std::isfinite( peak ) ? json( std::to_string( uint64_t( peak ) ) ) : json( nullptr ) },
+            { "reasons", reasons[n] }, { "severe", durations[n] >= severeNs }, { "selected", !reasons[n].empty() },
+            { "classification", "signals_only_not_confirmed_causality" }
+        };
+        if( options.frameSink ) options.frameSink( row );
+        if( !reasons[n].empty() ) { candidates.push_back( n ); if( options.candidateSink ) options.candidateSink( row ); }
+    }
     stage( "classify" );
 
     // Whole capture.
@@ -805,8 +1029,8 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
         for( auto n = first; n <= last; ++n )
         {
             const auto& c = cells[n];
-            main += double( std::max<int64_t>( 0, c[MainBusy] - c[MainWaitPresent] - c[MainWaitJob] - c[MainWaitOther] - c[MainPacing] ) );
-            render += double( std::max<int64_t>( 0, c[RenderBusy] - c[RenderWaitGpu] - c[RenderWaitOther] ) );
+            main += double( std::max<int64_t>( 0, c[MainBusy] - c[MainWaitPresent] - c[MainWaitJob] - c[MainWaitOther] - c[MainPacing] - c[MainUnknown] ) );
+            render += double( std::max<int64_t>( 0, c[RenderBusy] - c[RenderWaitGpu] - c[RenderWaitOther] - c[RenderUnknown] ) );
             gpu += double( c[GpuBusy] );
             mainWait += double( c[MainWaitPresent] + c[MainWaitJob] + c[MainWaitOther] );
             jobs += double( c[WorkerBusy] );
@@ -888,62 +1112,29 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
             { "time_shares", shares( cluster.first, cluster.last ) } } );
     }
 
-    // Recommended windows: for each limiter with a meaningful share of the
-    // debt, the window of `windowSeconds` where its debt is largest; the
-    // worst spike clusters; and typical frames.
-    const auto windowNs = std::max<int64_t>( 1, int64_t( std::clamp( options.windowSeconds, 0.5, 60.0 ) * 1e9 ) );
+    // Representatives are a deep-read budget, never a candidate filter.
+    std::vector<size_t> representatives;
+    const auto choose = [&]( size_t n ) {
+        if( representatives.size() < std::min( options.maxRepresentatives, options.maxWindows ) && std::find( representatives.begin(), representatives.end(), n ) == representatives.end() ) representatives.push_back( n );
+    };
+    for( const auto& [reason, best] : bestByReason ) choose( best.second );
+    auto worst = candidates;
+    std::stable_sort( worst.begin(), worst.end(), [&]( size_t a, size_t b ) { return durations[a] > durations[b]; } );
+    for( auto n : worst ) choose( n );
+    std::sort( representatives.begin(), representatives.end() );
+    json representativeJson = json::array();
     std::vector<Window> windows;
-    const auto overlaps = [&]( size_t first, size_t last ) {
-        for( auto& window : windows ) if( first <= window.last && last >= window.first ) return &window;
-        return static_cast<Window*>( nullptr );
-    };
-    const auto addWindow = [&]( size_t first, size_t last, std::string reason ) {
-        if( auto* window = overlaps( first, last ) )
+    for( auto n : representatives )
+    {
+        representativeJson.push_back( { { "ref", frameRefs[n] }, { "index", frameIndices[n] }, { "reasons", reasons[n] } } );
+        Window w{ n ? n - 1 : 0, std::min( frameCount - 1, n + 1 ), { "representative_frame:" + std::to_string( frameIndices[n] ) } };
+        if( !windows.empty() && w.first <= windows.back().last + 1 )
         {
-            window->first = std::min( window->first, first );
-            window->last = std::max( window->last, last );
-            window->reasons.push_back( std::move( reason ) );
-            return;
+            windows.back().last = std::max( windows.back().last, w.last );
+            windows.back().reasons.insert( windows.back().reasons.end(), w.reasons.begin(), w.reasons.end() );
         }
-        if( windows.size() >= std::max<size_t>( 1, options.maxWindows ) ) return;
-        windows.push_back( { first, last, { std::move( reason ) } } );
-    };
-    for( const auto l : order )
-    {
-        if( Limiter( l ) == Limiter::WithinBudget || !totalDebt || double( debtByLimiter[l] ) < 0.05 * double( totalDebt ) ) continue;
-        int64_t best = -1, current = 0;
-        size_t bestFirst = 0, bestLast = 0, first = 0;
-        for( size_t last = 0; last < frameCount; ++last )
-        {
-            if( size_t( facts[last].limiter ) == l ) current += debtOf( last );
-            while( frames.end[last] - frames.begin[first] > windowNs && first < last )
-            {
-                if( size_t( facts[first].limiter ) == l ) current -= debtOf( first );
-                ++first;
-            }
-            if( current > best ) { best = current; bestFirst = first; bestLast = last; }
-        }
-        if( best > 0 ) addWindow( bestFirst, bestLast, std::string( "largest " ) + LimiterNames[l] + " debt" );
+        else windows.push_back( std::move( w ) );
     }
-    for( size_t n = 0; n < clusters.size() && n < 3; ++n )
-    {
-        auto first = clusters[n].first, last = clusters[n].last;
-        const auto margin = std::min<int64_t>( 1'000'000'000, windowNs / 2 );
-        while( first > 0 && frames.begin[clusters[n].first] - frames.begin[first - 1] <= margin ) --first;
-        while( last + 1 < frameCount && frames.end[last + 1] - frames.end[clusters[n].last] <= margin ) ++last;
-        addWindow( first, last, "spike cluster" );
-    }
-    {
-        const auto globalMedian = Percentile( durations, 0.5 );
-        size_t best = 0;
-        for( size_t s = 1; s < segmentFrames.size(); ++s )
-            if( std::abs( segmentMedian[s] - globalMedian ) < std::abs( segmentMedian[best] - globalMedian ) ) best = s;
-        const auto first = segmentFrames[best].first;
-        auto last = first;
-        while( last + 1 <= segmentFrames[best].second && frames.end[last + 1] - frames.begin[first] <= windowNs ) ++last;
-        addWindow( first, last, "typical frames" );
-    }
-    std::sort( windows.begin(), windows.end(), []( const Window& a, const Window& b ) { return a.first < b.first; } );
     json recommended = json::array();
     json scanWindows = json::array();
     int64_t windowTotal = 0;
@@ -978,7 +1169,7 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
     cost["total"] = Round( std::chrono::duration<double, std::milli>( Clock::now() - started ).count(), 1 );
     return {
         { "algorithm", FrameTriageAlgorithmId() },
-        { "frame_set", { { "ref", frameSet->ref }, { "name", frameSet->name }, { "complete_frames", frameCount } } },
+        { "frame_set", { { "ref", frameSet->ref }, { "name", frameSet->name }, { "complete_frames", frameCount }, { "excluded_continuous_tail", excludedTail } } },
         { "budget_ms", Round( options.frameBudgetMs ) },
         { "capture", { { "start_ns", Decimal( captureStart ) }, { "end_ns", Decimal( captureEnd ) }, { "seconds", Round( spanSeconds, 10 ) } } },
         { "frame_time", { { "mean_ms", Ms( total / int64_t( frameCount ) ) }, { "p50_ms", Percentile( durations, 0.5 ) },
@@ -987,12 +1178,29 @@ json RunFrameTriage( const TraceSource& source, const FrameTriageOptions& option
             { "over_budget_frames", overBudget }, { "over_budget_share", Round( double( overBudget ) / double( frameCount ) ) },
             { "debt_ms", Ms( totalDebt ) } } },
         { "time_shares", shares( 0, frameCount - 1 ) },
+        { "independent_budget_signals", {
+            { "main_active_over_budget_frames", mainOver }, { "render_active_over_budget_frames", renderOver },
+            { "gpu_union_over_budget_frames", gpuOver }, { "cpu_and_gpu_over_budget_frames", cpuAndGpuOver },
+            { "main_active_ms", { { "p50", Percentile( mainActiveTimes, 0.5 ) }, { "p90", Percentile( mainActiveTimes, 0.9 ) }, { "p99", Percentile( mainActiveTimes, 0.99 ) } } },
+            { "render_active_ms", { { "p50", Percentile( renderActiveTimes, 0.5 ) }, { "p90", Percentile( renderActiveTimes, 0.9 ) }, { "p99", Percentile( renderActiveTimes, 0.99 ) } } },
+            { "gpu_union_ms", { { "p50", Percentile( gpuBusyTimes, 0.5 ) }, { "p90", Percentile( gpuBusyTimes, 0.9 ) }, { "p99", Percentile( gpuBusyTimes, 0.99 ) } } },
+            { "semantics", "Overlapping signals, not exclusive causal labels. CPU is instrumented non-wait wall time, not on-CPU time. GPU is top-level interval union across non-copy queues, not hardware utilization or frame-to-submit attribution." }
+        } },
         { "limiters", std::move( limiters ) },
         { "segment_seconds", Round( segmentSeconds, 10 ) },
         { "segments", std::move( segments ) },
         { "spike_clusters", std::move( spikes ) }, { "spike_cluster_count", clusterCount },
         { "recommended_windows", std::move( recommended ) },
         { "scan_windows", std::move( scanWindows ) }, { "scan_window_seconds", Round( double( windowTotal ) / 1e9, 10 ) },
+        { "selection", { { "candidate_frames", candidates.size() }, { "severe_frames", severeCount },
+            { "reason_counts", reasonCounts }, { "representatives", representativeJson }, { "deferred_frame_count", candidates.size() - representatives.size() },
+            { "sustained_intervals", sustainedJson }, { "observed_candidate_enumeration_complete", true }, { "causal_classification_complete", false } } },
+        { "coverage", { { "cpu_invalid_or_incomplete", cpu.invalid }, { "cpu_missing_parents", cpu.missingParents },
+            { "cpu_native_long_self", cpu.nativeCandidates.size() }, { "gpu_native_long_roots", gpuNativeLong },
+            { "memory_sources", memorySources }, { "memory_max_sample_age_ns", std::to_string( options.memorySampleMaxAgeNs ) },
+            { "gpu_scope", "all recorded complete root spans; copy queue separate; frame attribution unverified" },
+            { "cpu_scope", "all recognized role owners; role sums can overlap; non-wait wall time is not on-CPU" },
+            { "missing_domains", missing } } },
         { "signals", std::move( signals ) }, { "missing_evidence", std::move( missing ) },
         { "thresholds", {
             { "pacing_wait", thresholds.pacing }, { "loading", thresholds.loading }, { "gpu_busy", thresholds.gpu },

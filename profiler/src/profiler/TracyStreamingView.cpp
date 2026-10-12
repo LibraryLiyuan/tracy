@@ -59,8 +59,9 @@ const char* IoStatusName( uint8_t value )
     return value < std::size( names ) ? names[value] : "Unknown status";
 }
 }
-StreamingView::StreamingView( std::filesystem::path journal, bool live )
-    : m_journal( std::move( journal ) )
+StreamingView::StreamingView( std::filesystem::path journal, bool live, std::filesystem::path reportChannel )
+    : m_reportChannel( std::move( reportChannel ) )
+    , m_journal( std::move( journal ) )
     , m_liveMode( live )
     , m_thread( [this] { Run(); } )
 {
@@ -1959,7 +1960,13 @@ bool StreamingView::Draw()
         if( !m_liveMode )
         {
             if( !m_timeline ) m_timeline = std::make_unique<StreamingTimeline>( m_journal );
+            m_timeline->WebInteraction(!m_reportChannel.empty());
+            request = UpdateReport( r.info ) || request;
             DrawToolbar( open );
+            if( !m_reportChannel.empty() && !m_reportReply.is_null() && m_reportReply.value( "ok", false ) )
+                ImGui::TextDisabled( "Report: %s | %s | query index %lld | native frame %s", m_reportReply.value( "view_id", "" ).c_str(),
+                    m_reportReply.value( "frame_set", "range" ).c_str(), (long long)m_reportReply.value( "frame_index", int64_t(-1) ),
+                    m_reportReply.value( "native_frame_number", "n/a" ).c_str() );
             m_timeline->DrawFrameGraph();
             if( PanelWindow panel( "Options", "", m_showOptions, true, false ); panel ) m_timeline->DrawOptions();
         }
@@ -3085,6 +3092,9 @@ bool StreamingView::Draw()
     }
     if( request && m_end > m_begin ) RequestWindow( after );
     ImGui::End();
+    UpdateWeb();
     return open;
 }
 }
+#include "TracyStreamingReport.inl"
+#include "TracyStreamingWeb.inl"

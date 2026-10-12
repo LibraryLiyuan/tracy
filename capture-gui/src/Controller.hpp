@@ -23,6 +23,8 @@ class Controller
     ~Controller();
     ViewState Snapshot();
     bool Launch(const Settings &settings);
+    // Closes the running game and starts it with the selected INI.
+    bool Restart(const Settings &settings, ProcessIdentity running);
     bool Start(const Settings &settings, ProcessIdentity target);
     bool Recover(const fs::path &directory, const Settings *currentTools = nullptr);
     void Stop();

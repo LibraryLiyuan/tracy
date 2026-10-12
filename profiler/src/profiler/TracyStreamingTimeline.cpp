@@ -541,6 +541,7 @@ void StreamingTimeline::SetRange( int64_t begin, int64_t end )
 
 void StreamingTimeline::ZoomToRange( int64_t begin, int64_t end )
 {
+    if(m_webInteraction){SetRange(begin,end);return;}
     if( begin == end ) end = begin + 1;
     m_highlightZoom.active = false;
     m_zoomAnim.active = true;
@@ -1431,6 +1432,7 @@ void StreamingTimeline::HandleMouse( float x0, float w )
         double mod = 0.25;
         if( io.KeyCtrl ) mod = 0.05;
         else if( io.KeyShift ) mod = 0.5;
+        if(m_webInteraction)mod=1.0-std::pow(1.0-mod,std::min(4.0,double(std::abs(wheel))));
         if( wheel > 0 )
         {
             t0 += int64_t( p1 * mod );
@@ -2565,6 +2567,11 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         y += ostep;
         const auto found = expanded ? loaded.find( std::make_pair( lane.id, lane.gpu ) ) : loaded.end();
         const LaneData* data = found == loaded.end() ? nullptr : found->second;
+        if( key == m_reportFocusKey && m_reportScrolling && data )
+        {
+            ImGui::SetScrollY( std::max( 0.f, y + m_reportDepth * ostep - lanesHeight * 0.30f ) );
+            if( !Busy() && ++m_reportStable >= 4 ) m_reportScrolling = false;
+        }
         if( expanded )
         {
             // Row tops: the groups of a GPU context are below each other,
@@ -2593,6 +2600,7 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
                 const auto laneTop = wpos.y + y;
                 if( laneTop < yMax && laneTop + contentHeight > yMin )
                 {
+                    if( key == m_reportFocusKey ) stats.focusLaneVisible = true;
                     stats.lanes++;
                     ImGui::PushClipRect( ImVec2( wpos.x, std::max( laneTop, yMin ) ), ImVec2( wpos.x + w, std::min( laneTop + contentHeight, yMax ) ), true );
                     if( labels )
@@ -2612,6 +2620,7 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
                         if( top > yMax || top + ostep < yMin ) continue;
                         const auto pr0 = double( item.start - m_begin ) * pxns, pr1 = double( item.end - m_begin ) * pxns;
                         if( pr1 < -10 || pr0 > w + 10 ) continue;
+                        if( item.kind == Kind::Zone && item.id == selected && lane.gpu == selectedGpu ) stats.selectedVisible = true;
                         const auto& source = item.source < statics->sources.size() ? statics->sources[item.source] : statics->sources.front();
                         ImVec2 a, b;
                         switch( item.kind )
@@ -2804,3 +2813,4 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
     return clicked;
 }
 }
+#include "TracyStreamingReportTimeline.inl"

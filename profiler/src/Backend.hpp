@@ -15,6 +15,8 @@ double StreamingFramePresentMilliseconds();
 double StreamingFrameCpuMilliseconds();
 // Saves the next rendered frame as a PNG at `path`.
 void RequestStreamingScreenshot(const char* path);
+void ConfigureStreamingWeb(const char* channel);
+void UpdateStreamingWebState(uint64_t input,uint64_t navigation,int64_t begin,int64_t end,uint64_t selected,uint32_t flags,uint64_t queued);
 #endif
 
 class RunQueue;
