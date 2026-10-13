@@ -7,10 +7,13 @@
 namespace tracy
 {
 
+// Up to 5% slower than the target still counts as on target: the jitter of
+// frames paced by a display that refreshes just under the target rate, such
+// as 59.94 Hz for 60 FPS.
 static uint32_t GetFrameColor( uint64_t time, uint64_t target )
 {
     return time > target * 2 ? 0xFF2222DD :
-           time > target     ? 0xFF22DDDD :
+           time > target * 100 / 95 ? 0xFF22DDDD :
            time > target / 2 ? 0xFF22DD22 : 0xFFDD9900;
 }
 

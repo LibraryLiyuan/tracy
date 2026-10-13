@@ -40,6 +40,21 @@ struct UsageData
     // The engines the lane shows: 3D, and the others that ran the game's
     // work at some point.
     std::array<bool, JnUsage::Engines> engineShown {};
+    // The display plots, and from them the frames the display showed: each
+    // from the refresh the frame before it appeared at (or the earliest it
+    // could have) to the refresh it appeared at. A point that covers several
+    // frames is one entry.
+    VramSeries displayRefreshes, displayFrames;
+    struct DisplayFrame
+    {
+        int64_t start, end;
+        uint32_t refreshes, frames;
+        // The refreshes the frames waited past one each.
+        uint32_t Missed() const { return refreshes > frames ? refreshes - frames : 0; }
+    };
+    std::vector<DisplayFrame> display;
+    // The display's refresh period, from the frames that took one refresh.
+    int64_t refreshPeriod = 0;
     // The sampling interval, from the processor description or the plots.
     int64_t interval = 100'000'000;
     int64_t lastTime = 0;
@@ -60,11 +75,14 @@ struct UsageData
     void ParseAppInfo( std::string_view text );
     // Orders the series by time once loaded and settles the fallbacks.
     void Finish();
+    // Builds the display frames from the display plots.
+    void FinishDisplay();
     bool HasCpu() const;
     bool HasCores() const;
     bool HasMemory() const;
     bool HasGpu() const;
-    bool Empty() const { return !HasCpu() && !HasMemory() && !HasGpu(); }
+    bool HasDisplay() const { return !display.empty(); }
+    bool Empty() const { return !HasCpu() && !HasMemory() && !HasGpu() && !HasDisplay(); }
     // Whether the processors have two core types, and whether one is an
     // efficiency core.
     bool Hybrid() const;
@@ -83,9 +101,21 @@ enum class UsageLane : uint8_t
     Memory,
     // The process's use of each GPU engine.
     Gpu,
+    // The frames the display showed against its refreshes (VSync).
+    Display,
     NUM
 };
 constexpr int UsageLanes = int( UsageLane::NUM );
+
+// The time the GPU's direct queue was busy in a range, for the display
+// lane's tooltip: the union of its top-level zones there, approximate when
+// some were folded together. Empty when the zones there are not loaded.
+struct GpuBusy
+{
+    int64_t busy = 0;
+    bool approximate = false;
+};
+using GpuBusyFn = std::function<std::optional<GpuBusy>( int64_t begin, int64_t end )>;
 
 const char* UsageLaneLabel( UsageLane lane );
 bool UsageLanePresent( const UsageData& data, UsageLane lane );
@@ -94,7 +124,8 @@ float UsageLaneHeight( const UsageData& data, UsageLane lane, float plotHeight )
 // Draws a lane in `area`, as tall as UsageLaneHeight gives for `plotHeight`,
 // with a legend of what it shows on the header row (VramPlotArea::legendMinX).
 // Returns the time under the mouse, after showing its tooltip.
-std::optional<int64_t> DrawUsageLane( ImDrawList* draw, const VramPlotArea& area, const UsageData& data, UsageLane lane, float plotHeight );
+std::optional<int64_t> DrawUsageLane( ImDrawList* draw, const VramPlotArea& area, const UsageData& data, UsageLane lane, float plotHeight,
+    const GpuBusyFn& gpuBusy = {} );
 // The header tooltip of a lane: its peaks and averages over the capture.
 void UsageLaneTooltip( const UsageData& data, UsageLane lane );
 

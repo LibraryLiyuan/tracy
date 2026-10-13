@@ -2,6 +2,7 @@
 #include "TracyColor.hpp"
 #include "TracyImGui.hpp"
 #include "TracyMouse.hpp"
+#include "TracyTexture.hpp"
 #include "TracyUtility.hpp"
 #include "../Fonts.hpp"
 #include "../../../public/common/TracyProtocol.hpp"
@@ -343,10 +344,19 @@ StreamingTimeline::~StreamingTimeline()
         std::lock_guard lock( m_vramMutex );
         m_vramSignal.notify_all();
     }
+    {
+        std::lock_guard lock( m_shotMutex );
+        m_shotSignal.notify_all();
+    }
     if( m_thread.joinable() ) m_thread.join();
     if( m_rootsThread.joinable() ) m_rootsThread.join();
     if( m_skeletonThread.joinable() ) m_skeletonThread.join();
     if( m_vramThread.joinable() ) m_vramThread.join();
+    if( m_shotThread.joinable() ) m_shotThread.join();
+    // The view is destroyed on the GUI thread.
+    const auto now = []( const std::function<void()>& fn, bool ) { fn(); };
+    for( const auto& [id, thumbnail] : m_thumbnails ) FreeTexture( thumbnail.texture, now );
+    if( m_picture.texture ) FreeTexture( m_picture.texture, now );
 }
 
 std::optional<int64_t> StreamingTimeline::ParseTimeText( const std::string& text )
@@ -465,6 +475,653 @@ std::optional<int64_t> StreamingTimeline::TakeVramClick()
     const auto click = m_vramClick;
     m_vramClick.reset();
     return click;
+}
+
+namespace
+{
+// Thumbnails decode this tall, crisp in the large strip at 1.5 times the UI
+// scale; past MaxThumbnails uploaded, the least recently drawn go.
+constexpr int ThumbnailHeight = 128;
+constexpr size_t MaxThumbnails = 160;
+// The strip's thumbnail heights at UI scale 1: small, medium and large.
+constexpr float ShotHeights[] = { 40, 56, 80 };
+constexpr const char* ShotSizeNames[] = { "Small", "Medium", "Large" };
+
+uint32_t Average4( uint32_t a, uint32_t b, uint32_t c, uint32_t d )
+{
+    uint32_t out = 0;
+    for( int shift = 0; shift < 32; shift += 8 )
+        out |= ( ( ( ( a >> shift ) & 0xFF ) + ( ( b >> shift ) & 0xFF ) + ( ( c >> shift ) & 0xFF ) + ( ( d >> shift ) & 0xFF ) + 2 ) / 4 ) << shift;
+    return out;
+}
+
+// A box filter of an RGBA picture to dw x dh, turned upright when flip.
+std::vector<uint32_t> Resample( const std::vector<uint32_t>& src, int sw, int sh, int dw, int dh, bool flip )
+{
+    std::vector<uint32_t> dst( size_t( dw ) * dh );
+    for( int y = 0; y < dh; ++y )
+    {
+        const int y0 = int( int64_t( y ) * sh / dh ), y1 = std::max( y0 + 1, int( int64_t( y + 1 ) * sh / dh ) );
+        for( int x = 0; x < dw; ++x )
+        {
+            const int x0 = int( int64_t( x ) * sw / dw ), x1 = std::max( x0 + 1, int( int64_t( x + 1 ) * sw / dw ) );
+            uint32_t sum[4] = {};
+            uint32_t n = 0;
+            for( int sy = y0; sy < y1; ++sy )
+            {
+                const auto row = src.data() + size_t( flip ? sh - 1 - sy : sy ) * sw;
+                for( int sx = x0; sx < x1; ++sx )
+                {
+                    const auto p = row[sx];
+                    for( int c = 0; c < 4; ++c ) sum[c] += ( p >> ( c * 8 ) ) & 0xFF;
+                    n++;
+                }
+            }
+            uint32_t out = 0;
+            for( int c = 0; c < 4; ++c ) out |= ( ( sum[c] + n / 2 ) / n ) << ( c * 8 );
+            dst[size_t( y ) * dw + x] = out;
+        }
+    }
+    return dst;
+}
+
+// The mip levels under the last one, halving down to 1x1 as OpenGL sizes them.
+void AddMips( std::vector<std::vector<uint32_t>>& levels, std::vector<int>& widths, std::vector<int>& heights )
+{
+    while( widths.back() > 1 || heights.back() > 1 )
+    {
+        const int sw = widths.back(), sh = heights.back();
+        const int dw = std::max( 1, sw / 2 ), dh = std::max( 1, sh / 2 );
+        std::vector<uint32_t> dst( size_t( dw ) * dh );
+        const auto& src = levels.back();
+        for( int y = 0; y < dh; ++y )
+        {
+            const int y0 = std::min( y * 2, sh - 1 ), y1 = std::min( y * 2 + 1, sh - 1 );
+            for( int x = 0; x < dw; ++x )
+            {
+                const int x0 = std::min( x * 2, sw - 1 ), x1 = std::min( x * 2 + 1, sw - 1 );
+                dst[size_t( y ) * dw + x] = Average4( src[size_t( y0 ) * sw + x0], src[size_t( y0 ) * sw + x1], src[size_t( y1 ) * sw + x0], src[size_t( y1 ) * sw + x1] );
+            }
+        }
+        levels.push_back( std::move( dst ) );
+        widths.push_back( dw );
+        heights.push_back( dh );
+    }
+}
+}
+
+std::shared_ptr<const std::vector<StreamingTimeline::Shot>> StreamingTimeline::Shots() const
+{
+    std::lock_guard lock( m_shotMutex );
+    return m_shots;
+}
+
+void StreamingTimeline::ServeShots( stream::EventStore& store )
+{
+    auto shots = std::make_shared<std::vector<Shot>>();
+    for( uint64_t after = 0;; )
+    {
+        if( m_stop ) return;
+        const auto page = store.FrameImages( after, 512 );
+        for( const auto& image : page.values )
+        {
+            // A screenshot shows under the frame it belongs to, once that is recorded.
+            if( !image.start || image.width == 0 || image.height == 0 || image.width % 4 != 0 || image.height % 4 != 0 ||
+                image.bc1Bytes != uint64_t( image.width ) * image.height / 2 ) continue;
+            Shot shot;
+            shot.id = image.id;
+            shot.frame = image.frameIndex;
+            shot.start = *image.start;
+            shot.end = image.end.value_or( *image.start );
+            shot.width = image.width;
+            shot.height = image.height;
+            shot.flipped = image.flipped;
+            shots->push_back( shot );
+        }
+        if( !page.more ) break;
+        after = page.next;
+    }
+    std::stable_sort( shots->begin(), shots->end(), []( const Shot& a, const Shot& b ) { return a.start < b.start; } );
+    std::unordered_map<uint64_t, size_t> byId;
+    for( size_t i = 0; i < shots->size(); ++i ) byId.emplace( ( *shots )[i].id, i );
+    {
+        std::lock_guard lock( m_shotMutex );
+        m_shots = shots;
+    }
+    m_published = true;
+    // The viewer's picture before the thumbnails, which go in the order asked.
+    while( !m_stop )
+    {
+        uint64_t id = 0;
+        bool picture = false;
+        {
+            std::unique_lock lock( m_shotMutex );
+            m_shotSignal.wait( lock, [&] { return m_stop.load() || m_pictureWanted != m_pictureServed || !m_thumbQueue.empty(); } );
+            if( m_stop ) return;
+            if( m_pictureWanted != m_pictureServed )
+            {
+                id = m_pictureWanted;
+                m_pictureServed = id;
+                picture = true;
+            }
+            else
+            {
+                id = m_thumbQueue.front();
+                m_thumbQueue.erase( m_thumbQueue.begin() );
+                if( std::any_of( m_thumbReady.begin(), m_thumbReady.end(), [id]( const ShotPixels& p ) { return p.id == id; } ) ) continue;
+            }
+        }
+        // A screenshot that cannot be read comes back without levels, so that
+        // it is not asked for again.
+        ShotPixels pixels;
+        pixels.id = id;
+        const auto found = byId.find( id );
+        if( found != byId.end() )
+        {
+            const auto& shot = ( *shots )[found->second];
+            const auto bc1Bytes = size_t( shot.width ) * shot.height / 2;
+            std::vector<uint8_t> bytes;
+            bytes.reserve( bc1Bytes );
+            try
+            {
+                for( uint64_t offset = 0; !m_stop; )
+                {
+                    auto chunk = store.FrameImageBytes( shot.id, offset, 1 << 20 );
+                    bytes.insert( bytes.end(), chunk.data.begin(), chunk.data.end() );
+                    offset += chunk.data.size();
+                    if( !chunk.more || chunk.data.empty() ) break;
+                }
+            }
+            catch( const std::exception& )
+            {
+                bytes.clear();
+            }
+            if( bytes.size() == bc1Bytes )
+            {
+                std::vector<uint32_t> rgba( size_t( shot.width ) * shot.height );
+                DecodeBc1( reinterpret_cast<const char*>( bytes.data() ), shot.width, shot.height, rgba.data() );
+                int height = shot.height, width = shot.width;
+                if( !picture && height > ThumbnailHeight )
+                {
+                    height = ThumbnailHeight;
+                    width = std::max( 1, int( std::lround( double( shot.width ) * height / shot.height ) ) );
+                }
+                pixels.levels.push_back( Resample( rgba, shot.width, shot.height, width, height, shot.flipped ) );
+                pixels.widths.push_back( width );
+                pixels.heights.push_back( height );
+                AddMips( pixels.levels, pixels.widths, pixels.heights );
+            }
+        }
+        {
+            std::lock_guard lock( m_shotMutex );
+            if( picture ) m_pictureReady = std::move( pixels );
+            else m_thumbReady.push_back( std::move( pixels ) );
+        }
+        m_published = true;
+    }
+}
+
+void StreamingTimeline::TakeShots()
+{
+    std::vector<ShotPixels> thumbnails;
+    std::optional<ShotPixels> picture;
+    {
+        std::lock_guard lock( m_shotMutex );
+        thumbnails.swap( m_thumbReady );
+        picture.swap( m_pictureReady );
+    }
+    const auto now = []( const std::function<void()>& fn, bool ) { fn(); };
+    const auto upload = [&]( ShotTexture& texture, ShotPixels& pixels ) {
+        // A new size takes a new texture: the old one's mip levels differ.
+        if( texture.texture && ( texture.width != pixels.widths.front() || texture.height != pixels.heights.front() ) )
+        {
+            FreeTexture( texture.texture, now );
+            texture.texture = 0;
+        }
+        if( !texture.texture ) texture.texture = MakeImageTexture();
+        std::vector<void*> data;
+        for( auto& level : pixels.levels ) data.push_back( level.data() );
+        UpdateTextureRGBAMips( texture.texture, data.data(), pixels.widths.data(), pixels.heights.data(), data.size() );
+        texture.width = pixels.widths.front();
+        texture.height = pixels.heights.front();
+    };
+    for( auto& pixels : thumbnails )
+    {
+        auto& texture = m_thumbnails[pixels.id];
+        if( !pixels.levels.empty() ) upload( texture, pixels );
+        texture.used = m_shotTick;
+    }
+    if( picture && picture->id == m_viewerShot )
+    {
+        m_pictureValid = !picture->levels.empty();
+        if( m_pictureValid ) upload( m_picture, *picture );
+        m_pictureId = picture->id;
+    }
+    if( m_thumbnails.size() > MaxThumbnails )
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> ages;
+        for( const auto& [id, texture] : m_thumbnails ) ages.emplace_back( texture.used, id );
+        std::sort( ages.begin(), ages.end() );
+        for( const auto& [used, id] : ages )
+        {
+            if( m_thumbnails.size() <= MaxThumbnails * 3 / 4 || used == m_shotTick ) break;
+            const auto found = m_thumbnails.find( id );
+            if( found->second.texture ) FreeTexture( found->second.texture, now );
+            m_thumbnails.erase( found );
+        }
+    }
+}
+
+void StreamingTimeline::WantThumbnails( std::vector<uint64_t> ids )
+{
+    ids.erase( std::remove_if( ids.begin(), ids.end(), [this]( uint64_t id ) { return m_thumbnails.count( id ) != 0; } ), ids.end() );
+    if( ids == m_thumbsAsked ) return;
+    m_thumbsAsked = ids;
+    {
+        std::lock_guard lock( m_shotMutex );
+        m_thumbQueue = std::move( ids );
+    }
+    m_shotSignal.notify_all();
+}
+
+const StreamingTimeline::ShotTexture* StreamingTimeline::Thumbnail( uint64_t id )
+{
+    const auto found = m_thumbnails.find( id );
+    if( found == m_thumbnails.end() ) return nullptr;
+    found->second.used = m_shotTick;
+    return found->second.texture ? &found->second : nullptr;
+}
+
+bool StreamingTimeline::OpenMiddleScreenshot()
+{
+    const auto shots = Shots();
+    if( !shots || shots->empty() ) return false;
+    OpenShot( ( *shots )[shots->size() / 2].id );
+    return true;
+}
+
+bool StreamingTimeline::ScreenshotsSettled() const
+{
+    std::lock_guard lock( m_shotMutex );
+    return m_shots && m_thumbQueue.empty() && m_thumbReady.empty() && m_thumbsAsked.empty() && ( !m_viewerOpen || m_pictureId == m_viewerShot );
+}
+
+void StreamingTimeline::WantPicture( uint64_t id )
+{
+    {
+        std::lock_guard lock( m_shotMutex );
+        m_pictureWanted = id;
+    }
+    m_shotSignal.notify_all();
+}
+
+void StreamingTimeline::OpenShot( uint64_t id )
+{
+    m_viewerOpen = true;
+    m_viewerFocusWindow = true;
+    m_viewerShot = id;
+    WantPicture( id );
+}
+
+void StreamingTimeline::GoToShot( const Shot& shot )
+{
+    // The frame's end, or the next frame's start when it has none.
+    auto end = shot.end;
+    if( end <= shot.start )
+    {
+        end = shot.start + 1;
+        if( const auto statics = CurrentStatics() )
+        {
+            for( const auto& set : statics->frameSets )
+            {
+                if( !set.base ) continue;
+                const auto next = std::upper_bound( set.starts.begin(), set.starts.end(), shot.start );
+                if( next != set.starts.end() ) end = *next;
+                break;
+            }
+        }
+    }
+    ZoomToRange( shot.start, end );
+}
+
+float StreamingTimeline::ShotStripHeight() const
+{
+    return std::round( ( ShotHeights[std::clamp( m_shotSize, 0, 2 )] + 6 ) * GetScale() );
+}
+
+std::optional<float> StreamingTimeline::DrawShotStrip( ImVec2 pos, float height, int columns, float labelWidth, const std::function<std::optional<float>( int64_t )>& timeX )
+{
+    const auto shots = Shots();
+    ImGui::InvisibleButton( "##screenshots", ImVec2( float( columns + 2 ) + labelWidth, height ), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle );
+    const bool hover = ImGui::IsItemHovered();
+    if( hover ) ImGui::SetItemKeyOwner( ImGuiKey_MouseWheelY );
+    if( !shots || shots->empty() ) return std::nullopt;
+    const auto& list = *shots;
+    auto draw = ImGui::GetWindowDrawList();
+    const auto scale = GetScale();
+    const auto ty = ImGui::GetTextLineHeight();
+    const auto pad = std::round( 3 * scale );
+    const auto gap = std::round( 3 * scale );
+    const auto th = height - 2 * pad;
+    draw->AddRectFilled( pos, pos + ImVec2( float( columns + 2 ), height ), 0x1AFFFFFF );
+
+    // Each screenshot under the middle of its frame's bar, as wide as its
+    // picture at the strip's height, kept inside the strip.
+    struct Mark
+    {
+        size_t index;
+        float x, x0, x1;
+    };
+    std::vector<Mark> marks;
+    for( size_t i = 0; i < list.size(); ++i )
+    {
+        const auto x = timeX( list[i].start );
+        if( !x ) continue;
+        const auto tw = std::max( 4.f, std::round( th * list[i].width / float( std::max<uint16_t>( 1, list[i].height ) ) ) );
+        const auto x0 = std::round( std::clamp( *x - tw * 0.5f, 1.f, std::max( 1.f, float( columns + 1 ) - tw ) ) );
+        marks.push_back( { i, *x, x0, x0 + tw } );
+    }
+    // The viewer's screenshot keeps its place; the others fill in from the
+    // left wherever they cover no shown one. Ticks mark them all.
+    const Mark* kept = nullptr;
+    if( m_viewerOpen )
+        for( const auto& mark : marks )
+            if( list[mark.index].id == m_viewerShot ) kept = &mark;
+    std::vector<const Mark*> shown;
+    float right = -1e9f;
+    for( const auto& mark : marks )
+    {
+        if( &mark != kept )
+        {
+            if( mark.x0 < right + gap ) continue;
+            if( kept && mark.x1 + gap > kept->x0 && mark.x0 < kept->x1 + gap ) continue;
+        }
+        shown.push_back( &mark );
+        right = mark.x1;
+    }
+
+    // The screenshot under the mouse: a shown one, else the nearest tick.
+    const auto mouse = ImGui::GetIO().MousePos;
+    const Mark* hovered = nullptr;
+    if( hover && mouse.x < pos.x + columns + 2 )
+    {
+        for( const auto* mark : shown )
+            if( mouse.x >= pos.x + mark->x0 && mouse.x < pos.x + mark->x1 && mouse.y >= pos.y + pad && mouse.y < pos.y + pad + th ) hovered = mark;
+        if( !hovered )
+        {
+            float best = 6 * scale;
+            for( const auto& mark : marks )
+            {
+                const auto d = std::abs( pos.x + mark.x - mouse.x );
+                if( d <= best )
+                {
+                    best = d;
+                    hovered = &mark;
+                }
+            }
+        }
+    }
+
+    // The thumbnails wanted: the hovered and the viewer's first, then the
+    // shown ones from the left.
+    std::vector<uint64_t> wanted;
+    if( hovered ) wanted.push_back( list[hovered->index].id );
+    if( kept && kept != hovered ) wanted.push_back( list[kept->index].id );
+    for( const auto* mark : shown )
+        if( mark != hovered && mark != kept ) wanted.push_back( list[mark->index].id );
+    WantThumbnails( std::move( wanted ) );
+
+    for( const auto& mark : marks )
+    {
+        const auto x = std::round( pos.x + mark.x ) + 0.5f;
+        draw->AddLine( ImVec2( x, pos.y ), ImVec2( x, pos.y + pad ), &mark == hovered ? 0xFFFFFFFF : 0x88FFFFFF );
+    }
+    for( const auto* mark : shown )
+    {
+        const auto& shot = list[mark->index];
+        const ImVec2 a( pos.x + mark->x0, pos.y + pad ), b( pos.x + mark->x1, pos.y + pad + th );
+        if( const auto texture = Thumbnail( shot.id ) ) draw->AddImage( texture->texture, a, b );
+        else draw->AddRectFilled( a, b, 0xFF2A2A2A );
+        uint32_t border = 0x40FFFFFF;
+        float thickness = 1;
+        if( mark == kept )
+        {
+            border = 0xFF44DD44;
+            thickness = 2 * scale;
+        }
+        if( mark == hovered )
+        {
+            border = 0xFFFFFFFF;
+            thickness = 2 * scale;
+        }
+        draw->AddRect( a, b, border, 0, 0, thickness );
+    }
+    // The count right of the strip, under the graph's guide labels.
+    char count[32];
+    snprintf( count, sizeof( count ), ICON_FA_IMAGE " %s", RealToString( list.size() ) );
+    const auto countPos = ImVec2( pos.x + columns + 2 + ty * 0.5f, pos.y + ( height - ty ) * 0.5f );
+    draw->AddText( countPos, ImGui::GetColorU32( ImGuiCol_TextDisabled ), count );
+
+    if( hovered )
+    {
+        const auto& shot = list[hovered->index];
+        ImGui::BeginTooltip();
+        if( const auto texture = Thumbnail( shot.id ) ) ImGui::Image( texture->texture, ImVec2( float( texture->width ), float( texture->height ) ) );
+        else ImGui::TextDisabled( "Loading the screenshot..." );
+        ImGui::Text( "Screenshot %s of %s", RealToString( hovered->index + 1 ), RealToString( list.size() ) );
+        TextFocused( "Frame:", RealToString( shot.frame ) );
+        TextFocused( "Time:", TimeToStringExact( shot.start ) );
+        if( shot.end > shot.start )
+        {
+            TextFocused( "Frame time:", TimeToString( shot.end - shot.start ) );
+            ImGui::SameLine();
+            ImGui::TextDisabled( "(%.1f FPS)", 1e9 / double( shot.end - shot.start ) );
+        }
+        ImGui::Separator();
+        TextDisabledUnformatted( "Click to view it large; double-click or middle-click to show its frame." );
+        ImGui::EndTooltip();
+        if( IsMouseClicked( 0 ) ) OpenShot( shot.id );
+        if( ImGui::IsMouseDoubleClicked( ImGuiMouseButton_Left ) || IsMouseClicked( 2 ) ) GoToShot( shot );
+    }
+    else if( hover && mouse.x >= pos.x + columns + 2 )
+    {
+        ImGui::BeginTooltip();
+        ImGui::Text( "%s screenshots", RealToString( list.size() ) );
+        ImGui::Separator();
+        TextDisabledUnformatted( "Each under its frame's bar; ticks mark those without room for a thumbnail." );
+        TextDisabledUnformatted( "Hover one for a preview, click it to view it large, double-click to show its frame." );
+        TextDisabledUnformatted( "The wheel and a right drag zoom and scroll the strip with the frame graph." );
+        TextDisabledUnformatted( "Right-click for the thumbnail size." );
+        ImGui::EndTooltip();
+    }
+    // A right click that does not drag opens the strip's menu.
+    if( hover && IsMouseClickReleased( 1 ) ) ImGui::OpenPopup( "##screenshotsMenu" );
+    if( ImGui::BeginPopup( "##screenshotsMenu" ) )
+    {
+        ImGui::TextDisabled( "Thumbnail size" );
+        for( int size = 0; size < 3; ++size )
+            if( ImGui::RadioButton( ShotSizeNames[size], m_shotSize == size ) ) m_shotSize = size;
+        ImGui::Separator();
+        if( ImGui::Selectable( "Hide the screenshot strip" ) ) m_drawShots = false;
+        ImGui::TextDisabled( "(Options bring it back)" );
+        ImGui::EndPopup();
+    }
+    if( hovered ) return hovered->x;
+    if( kept ) return kept->x;
+    return std::nullopt;
+}
+
+void StreamingTimeline::DrawScreenshotViewer()
+{
+    if( !m_viewerOpen ) return;
+    TakeShots();
+    const auto shots = Shots();
+    const auto found = shots ? std::find_if( shots->begin(), shots->end(), [this]( const Shot& shot ) { return shot.id == m_viewerShot; } ) : std::vector<Shot>::const_iterator();
+    if( !shots || found == shots->end() )
+    {
+        m_viewerOpen = false;
+        return;
+    }
+    const auto& list = *shots;
+    auto index = int( found - list.begin() );
+    const auto viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowSize( ImVec2( viewport->WorkSize.x * 0.55f, viewport->WorkSize.y * 0.65f ), ImGuiCond_FirstUseEver );
+    ImGui::SetNextWindowPos( ImVec2( viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + viewport->WorkSize.y * 0.5f ), ImGuiCond_FirstUseEver, ImVec2( 0.5f, 0.5f ) );
+    if( m_viewerFocusWindow )
+    {
+        ImGui::SetNextWindowFocus();
+        ImGui::SetNextWindowCollapsed( false );
+        m_viewerFocusWindow = false;
+    }
+    char title[160];
+    snprintf( title, sizeof( title ), ICON_FA_IMAGE " Screenshot %s of %s \xc2\xb7 frame %s###StreamingScreenshotViewer", RealToString( index + 1 ), RealToString( list.size() ), RealToString( list[index].frame ) );
+    bool open = true;
+    const bool visible = ImGui::Begin( title, &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
+    if( !open ) m_viewerOpen = false;
+    if( !visible )
+    {
+        ImGui::End();
+        return;
+    }
+    auto& io = ImGui::GetIO();
+    // Keys while the viewer has focus: the arrows, Home and End step through
+    // the screenshots, F fits, 1 shows the picture's own pixels, G shows its
+    // frame and Esc closes.
+    int target = index;
+    bool fitNow = false, actual = false, go = false;
+    if( ImGui::IsWindowFocused( ImGuiFocusedFlags_RootAndChildWindows ) && !io.WantTextInput )
+    {
+        if( ImGui::IsKeyPressed( ImGuiKey_LeftArrow ) ) target--;
+        if( ImGui::IsKeyPressed( ImGuiKey_RightArrow ) ) target++;
+        if( ImGui::IsKeyPressed( ImGuiKey_Home, false ) ) target = 0;
+        if( ImGui::IsKeyPressed( ImGuiKey_End, false ) ) target = int( list.size() ) - 1;
+        if( ImGui::IsKeyPressed( ImGuiKey_F, false ) ) fitNow = true;
+        if( ImGui::IsKeyPressed( ImGuiKey_1, false ) ) actual = true;
+        if( ImGui::IsKeyPressed( ImGuiKey_G, false ) ) go = true;
+        if( ImGui::IsKeyPressed( ImGuiKey_Escape, false ) ) m_viewerOpen = false;
+    }
+    ImGui::BeginDisabled( index == 0 );
+    if( ImGui::Button( ICON_FA_CARET_LEFT ) ) target = index - 1;
+    ImGui::EndDisabled();
+    TooltipIfHovered( "The previous screenshot (Left arrow; Home for the first)" );
+    ImGui::SameLine();
+    ImGui::Text( "%s / %s", RealToString( index + 1 ), RealToString( list.size() ) );
+    ImGui::SameLine();
+    ImGui::BeginDisabled( index + 1 >= int( list.size() ) );
+    if( ImGui::Button( ICON_FA_CARET_RIGHT ) ) target = index + 1;
+    ImGui::EndDisabled();
+    TooltipIfHovered( "The next screenshot (Right arrow; End for the last)" );
+    ImGui::SameLine();
+    if( ImGui::Button( ICON_FA_CROSSHAIRS " Show frame" ) ) go = true;
+    TooltipIfHovered( "Zooms the timeline to this screenshot's frame (G)" );
+    ImGui::SameLine();
+    ImGui::Checkbox( "Follow", &m_viewerFollow );
+    TooltipIfHovered( "Stepping through the screenshots shows each one's frame in the timeline" );
+    ImGui::SameLine();
+    if( ImGui::Button( "Fit" ) ) fitNow = true;
+    TooltipIfHovered( "The whole picture in the window (F, or double-click when zoomed in)" );
+    ImGui::SameLine();
+    if( ImGui::Button( "1:1" ) ) actual = true;
+    TooltipIfHovered( "One screen pixel per picture pixel (1)" );
+    ImGui::SameLine();
+    ImGui::TextDisabled( ICON_FA_CIRCLE_QUESTION );
+    if( ImGui::IsItemHovered() )
+    {
+        ImGui::BeginTooltip();
+        TextDisabledUnformatted( "Wheel: zoom at the mouse \xc2\xb7 drag: pan \xc2\xb7 double-click: zoom in there, or back to fit" );
+        TextDisabledUnformatted( "Left / Right: previous / next \xc2\xb7 Home / End: first / last" );
+        TextDisabledUnformatted( "F: fit \xc2\xb7 1: 1:1 \xc2\xb7 G: show the frame in the timeline \xc2\xb7 Esc: close" );
+        TextDisabledUnformatted( "The zoom stays while stepping, so the same spot can be compared across screenshots." );
+        ImGui::EndTooltip();
+    }
+    target = std::clamp( target, 0, int( list.size() ) - 1 );
+    if( target != index )
+    {
+        index = target;
+        m_viewerShot = list[index].id;
+        WantPicture( m_viewerShot );
+        if( m_viewerFollow ) GoToShot( list[index] );
+    }
+    const auto& shot = list[index];
+    if( go ) GoToShot( shot );
+    ImGui::SameLine();
+    if( shot.end > shot.start ) ImGui::TextDisabled( "%s \xc2\xb7 frame time %s (%.1f FPS)", TimeToStringExact( shot.start ), TimeToString( shot.end - shot.start ), 1e9 / double( shot.end - shot.start ) );
+    else ImGui::TextDisabled( "%s", TimeToStringExact( shot.start ) );
+
+    // The picture: fitted to the window until zoomed, then at the zoom
+    // around the picture's point at the middle of the window.
+    ImGui::BeginChild( "##picture", ImVec2( 0, 0 ), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
+    const auto origin = ImGui::GetCursorScreenPos();
+    const auto area = ImVec2( std::max( 1.f, ImGui::GetContentRegionAvail().x ), std::max( 1.f, ImGui::GetContentRegionAvail().y ) );
+    ImGui::InvisibleButton( "##view", area, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle );
+    const bool hovered = ImGui::IsItemHovered();
+    if( hovered ) ImGui::SetItemKeyOwner( ImGuiKey_MouseWheelY );
+    const float w = shot.width, h = shot.height;
+    const float fitScale = std::min( area.x / w, area.y / h );
+    if( fitNow ) m_viewerZoom = 0;
+    if( actual )
+    {
+        m_viewerZoom = 1;
+        m_viewerCenter = ImVec2( w * 0.5f, h * 0.5f );
+    }
+    const ImVec2 middle( origin.x + area.x * 0.5f, origin.y + area.y * 0.5f );
+    const auto viewScale = [&] { return m_viewerZoom > 0 ? m_viewerZoom : fitScale; };
+    const auto viewCenter = [&] { return m_viewerZoom > 0 ? m_viewerCenter : ImVec2( w * 0.5f, h * 0.5f ); };
+    if( hovered )
+    {
+        const auto s = viewScale();
+        const auto c = viewCenter();
+        // The picture's point under the mouse stays under it as the zoom changes.
+        const ImVec2 point( c.x + ( io.MousePos.x - middle.x ) / s, c.y + ( io.MousePos.y - middle.y ) / s );
+        const auto zoomTo = [&]( float zoom ) {
+            if( zoom <= fitScale * 1.0001f )
+            {
+                m_viewerZoom = 0;
+                return;
+            }
+            m_viewerZoom = zoom;
+            m_viewerCenter = ImVec2( point.x - ( io.MousePos.x - middle.x ) / zoom, point.y - ( io.MousePos.y - middle.y ) / zoom );
+        };
+        if( io.MouseWheel != 0 ) zoomTo( std::clamp( s * std::pow( 1.25f, io.MouseWheel ), fitScale, std::max( fitScale, 32.f ) ) );
+        if( ImGui::IsMouseDoubleClicked( ImGuiMouseButton_Left ) )
+        {
+            if( m_viewerZoom > 0 ) m_viewerZoom = 0;
+            else zoomTo( std::max( 1.f, fitScale * 2 ) );
+        }
+    }
+    if( ImGui::IsItemActive() && m_viewerZoom > 0 && ( ImGui::IsMouseDragging( ImGuiMouseButton_Left, 0 ) || ImGui::IsMouseDragging( ImGuiMouseButton_Right, 0 ) ) )
+    {
+        m_viewerCenter.x -= io.MouseDelta.x / m_viewerZoom;
+        m_viewerCenter.y -= io.MouseDelta.y / m_viewerZoom;
+    }
+    m_viewerCenter = ImVec2( std::clamp( m_viewerCenter.x, 0.f, w ), std::clamp( m_viewerCenter.y, 0.f, h ) );
+    const auto s = viewScale();
+    const auto c = viewCenter();
+    const ImVec2 a( middle.x - c.x * s, middle.y - c.y * s ), b( a.x + w * s, a.y + h * s );
+    auto draw = ImGui::GetWindowDrawList();
+    draw->PushClipRect( origin, origin + area, true );
+    draw->AddRectFilled( origin, origin + area, 0xFF141414 );
+    const auto ty = ImGui::GetTextLineHeight();
+    if( m_pictureId == shot.id && m_pictureValid && m_picture.texture )
+    {
+        draw->AddImage( m_picture.texture, a, b );
+    }
+    else if( m_pictureId == shot.id && !m_pictureValid )
+    {
+        DrawTextContrast( draw, origin + ImVec2( ty * 0.5f, ty * 0.5f ), 0xFF8888FF, "This screenshot could not be read from the event store." );
+    }
+    else
+    {
+        // The thumbnail stands in until the picture is decoded.
+        if( const auto texture = Thumbnail( shot.id ) ) draw->AddImage( texture->texture, a, b );
+        DrawTextContrast( draw, origin + ImVec2( ty * 0.5f, ty * 0.5f ), 0xFFCCCCCC, "Loading the picture..." );
+    }
+    char info[64];
+    snprintf( info, sizeof( info ), "%.0f%% \xc2\xb7 %d x %d", s * 100, shot.width, shot.height );
+    DrawTextContrast( draw, ImVec2( origin.x + ty * 0.5f, origin.y + area.y - ty * 1.5f ), 0xFFCCCCCC, info );
+    draw->PopClipRect();
+    ImGui::EndChild();
+    ImGui::End();
 }
 
 void StreamingTimeline::ShowVram()
@@ -737,6 +1394,25 @@ void StreamingTimeline::Run()
                 catch( const std::exception& )
                 {
                     // The panel lists no resources.
+                }
+            } );
+        }
+        // The screenshots list and decode on a handle of their own.
+        {
+            auto shotOptions = options;
+            shotOptions.cacheBytes = 8ull << 20;
+            shotOptions.resultBytes = 16ull << 20;
+            std::shared_ptr<stream::EventStore> shotStore = store->OpenSibling( shotOptions );
+            m_shotThread = std::thread( [this, shotStore] {
+                try
+                {
+                    ServeShots( *shotStore );
+                }
+                catch( const std::exception& )
+                {
+                    // The frame graph shows no screenshot strip.
+                    std::lock_guard lock( m_shotMutex );
+                    if( !m_shots ) m_shots = std::make_shared<std::vector<Shot>>();
                 }
             } );
         }
@@ -1552,6 +2228,7 @@ void StreamingTimeline::DrawOptions()
     ImGui::SetNextItemWidth( 90 * GetScale() );
     if( ImGui::InputInt( "Target FPS", &m_frameTarget ) ) m_frameTarget = std::clamp( m_frameTarget, 1, 10000 );
     ImGui::TextDisabled( "The frame graph's colors, guide lines and FPS line, and the timeline's frame shading, follow the target." );
+    ImGui::TextDisabled( "A bar is green up to 5%% slower than the target (VSync jitter), yellow up to twice the target time, red past that." );
     ImGui::Unindent();
     ImGui::BeginDisabled( !Vram() );
     ImGui::Checkbox( ICON_FA_MICROCHIP " Draw GPU memory", &m_drawVram );
@@ -1559,11 +2236,30 @@ void StreamingTimeline::DrawOptions()
     ImGui::SameLine();
     ImGui::TextDisabled( Vram() ? "(video and system memory lanes, with the other plot lanes at the top)" : "(the capture has no GPU memory plots)" );
     ImGui::BeginDisabled( !Usage() );
-    ImGui::Checkbox( ICON_FA_GAUGE_HIGH " Draw CPU, memory and GPU usage", &m_drawUsage );
+    ImGui::Checkbox( ICON_FA_GAUGE_HIGH " Draw the display, CPU, memory and GPU usage", &m_drawUsage );
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled( Usage() ? "(CPU, memory and GPU usage lanes at the top)" : "(the capture has no usage plots)" );
+    ImGui::TextDisabled( Usage() ? "(the display (VSync) lane above the GPU, CPU, memory and GPU usage lanes)" : "(the capture has no usage plots)" );
     ImGui::TextDisabled( "The plot lanes zoom with the view: zoomed out, each pixel averages the samples it covers; zoomed in, lines join the samples. The dashed line marks the view's middle." );
+    const auto shots = Shots();
+    const bool anyShots = shots && !shots->empty();
+    ImGui::BeginDisabled( !anyShots );
+    ImGui::Checkbox( ICON_FA_IMAGE " Draw the screenshot strip", &m_drawShots );
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if( anyShots ) ImGui::TextDisabled( "(%s screenshots under the frame graph; click one to view it large)", RealToString( shots->size() ) );
+    else ImGui::TextDisabled( "(the capture has no screenshots)" );
+    if( anyShots && m_drawShots )
+    {
+        ImGui::Indent();
+        ImGui::TextUnformatted( "Thumbnails:" );
+        for( int size = 0; size < 3; ++size )
+        {
+            ImGui::SameLine();
+            if( ImGui::RadioButton( ShotSizeNames[size], m_shotSize == size ) ) m_shotSize = size;
+        }
+        ImGui::Unindent();
+    }
 }
 
 void StreamingTimeline::DrawFrameNavigation()
@@ -1651,6 +2347,30 @@ void StreamingTimeline::DrawFrameNavigation()
     }
 }
 
+namespace
+{
+// A frame's band against the target frame time: on target up to 5% slower
+// (the jitter of frames paced by a display that refreshes just under the
+// target rate, such as 59.94 Hz for 60 FPS; the FPS lane allows the same),
+// slower, or more than twice the target: a missed VSync refresh or a hitch.
+int FrameBand( int64_t time, int64_t target )
+{
+    return time > target * 2 ? 2 : time > target * 100 / 95 ? 1 : 0;
+}
+constexpr uint32_t FrameBandColors[3] = { 0xFF22DD22, 0xFF22DDDD, 0xFF2222DD };
+
+// The band of a frame for its tooltip, in its color.
+void FrameBandLine( int64_t time, int64_t target, int targetFps )
+{
+    const auto band = FrameBand( time, target );
+    ImGui::TextColored( ImGui::ColorConvertU32ToFloat4( FrameBandColors[band] ), ICON_FA_SQUARE );
+    ImGui::SameLine();
+    if( band == 0 ) ImGui::TextDisabled( "On the %i FPS target: up to %s, 5%% over %s", targetFps, TimeToString( target * 100 / 95 ), TimeToString( target ) );
+    else if( band == 1 ) ImGui::TextDisabled( "Slower than the %i FPS target: over %s", targetFps, TimeToString( target * 100 / 95 ) );
+    else ImGui::TextDisabled( "Under %g FPS: over %s, such as a missed VSync refresh or a hitch", targetFps / 2.0, TimeToString( target * 2 ) );
+}
+}
+
 // The frame graph of the active frame set: a bar per frame, or per group of
 // frames once scaled down, as tall as its frame time (a group's slowest), and
 // a line of the average FPS over the last second (over the group when that
@@ -1679,7 +2399,7 @@ void StreamingTimeline::DrawFrameGraph()
     const int64_t frameTarget = 1000 * 1000 * 1000 / std::max( 1, m_frameTarget );
     // 50 ms, or more so that twice the target fits.
     const int64_t MaxFrameTime = std::max<int64_t>( 50 * 1000 * 1000, frameTarget * 5 / 2 );
-    const auto frameColor = [frameTarget]( int64_t time ) { return time > frameTarget * 2 ? 0xFF2222DD : time > frameTarget ? 0xFF22DDDD : 0xFF22DD22; };
+    const auto frameColor = [frameTarget]( int64_t time ) { return FrameBandColors[FrameBand( time, frameTarget )]; };
     auto& io = ImGui::GetIO();
     auto draw = ImGui::GetWindowDrawList();
     const auto w = ImGui::GetContentRegionAvail().x;
@@ -1732,13 +2452,21 @@ void StreamingTimeline::DrawFrameGraph()
         if( m_begin == m_end ) m_begin--;
     };
 
+    // The screenshot strip under the graph zooms and scrolls with it.
+    TakeShots();
+    m_shotTick++;
+    const auto shots = m_drawShots ? Shots() : nullptr;
+    const auto stripHeight = shots && !shots->empty() ? ShotStripHeight() : 0.f;
+    const auto stripPos = wpos + ImVec2( 0, Height + ImGui::GetStyle().ItemSpacing.y );
+    const bool stripHover = stripHeight > 0 && ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect( stripPos, stripPos + ImVec2( float( columns + 2 ), stripHeight ) );
+
     ImGui::InvisibleButton( "##frames", ImVec2( w, Height ) );
     const bool hover = ImGui::IsItemHovered();
     if( hover ) ImGui::SetItemKeyOwner( ImGuiKey_MouseWheelY );
     draw->AddRectFilled( wpos, wpos + ImVec2( columns + 2, Height ), 0x33FFFFFF );
     const auto wheel = io.MouseWheel;
     const auto prevScale = m_frameScale;
-    if( hover )
+    if( hover || stripHover )
     {
         if( wheel > 0 )
         {
@@ -1756,7 +2484,7 @@ void StreamingTimeline::DrawFrameGraph()
     const auto clampStart = [&] { m_frameStart = fit ? 0 : std::clamp( m_frameStart, 0, std::max( 0, total - onScreen * group ) ); };
     if( !ImGui::IsMouseDown( 0 ) ) m_frameDragFirst = -1;
     // When the view moves elsewhere, the graph scrolls to show its frames.
-    if( ( m_begin != m_frameGraphBegin || m_end != m_frameGraphEnd ) && m_frameDragFirst < 0 && !( hover && IsMouseDragging( 1 ) ) )
+    if( ( m_begin != m_frameGraphBegin || m_end != m_frameGraphEnd ) && m_frameDragFirst < 0 && !( ( hover || stripHover ) && IsMouseDragging( 1 ) ) )
     {
         m_frameGraphBegin = m_begin;
         m_frameGraphEnd = m_end;
@@ -1769,7 +2497,7 @@ void StreamingTimeline::DrawFrameGraph()
         }
     }
     float crosshair = -1;
-    if( hover )
+    if( hover || stripHover )
     {
         if( !fit && IsMouseDragging( 1 ) )
         {
@@ -1788,7 +2516,7 @@ void StreamingTimeline::DrawFrameGraph()
             if( m_frameScale != prevScale ) m_frameStart = columnFrames( mo, prevScale, m_frameStart ).first - int( mo * group / fwidth );
             clampStart();
             const auto [sel, count] = columnFrames( mo, m_frameScale, m_frameStart );
-            if( sel < total )
+            if( hover && sel < total )
             {
                 const auto last = sel + count - 1;
                 crosshair = fit ? float( int64_t( std::clamp( int( mo * bars / columns ), 0, bars - 1 ) ) * columns / bars ) + 0.5f * columns / bars
@@ -1812,6 +2540,7 @@ void StreamingTimeline::DrawFrameGraph()
                     TextFocused( "Slowest frame:", TimeToString( slowest ) );
                     ImGui::SameLine();
                     ImGui::TextDisabled( "(%.1f FPS)", 1000000000.0 / slowest );
+                    FrameBandLine( slowest, frameTarget, m_frameTarget );
                     TextFocused( "Over the target:", RealToString( over ) );
                     ImGui::SameLine();
                     ImGui::TextDisabled( "of %s frames", RealToString( count ) );
@@ -1840,15 +2569,19 @@ void StreamingTimeline::DrawFrameGraph()
                         ImGui::TextUnformatted( RealToString( fnum ) );
                         ImGui::Separator();
                         TextFocused( "Frame time:", TimeToString( frameTime ) );
-                        ImGui::SameLine();
-                        ImGui::TextDisabled( "(%.1f FPS)", 1000000000.0 / frameTime );
+                        char current[32];
+                        snprintf( current, sizeof( current ), "%.1f FPS", 1000000000.0 / frameTime );
+                        TextFocused( "Current FPS:", current );
+                        FrameBandLine( frameTime, frameTarget, m_frameTarget );
                     }
                 }
-                char average[32];
-                snprintf( average, sizeof( average ), "%.1f FPS", fps );
-                TextFocused( "Average:", average );
+                // One frame: the average a game's FPS counter shows there, over
+                // the second that ends with it. Several frames: their average.
+                char rate[32];
+                snprintf( rate, sizeof( rate ), "%.1f FPS", fps );
+                TextFocused( count > 1 ? "Average FPS:" : "Last second:", rate );
                 ImGui::SameLine();
-                ImGui::TextDisabled( "(over %s)", TimeToString( span ) );
+                ImGui::TextDisabled( count > 1 ? "(over %s)" : "(average over %s)", TimeToString( span ) );
                 TextFocused( "Time from start of program:", TimeToStringExact( frames.starts[sel] ) );
                 ImGui::EndTooltip();
                 if( IsMouseClicked( 0 ) )
@@ -1959,8 +2692,60 @@ void StreamingTimeline::DrawFrameGraph()
     snprintf( text, sizeof( text ), "Frames %s - %s%s%s", RealToString( FrameNumber( *statics, frames, shownFirst ) ), RealToString( FrameNumber( *statics, frames, shownLast ) ),
               fit ? " \xc2\xb7 the whole capture" : group > 1 ? " \xc2\xb7 " : "", fit || group == 1 ? "" : ( std::to_string( group ) + " per bar" ).c_str() );
     draw->AddText( rowPos, ImGui::GetColorU32( ImGuiCol_TextDisabled ), text );
+    const auto leftEnd = rowPos.x + ImGui::CalcTextSize( text ).x;
     snprintf( text, sizeof( text ), "Average %.1f FPS \xc2\xb7 1%% low %.1f FPS \xc2\xb7 %s over %.1f ms", summary.averageFps, summary.lowFps, RealToString( summary.slow ), frameTarget * 2 / 1e6 );
-    draw->AddText( ImVec2( rowPos.x + w - ImGui::CalcTextSize( text ).x, rowPos.y ), ImGui::GetColorU32( ImGuiCol_Text ), text );
+    const auto rightStart = rowPos.x + w - ImGui::CalcTextSize( text ).x;
+    draw->AddText( ImVec2( rightStart, rowPos.y ), ImGui::GetColorU32( ImGuiCol_Text ), text );
+    // The bars' colors, after the frames shown when there is room.
+    {
+        const double onTarget = std::floor( m_frameTarget * 0.95 + 0.5 ), half = m_frameTarget / 2.0;
+        char bands[3][48];
+        snprintf( bands[0], sizeof( bands[0] ), "%g+ FPS", onTarget );
+        snprintf( bands[1], sizeof( bands[1] ), "%g-%g FPS", half, onTarget );
+        snprintf( bands[2], sizeof( bands[2] ), "under %g FPS", half );
+        const auto box = std::round( ty * 0.6f );
+        float width = 0;
+        for( const auto& band : bands ) width += box + ty * 0.3f + ImGui::CalcTextSize( band ).x + ty;
+        auto x = leftEnd + ty * 1.5f;
+        if( x + width < rightStart )
+        {
+            for( int band = 0; band < 3; ++band )
+            {
+                const auto y = rowPos.y + std::round( ( ty - box ) * 0.5f );
+                draw->AddRectFilled( ImVec2( x, y ), ImVec2( x + box, y + box ), FrameBandColors[band] );
+                x += box + ty * 0.3f;
+                draw->AddText( ImVec2( x, rowPos.y ), ImGui::GetColorU32( ImGuiCol_TextDisabled ), bands[band] );
+                x += ImGui::CalcTextSize( bands[band] ).x + ty;
+            }
+        }
+    }
+
+    if( stripHeight > 0 )
+    {
+        // The x of a time: the middle of the bar of the frame holding it,
+        // none when the graph does not show that frame.
+        const auto timeX = [&]( int64_t time ) -> std::optional<float> {
+            const auto next = std::upper_bound( frames.starts.begin(), frames.starts.end(), time );
+            if( next == frames.starts.begin() ) return std::nullopt;
+            const int frame = int( next - frames.starts.begin() ) - 1;
+            if( fit )
+            {
+                auto bar = int( int64_t( frame ) * bars / total );
+                while( bar + 1 < bars && int64_t( bar + 1 ) * total / bars <= frame ) bar++;
+                while( bar > 0 && int64_t( bar ) * total / bars > frame ) bar--;
+                return 1 + 0.5f * float( int64_t( bar ) * columns / bars + int64_t( bar + 1 ) * columns / bars );
+            }
+            if( frame < m_frameStart || frame >= m_frameStart + onScreen * group ) return std::nullopt;
+            return float( ( frame - m_frameStart ) / group * fwidth ) + 1 + 0.5f * fwidth;
+        };
+        ImGui::SetCursorScreenPos( stripPos );
+        if( const auto marked = DrawShotStrip( stripPos, stripHeight, columns, labelWidth, timeX ) )
+        {
+            // The frame of the hovered screenshot, or of the viewer's, in the graph.
+            const auto x = std::round( wpos.x + *marked ) + 0.5f;
+            draw->AddLine( ImVec2( x, wpos.y ), ImVec2( x, wpos.y + Height ), 0xAAFFFFFF );
+        }
+    }
 }
 
 // As Tracy's DrawTimelineFramesHeader.
@@ -2505,8 +3290,63 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         background.height += 1.2f * ostep;
         return DrawPlotLane( draw, area, background, drawLane );
     };
-    // The usage lanes: CPU and memory above all others, GPU usage above the
-    // GPU memory lanes.
+    // The GPU's direct queue, and the time its top-level zones as loaded for
+    // the view cover in a range, for the display lane: approximate where
+    // zones were folded together, unknown where only their density is.
+    size_t directLane = SIZE_MAX;
+    const GpuBusyFn gpuBusy = [&]( int64_t begin, int64_t end ) -> std::optional<GpuBusy> {
+        if( directLane == SIZE_MAX || !snapshot || snapshot->begin > begin || snapshot->end < end ) return std::nullopt;
+        auto& cache = m_busySpans;
+        const auto laneId = statics->lanes[directLane].id;
+        if( cache.snapshot != snapshot.get() || cache.lane != laneId )
+        {
+            cache = BusySpans {};
+            cache.snapshot = snapshot.get();
+            cache.lane = laneId;
+            const auto found = loaded.find( std::make_pair( laneId, true ) );
+            cache.loaded = found != loaded.end() && !found->second->dense;
+            if( cache.loaded )
+            {
+                std::vector<std::tuple<int64_t, int64_t, bool>> items;
+                for( const auto& item : found->second->items )
+                {
+                    if( item.depth != 0 || item.end <= item.start ) continue;
+                    if( item.kind == Kind::Density ) cache.density.emplace_back( item.start, item.end );
+                    else items.emplace_back( item.start, item.end, item.kind == Kind::Folded );
+                }
+                std::sort( items.begin(), items.end() );
+                for( const auto& [start, stop, folded] : items )
+                {
+                    if( !cache.spans.empty() && start <= cache.spans.back().second )
+                    {
+                        cache.spans.back().second = std::max( cache.spans.back().second, stop );
+                        if( folded ) cache.folded.back() = 1;
+                    }
+                    else
+                    {
+                        cache.spans.emplace_back( start, stop );
+                        cache.folded.push_back( folded );
+                    }
+                }
+                std::sort( cache.density.begin(), cache.density.end() );
+            }
+        }
+        if( !cache.loaded ) return std::nullopt;
+        const auto endsAfter = []( const std::pair<int64_t, int64_t>& span, int64_t t ) { return span.second <= t; };
+        // Only the density of zones is known there.
+        const auto dense = std::lower_bound( cache.density.begin(), cache.density.end(), begin, endsAfter );
+        if( dense != cache.density.end() && dense->first < end ) return std::nullopt;
+        GpuBusy busy;
+        for( auto i = size_t( std::lower_bound( cache.spans.begin(), cache.spans.end(), begin, endsAfter ) - cache.spans.begin() );
+             i < cache.spans.size() && cache.spans[i].first < end; ++i )
+        {
+            busy.busy += std::min( cache.spans[i].second, end ) - std::max( cache.spans[i].first, begin );
+            busy.approximate |= cache.folded[i] != 0;
+        }
+        return busy;
+    };
+    // The usage lanes: the display above the GPU's direct queue, CPU and
+    // memory above all others, GPU usage above the GPU memory lanes.
     const auto usage = m_drawUsage ? Usage() : nullptr;
     const auto drawUsageLane = [&]( UsageLane which ) {
         if( !usage || !UsageLanePresent( *usage, which ) ) return;
@@ -2522,7 +3362,8 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
             if( laneTop < yMax && laneTop + height > yMin )
             {
                 stats.usageLanes++;
-                drawOverview( laneTop, height, label, [&]( const VramPlotArea& area ) { return DrawUsageLane( draw, area, *usage, which, plotHeight ); } );
+                drawOverview( laneTop, height, label, [&]( const VramPlotArea& area ) {
+                    return DrawUsageLane( draw, area, *usage, which, plotHeight, which == UsageLane::Display && directLane != SIZE_MAX ? gpuBusy : GpuBusyFn() ); } );
             }
             y += height;
         }
@@ -2745,8 +3586,8 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
         }
         y += 0.2f * ostep;
     };
-    // The order: video memory, the direct GPU queue, the main and render
-    // threads and the job workers first; then CPU, memory and GPU usage,
+    // The order: video memory, the display, the direct GPU queue, the main
+    // and render threads and the job workers first; then CPU, memory and GPU usage,
     // system memory, the other GPU contexts and the other threads. FPS is in
     // the frame graph.
     std::vector<size_t> front, rest;
@@ -2770,6 +3611,7 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
             else if( name.rfind( "job.worker ", 0 ) == 0 ) workers.emplace_back( strtol( name.c_str() + 11, nullptr, 10 ), i );
         }
         std::stable_sort( workers.begin(), workers.end() );
+        directLane = direct;
         for( const auto i : { direct, mainThread, renderThread } )
             if( i != SIZE_MAX ) front.push_back( i );
         for( const auto& worker : workers ) front.push_back( worker.second );
@@ -2777,6 +3619,7 @@ std::optional<StreamingTimeline::Selection> StreamingTimeline::Draw( float heigh
             if( std::find( front.begin(), front.end(), i ) == front.end() ) rest.push_back( i );
     }
     drawVramLane( 0 );
+    drawUsageLane( UsageLane::Display );
     for( const auto i : front ) drawTimelineLane( statics->lanes[i] );
     drawUsageLane( UsageLane::Cpu );
     drawUsageLane( UsageLane::Memory );

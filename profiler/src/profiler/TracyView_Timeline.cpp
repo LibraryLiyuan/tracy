@@ -366,7 +366,7 @@ void View::DrawTimeline()
     const auto to = 9.f;
     const auto th = ( ty - to ) * sqrt( 3 ) * 0.5;
 
-    // The plot lanes come first: FPS, CPU, memory and GPU usage, then GPU
+    // The plot lanes come first: FPS, display, CPU, memory and GPU usage, then GPU
     // memory, which stacks the per-category plots. The plots they draw have
     // no lanes of their own.
     if( m_vd.drawPlots )

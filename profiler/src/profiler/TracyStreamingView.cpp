@@ -619,7 +619,7 @@ bool StreamingView::SmokeStepTimeline()
     const char* screenshot = getenv( "TRACY_STREAM_SCREENSHOT" );
     // A draw after the range was set showed a read of that range; the extra
     // draws let the scroll to the timeline take effect before a screenshot.
-    const auto settled = [&] { return stats.draws > m_timelineSmokeDraws + 2 && stats.drawn && stats.current && !m_timeline->Busy() && !m_timeline->Indexing() && !m_timeline->VramLoading() && !m_timeline->ShowingVram(); };
+    const auto settled = [&] { return stats.draws > m_timelineSmokeDraws + 2 && stats.drawn && stats.current && !m_timeline->Busy() && !m_timeline->Indexing() && !m_timeline->VramLoading() && !m_timeline->ShowingVram() && m_timeline->ScreenshotsSettled(); };
     const auto describe = [&]( const char* name ) {
         m_timelineSmoke += std::string( name ) + "_zones=" + std::to_string( stats.zones ) + ' ' + name + "_folded=" + std::to_string( stats.folded ) + ' ' +
             name + "_density=" + std::to_string( stats.density ) + ' ' + name + "_frames=" + std::to_string( stats.frames ) + ' ' +
@@ -712,6 +712,9 @@ bool StreamingView::SmokeStepTimeline()
         const auto& zones = m_result.zones->values;
         if( !zones.empty() ) m_timelineSmokeCenter = zones[zones.size() / 2].start;
     }
+    // The zoom stage shows the screenshot viewer on the middle screenshot,
+    // with its picture; the windows stage still has it, under Tracy's.
+    if( stage + 1 == Zoom ) m_timelineSmoke += std::string( "screenshot_viewer=" ) + ( m_timeline->OpenMiddleScreenshot() ? "open" : "none" ) + ' ';
     if( stage == Zoom )
     {
         m_showStatistics = true;
@@ -720,6 +723,7 @@ bool StreamingView::SmokeStepTimeline()
     if( stage == Windows )
     {
         m_showStatistics = m_showZoneInfo = false;
+        m_timeline->CloseScreenshotViewer();
         if( m_timeline->Vram() )
         {
             m_showGpuResources = true;
@@ -1968,6 +1972,7 @@ bool StreamingView::Draw()
                     m_reportReply.value( "frame_set", "range" ).c_str(), (long long)m_reportReply.value( "frame_index", int64_t(-1) ),
                     m_reportReply.value( "native_frame_number", "n/a" ).c_str() );
             m_timeline->DrawFrameGraph();
+            m_timeline->DrawScreenshotViewer();
             if( PanelWindow panel( "Options", "", m_showOptions, true, false ); panel ) m_timeline->DrawOptions();
         }
         if( PanelWindow panel( "Trace information", "", m_showInfo, true, m_liveMode ); panel )

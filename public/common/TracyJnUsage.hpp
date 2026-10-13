@@ -64,6 +64,18 @@ constexpr const char* GpuDedicatedUsedPlot = "GPU.Adapter.Dedicated.UsedBytes";
 constexpr const char* GpuDedicatedTotalPlot = "GPU.Adapter.Dedicated.TotalBytes";
 constexpr const char* GpuSharedUsedPlot = "GPU.Adapter.Shared.UsedBytes";
 
+// The display, from DXGI's frame statistics of the swap chain, which the
+// engine already reads once a frame while VSync is on. A point is at the
+// refresh (vertical blank) a new frame appeared at, and its value is the
+// number of refreshes since the frame before it appeared: 1 when the frame
+// was ready in time, 2 when it missed a refresh and the frame before stayed
+// on screen for two, and so on.
+constexpr const char* DisplayRefreshesPlot = "Display.Refreshes";
+// Rarely, more than one frame appeared since the previous point; then a point
+// of this plot at the same time gives how many, and the refreshes cover them
+// all.
+constexpr const char* DisplayFramesPlot = "Display.Frames";
+
 // The processors, as an app info message, which Tracy repeats to every
 // connection: "JNTracy.Usage cpus=<logical processors> classes=<efficiency
 // class of each, comma separated> interval_ms=<sampling interval>". Classes
