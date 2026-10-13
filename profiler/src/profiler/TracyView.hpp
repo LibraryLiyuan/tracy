@@ -780,7 +780,7 @@ private:
     std::vector<const PlotData*> m_usagePlots;
     size_t m_usagePlotCount = 0, m_usagePoints = 0, m_usageAppInfo = 0;
     // The lanes' timeline keys: the UsageLane of each.
-    std::array<UsageLane, UsageLanes> m_usageLanes { UsageLane::Cpu, UsageLane::Memory, UsageLane::Gpu };
+    std::array<UsageLane, UsageLanes> m_usageLanes { UsageLane::Display, UsageLane::Cpu, UsageLane::Memory, UsageLane::Gpu };
     // The FPS lane's frames: the base frame set's starts, and their ends
     // unless it is continuous, appended from the worker's as frames arrive.
     void UpdateFps();

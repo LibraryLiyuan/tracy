@@ -63,7 +63,7 @@ void View::DrawOptions()
     ImGui::SameLine( 0, 0 );
     SmallColorBox( 0xFF22DDDD );
     ImGui::SameLine( 0, 0 );
-    ImGui::Text( "  <  %i  <  ", tmp );
+    ImGui::Text( "  <  %i  <  ", int( tmp * 95 / 100 ) );
     ImGui::SameLine( 0, 0 );
     SmallColorBox( 0xFF22DD22 );
     ImGui::SameLine( 0, 0 );

@@ -139,6 +139,24 @@ static tracy_force_inline void DecodeDxt1Part( uint64_t d, uint32_t* dst, uint32
     memcpy( dst+3, dict + (idx & 0x3), 4 );
 }
 
+void DecodeBc1( const char* data, int w, int h, uint32_t* out )
+{
+    auto src = (const char*)data;
+    auto dst = out;
+    for( int y=0; y<h/4; y++ )
+    {
+        for( int x=0; x<w/4; x++ )
+        {
+            uint64_t d;
+            memcpy( &d, src, 8 );
+            src += 8;
+            DecodeDxt1Part( d, dst, w );
+            dst += 4;
+        }
+        dst += w*3;
+    }
+}
+
 void UpdateTexture( ImTextureID _tex, const char* data, int w, int h )
 {
     auto tex = (GLuint)_tex;
@@ -150,21 +168,22 @@ void UpdateTexture( ImTextureID _tex, const char* data, int w, int h )
     else
     {
         auto tmp = new uint32_t[w*h];
-        auto src = (const uint64_t*)data;
-        auto dst = tmp;
-        for( int y=0; y<h/4; y++ )
-        {
-            for( int x=0; x<w/4; x++ )
-            {
-                uint64_t d = *src++;
-                DecodeDxt1Part( d, dst, w );
-                dst += 4;
-            }
-            dst += w*3;
-        }
+        DecodeBc1( data, w, h, tmp );
         glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, tmp );
         delete[] tmp;
     }
+}
+
+ImTextureID MakeImageTexture()
+{
+    GLuint tex;
+    glGenTextures( 1, &tex );
+    glBindTexture( GL_TEXTURE_2D, tex );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+    return tex;
 }
 
 void UpdateTextureRGBA( ImTextureID _tex, void* data, int w, int h )

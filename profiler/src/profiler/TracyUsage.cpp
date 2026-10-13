@@ -727,6 +727,312 @@ const char* Fps( double fps, int64_t frameTime )
     return out;
 }
 
+// The display lane's colors: a frame that appeared one refresh after the
+// frame before, one that missed a refresh, and one that missed more.
+constexpr uint32_t DisplayOnTimeColor = 0xFF22DD22;
+constexpr uint32_t DisplayMissedColor = 0xFF22AAFF;
+constexpr uint32_t DisplayMissedMoreColor = 0xFF2222DD;
+constexpr uint32_t DisplayColors[3] = { DisplayOnTimeColor, DisplayMissedColor, DisplayMissedMoreColor };
+
+int DisplaySeverity( const UsageData::DisplayFrame& frame )
+{
+    return int( std::min<uint32_t>( frame.Missed(), 2 ) );
+}
+
+// The first display frame that ends after t.
+size_t DisplayFrameAfter( const UsageData& data, int64_t t )
+{
+    const auto& frames = data.display;
+    return size_t( std::upper_bound( frames.begin(), frames.end(), t, []( int64_t v, const UsageData::DisplayFrame& f ) { return v < f.end; } ) - frames.begin() );
+}
+
+const char* RefreshRate( int64_t period )
+{
+    static char buf[64];
+    snprintf( buf, sizeof( buf ), "%.1f Hz (%s)", 1e9 / double( period ), TimeToString( period ) );
+    return buf;
+}
+
+// Per pixel column of the area, the time its frames of each severity cover.
+struct DisplayColumn
+{
+    double covered[3] = {};
+};
+
+void DisplayColumns( const UsageData& data, const VramPlotArea& area, int count, std::vector<DisplayColumn>& out )
+{
+    out.assign( count, DisplayColumn() );
+    const auto& frames = data.display;
+    const auto nsPerPixel = 1.0 / area.pxns;
+    auto i = DisplayFrameAfter( data, area.begin );
+    for( int c = 0; c < count && i < frames.size(); ++c )
+    {
+        const auto c0 = area.begin + int64_t( c * nsPerPixel );
+        const auto c1 = area.begin + int64_t( ( c + 1 ) * nsPerPixel );
+        while( i < frames.size() && frames[i].start < c1 )
+        {
+            const auto overlap = double( std::min( frames[i].end, c1 ) - std::max( frames[i].start, c0 ) );
+            if( overlap > 0 ) out[c].covered[DisplaySeverity( frames[i] )] += overlap;
+            // A frame running past the column continues in the next.
+            if( frames[i].end > c1 ) break;
+            ++i;
+        }
+    }
+}
+
+// The frames that overlap [begin, end): how many of each severity, the
+// refreshes they missed, and the frames never shown (a point with more frames
+// than refreshes: presented faster than the display refreshed).
+struct DisplayCount
+{
+    size_t frames[3] = {};
+    size_t unshown = 0;
+    uint64_t missed = 0;
+    size_t Total() const { return frames[0] + frames[1] + frames[2] + unshown; }
+};
+
+uint32_t Unshown( const UsageData::DisplayFrame& frame )
+{
+    return frame.frames > frame.refreshes ? frame.frames - frame.refreshes : 0;
+}
+
+DisplayCount CountDisplay( const UsageData& data, int64_t begin, int64_t end )
+{
+    DisplayCount count;
+    for( auto i = DisplayFrameAfter( data, begin ); i < data.display.size() && data.display[i].start < end; ++i )
+    {
+        const auto& frame = data.display[i];
+        count.frames[DisplaySeverity( frame )] += frame.frames - Unshown( frame );
+        count.unshown += Unshown( frame );
+        count.missed += frame.Missed();
+    }
+    return count;
+}
+
+void DisplayCountLines( const DisplayCount& count )
+{
+    const auto total = count.Total();
+    if( total == 0 ) return;
+    char buf[64];
+    const char* labels[3] = { "On time:", "Missed one refresh:", "Missed more:" };
+    for( int s = 0; s < 3; ++s )
+    {
+        snprintf( buf, sizeof( buf ), "%zu (%.1f%%)", count.frames[s], 100.0 * double( count.frames[s] ) / double( total ) );
+        ImGui::TextColored( ImGui::ColorConvertU32ToFloat4( DisplayColors[s] ), "%s", ICON_FA_SQUARE );
+        ImGui::SameLine();
+        TextFocused( labels[s], buf );
+    }
+    if( count.unshown > 0 )
+    {
+        snprintf( buf, sizeof( buf ), "%zu (%.1f%%)", count.unshown, 100.0 * double( count.unshown ) / double( total ) );
+        TextFocused( "Never shown:", buf );
+        ImGui::SameLine();
+        ImGui::TextDisabled( "(presented faster than the display refreshed: VSync was not pacing)" );
+    }
+    TextFocused( "Refreshes missed:", RealToString( count.missed ) );
+}
+
+void DisplayExplanation()
+{
+    TextDisabledUnformatted( "With VSync a frame appears only at a refresh of the display. A frame not ready by then," );
+    TextDisabledUnformatted( "because the GPU is still rendering it or it reached the GPU late, waits for the next" );
+    TextDisabledUnformatted( "refresh, and the frame before stays on screen for one refresh more." );
+}
+
+std::optional<int64_t> DrawDisplay( ImDrawList* draw, const VramPlotArea& area, const UsageData& data, const GpuBusyFn& gpuBusy )
+{
+    const int count = std::max( 1, int( std::ceil( area.width ) ) );
+    const auto bottom = area.pos + ImVec2( area.width, area.height );
+    const auto ty = ImGui::GetTextLineHeight();
+    const auto& frames = data.display;
+    const auto period = data.refreshPeriod;
+    // Frames at least this wide draw one by one, else per pixel column.
+    const bool single = period > 0 && double( period ) * area.pxns >= 4;
+    const auto end = area.begin + int64_t( double( area.width ) / area.pxns );
+    draw->PushClipRect( area.pos, bottom, true );
+    Background( draw, area, DisplayOnTimeColor );
+    if( single )
+    {
+        for( auto i = DisplayFrameAfter( data, area.begin ); i < frames.size() && frames[i].start < end; ++i )
+        {
+            const auto& frame = frames[i];
+            const auto x0 = area.pos.x + float( double( frame.start - area.begin ) * area.pxns );
+            const auto x1 = area.pos.x + float( double( frame.end - area.begin ) * area.pxns );
+            const auto color = DisplayColors[DisplaySeverity( frame )];
+            // A pixel of gap between frames.
+            draw->AddRectFilled( ImVec2( x0, area.pos.y + 1 ), ImVec2( std::max( x0 + 1, x1 - 1 ), bottom.y - 1 ), WithAlpha( color, 0xB0 ) );
+            // The refreshes the frame missed, as ticks where each fell.
+            const auto refreshes = std::max<uint32_t>( frame.refreshes, 1 );
+            const auto step = ( x1 - x0 ) / float( refreshes );
+            if( refreshes > 1 && step >= 5 )
+                for( uint32_t r = 1; r < refreshes; ++r )
+                {
+                    const auto x = std::round( x0 + step * float( r ) ) + 0.5f;
+                    draw->AddLine( ImVec2( x, area.pos.y + 3 ), ImVec2( x, bottom.y - 3 ), 0xA0000000, 1.5f );
+                }
+            // The interval, what the frame missed and the GPU's busy time
+            // there, as far as there is room.
+            if( x1 - x0 < ty * 1.5f ) continue;
+            char labels[5][96];
+            int candidates = 0;
+            const auto interval = TimeToString( frame.end - frame.start );
+            if( frame.frames != 1 )
+            {
+                snprintf( labels[candidates++], 96, "%u frames, %u refreshes", frame.frames, frame.refreshes );
+                snprintf( labels[candidates++], 96, "%u frames", frame.frames );
+            }
+            else if( frame.Missed() > 0 )
+            {
+                std::optional<GpuBusy> busy;
+                if( gpuBusy && x1 - x0 >= ty * 6 ) busy = gpuBusy( frame.start, frame.end );
+                if( busy )
+                {
+                    char gpu[48];
+                    snprintf( gpu, sizeof( gpu ), "GPU %s%s", busy->approximate ? "~" : "", TimeToString( busy->busy ) );
+                    snprintf( labels[candidates++], 96, "%s, missed %u, %s", interval, frame.Missed(), gpu );
+                    snprintf( labels[candidates++], 96, "missed %u, %s", frame.Missed(), gpu );
+                }
+                snprintf( labels[candidates++], 96, "%s, missed %u", interval, frame.Missed() );
+                snprintf( labels[candidates++], 96, "missed %u", frame.Missed() );
+                snprintf( labels[candidates++], 96, "+%u", frame.Missed() );
+            }
+            else snprintf( labels[candidates++], 96, "%s", interval );
+            for( int c = 0; c < candidates; ++c )
+            {
+                const auto size = ImGui::CalcTextSize( labels[c] );
+                if( size.x + 6 > x1 - x0 ) continue;
+                const auto left = std::max( x0 + 3, area.pos.x + 2 );
+                const auto x = std::min( std::max( left, x0 + ( x1 - x0 - size.x ) * 0.5f ), x1 - 3 - size.x );
+                DrawTextContrast( draw, ImVec2( x, area.pos.y + ( area.height - size.y ) * 0.5f ), 0xFFFFFFFF, labels[c] );
+                break;
+            }
+        }
+    }
+    else
+    {
+        static struct
+        {
+            const UsageData::DisplayFrame* frames = nullptr;
+            size_t size = 0;
+            int64_t begin = 0;
+            double pxns = 0;
+            std::vector<DisplayColumn> values;
+        } cached;
+        if( cached.frames != frames.data() || cached.size != frames.size() || cached.begin != area.begin || cached.pxns != area.pxns || cached.values.size() != size_t( count ) )
+        {
+            cached.frames = frames.data();
+            cached.size = frames.size();
+            cached.begin = area.begin;
+            cached.pxns = area.pxns;
+            DisplayColumns( data, area, count, cached.values );
+        }
+        // Per column, the share of its time in frames of each severity,
+        // stacked from the bottom: missed more, missed one, on time.
+        std::vector<float> low( count ), high( count );
+        for( int s = 2; s >= 0; --s )
+        {
+            for( int c = 0; c < count; ++c )
+            {
+                const auto& column = cached.values[c];
+                const auto total = column.covered[0] + column.covered[1] + column.covered[2];
+                if( total <= 0 )
+                {
+                    low[c] = high[c] = area.height;
+                    continue;
+                }
+                double below = 0;
+                for( int t = 2; t > s; --t ) below += column.covered[t];
+                low[c] = area.height - float( below / total * area.height );
+                high[c] = area.height - float( ( below + column.covered[s] ) / total * area.height );
+            }
+            PlotFillColumns( draw, area, low, high, WithAlpha( DisplayColors[s], 0xB0 ) );
+        }
+    }
+    draw->PopClipRect();
+
+    const auto legendY = area.pos.y - ty - 1;
+    float x = bottom.x - ty * 0.5f;
+    if( PlotLegendEntry( draw, x, area.legendMinX, legendY, DisplayMissedMoreColor, "Missed 2+", false ) &&
+        PlotLegendEntry( draw, x, area.legendMinX, legendY, DisplayMissedColor, "Missed a refresh", false ) )
+        PlotLegendEntry( draw, x, area.legendMinX, legendY, DisplayOnTimeColor, "On time", false );
+
+    if( !area.hover || !ImGui::IsMouseHoveringRect( area.pos, bottom ) ) return std::nullopt;
+    const auto mouse = ImGui::GetMousePos();
+    const auto time = TimeUnderMouse( area );
+    draw->AddLine( ImVec2( mouse.x, area.pos.y ), ImVec2( mouse.x, bottom.y ), 0x99FFFFFF );
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted( UsageLaneLabel( UsageLane::Display ) );
+    ImGui::Separator();
+    const auto i = DisplayFrameAfter( data, time );
+    if( single && i < frames.size() && frames[i].start <= time )
+    {
+        const auto& frame = frames[i];
+        const auto x0 = std::max( area.pos.x, area.pos.x + float( double( frame.start - area.begin ) * area.pxns ) );
+        const auto x1 = std::min( bottom.x, area.pos.x + float( double( frame.end - area.begin ) * area.pxns ) );
+        draw->AddRect( ImVec2( x0, area.pos.y ), ImVec2( x1, bottom.y ), 0xFFFFFFFF );
+        TextFocused( "Appeared at:", TimeToString( frame.end ) );
+        char buf[128];
+        if( frame.frames == 1 )
+        {
+            snprintf( buf, sizeof( buf ), "%u refresh%s (%s)", frame.refreshes, frame.refreshes == 1 ? "" : "es", TimeToString( frame.end - frame.start ) );
+            TextFocused( "After the frame before:", buf );
+        }
+        else
+        {
+            snprintf( buf, sizeof( buf ), "%u over %u refreshes (%s)", frame.frames, frame.refreshes, TimeToString( frame.end - frame.start ) );
+            TextFocused( "Frames:", buf );
+            ImGui::SameLine();
+            ImGui::TextDisabled( "(the engine did not read them one by one)" );
+            if( Unshown( frame ) > 0 )
+                ImGui::TextColored( ImVec4( 1.f, 0.65f, 0.2f, 1.f ), "%u of them were never shown: the game presented faster than the display refreshed, so VSync was not pacing it.", Unshown( frame ) );
+        }
+        if( frame.Missed() > 0 )
+        {
+            snprintf( buf, sizeof( buf ), "%u refresh%s", frame.Missed(), frame.Missed() == 1 ? "" : "es" );
+            TextFocused( "Missed:", buf );
+            if( period > 0 && frame.frames == 1 )
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(not ready at %s)", TimeToString( frame.start + period ) );
+            }
+        }
+        if( period > 0 ) TextFocused( "Refresh rate:", RefreshRate( period ) );
+        if( gpuBusy )
+        {
+            if( const auto busy = gpuBusy( frame.start, frame.end ) )
+            {
+                snprintf( buf, sizeof( buf ), "%s%s of these %s", busy->approximate ? "about " : "", TimeToString( busy->busy ), TimeToString( frame.end - frame.start ) );
+                TextFocused( "GPU busy (direct queue):", buf );
+                if( frame.Missed() > 0 && period > 0 )
+                {
+                    if( busy->busy > period ) ImGui::TextColored( ImVec4( 1.f, 0.65f, 0.2f, 1.f ), "The GPU worked longer than one refresh (%s).", TimeToString( period ) );
+                    else ImGui::TextColored( ImVec4( 1.f, 0.65f, 0.2f, 1.f ), "The GPU worked less than a refresh: the frame reached it late." );
+                }
+            }
+            else ImGui::TextDisabled( "GPU busy: unfold the direct queue or zoom in to measure." );
+        }
+    }
+    else
+    {
+        TextFocused( "Time:", TimeToString( time ) );
+        // The pixel column under the mouse.
+        const auto c0 = area.begin + int64_t( std::floor( mouse.x - area.pos.x ) / area.pxns );
+        const auto c1 = area.begin + int64_t( ( std::floor( mouse.x - area.pos.x ) + 1 ) / area.pxns );
+        const auto here = CountDisplay( data, c0, c1 );
+        if( here.Total() > 0 )
+        {
+            TextFocused( "Frames in this pixel:", RealToString( here.Total() ) );
+            DisplayCountLines( here );
+        }
+        else ImGui::TextDisabled( "No frames recorded here." );
+        if( period > 0 ) TextFocused( "Refresh rate:", RefreshRate( period ) );
+    }
+    ImGui::Separator();
+    DisplayExplanation();
+    ImGui::EndTooltip();
+    return time;
+}
+
 }
 
 VramSeries* UsageData::Find( std::string_view name )
@@ -751,6 +1057,8 @@ VramSeries* UsageData::Find( std::string_view name )
     if( name == JnUsage::MemorySystemTotalPlot ) return &systemTotal;
     for( int e = 0; e < JnUsage::Engines; ++e )
         if( name == JnUsage::GpuEnginePlots[e] ) return &engines[e];
+    if( name == JnUsage::DisplayRefreshesPlot ) return &displayRefreshes;
+    if( name == JnUsage::DisplayFramesPlot ) return &displayFrames;
     if( StartsWith( name, "UnityCounter/" ) )
     {
         if( EndsWith( name, "/App Committed Memory" ) ) return &unityCommitted;
@@ -820,6 +1128,67 @@ void UsageData::Finish()
         const auto& values = engines[e].value;
         engineShown[e] = !values.empty() && ( e == int( JnUsage::Engine::ThreeD ) || std::any_of( values.begin(), values.end(), []( double v ) { return v > 0; } ) );
     }
+    FinishDisplay();
+}
+
+void UsageData::FinishDisplay()
+{
+    Order( displayRefreshes );
+    Order( displayFrames );
+    display.clear();
+    refreshPeriod = 0;
+    const auto& times = displayRefreshes.time;
+    const auto& values = displayRefreshes.value;
+    if( times.empty() ) return;
+    // The refresh period: the median interval between frames that appeared
+    // one refresh apart.
+    std::vector<int64_t> periods;
+    for( size_t i = 1; i < times.size() && periods.size() < 100000; ++i )
+        if( values[i] == 1 && times[i] > times[i - 1] ) periods.push_back( times[i] - times[i - 1] );
+    if( periods.empty() )
+    {
+        for( size_t i = 1; i < times.size() && periods.size() < 100000; ++i )
+            if( values[i] >= 1 && times[i] > times[i - 1] ) periods.push_back( int64_t( double( times[i] - times[i - 1] ) / values[i] ) );
+    }
+    if( !periods.empty() )
+    {
+        std::nth_element( periods.begin(), periods.begin() + periods.size() / 2, periods.end() );
+        refreshPeriod = periods[periods.size() / 2];
+    }
+    display.reserve( times.size() );
+    size_t f = 0;
+    for( size_t i = 0; i < times.size(); ++i )
+    {
+        if( values[i] < 1 ) continue;
+        DisplayFrame frame;
+        frame.end = times[i];
+        frame.refreshes = uint32_t( std::min( values[i], 1e9 ) );
+        frame.frames = 1;
+        while( f < displayFrames.time.size() && displayFrames.time[f] < frame.end ) f++;
+        if( f < displayFrames.time.size() && displayFrames.time[f] == frame.end && displayFrames.value[f] >= 1 )
+            frame.frames = uint32_t( std::min( displayFrames.value[f], 1e9 ) );
+        // From the refresh the frame before appeared at, when that point is
+        // there (within half a refresh of where the refreshes put it), else
+        // from where the refreshes put it.
+        // A count the time since the point before cannot hold (a counter that
+        // restarted, recorded by clients before they caught it) takes the
+        // refreshes that time holds.
+        if( !display.empty() && refreshPeriod > 0 )
+        {
+            const auto fit = std::max<int64_t>( 1, ( frame.end - display.back().end + refreshPeriod / 2 ) / refreshPeriod );
+            if( int64_t( frame.refreshes ) > fit + 2 ) frame.refreshes = uint32_t( std::min<int64_t>( fit, UINT32_MAX ) );
+        }
+        const auto span = refreshPeriod > 0 ? int64_t( frame.refreshes ) * refreshPeriod : 0;
+        frame.start = frame.end - span;
+        if( !display.empty() )
+        {
+            const auto previous = display.back().end;
+            if( span == 0 || previous >= frame.start - refreshPeriod / 2 ) frame.start = previous;
+        }
+        if( frame.start >= frame.end ) continue;
+        display.push_back( frame );
+    }
+    if( !display.empty() ) lastTime = std::max( lastTime, display.back().end );
 }
 
 bool UsageData::HasCpu() const
@@ -870,6 +1239,7 @@ bool IsUsagePlot( std::string_view name )
     if( StartsWith( name, JnUsage::CpuCorePrefix ) && EndsWith( name, JnUsage::CpuCoreSuffix ) ) return true;
     if( StartsWith( name, "Memory.Process." ) || StartsWith( name, "Memory.System." ) ) return true;
     if( StartsWith( name, "GPU.Process." ) || StartsWith( name, "GPU.Adapter." ) ) return true;
+    if( name == JnUsage::DisplayRefreshesPlot || name == JnUsage::DisplayFramesPlot ) return true;
     return false;
 }
 
@@ -880,6 +1250,7 @@ const char* UsageLaneLabel( UsageLane lane )
     case UsageLane::Cpu: return ICON_FA_GAUGE_HIGH " CPU usage";
     case UsageLane::Memory: return ICON_FA_MEMORY " Memory usage";
     case UsageLane::Gpu: return ICON_FA_GAUGE_HIGH " GPU usage";
+    case UsageLane::Display: return ICON_FA_DESKTOP " Display (VSync)";
     default: return "";
     }
 }
@@ -891,6 +1262,7 @@ bool UsageLanePresent( const UsageData& data, UsageLane lane )
     case UsageLane::Cpu: return data.HasCpu();
     case UsageLane::Memory: return data.HasMemory();
     case UsageLane::Gpu: return data.HasGpu();
+    case UsageLane::Display: return data.HasDisplay();
     default: return false;
     }
 }
@@ -910,17 +1282,20 @@ float UsageLaneHeight( const UsageData& data, UsageLane lane, float plotHeight )
         return layout.game + layout.gap + layout.machine;
     }
     case UsageLane::Gpu: return plotHeight * 0.5f;
+    case UsageLane::Display: return std::max( plotHeight * 0.3f, ImGui::GetTextLineHeight() * 1.6f );
     default: return 0;
     }
 }
 
-std::optional<int64_t> DrawUsageLane( ImDrawList* draw, const VramPlotArea& area, const UsageData& data, UsageLane lane, float plotHeight )
+std::optional<int64_t> DrawUsageLane( ImDrawList* draw, const VramPlotArea& area, const UsageData& data, UsageLane lane, float plotHeight,
+    const GpuBusyFn& gpuBusy )
 {
     switch( lane )
     {
     case UsageLane::Cpu: return DrawCpu( draw, area, data, plotHeight );
     case UsageLane::Memory: return DrawMemory( draw, area, data, plotHeight );
     case UsageLane::Gpu: return DrawGpu( draw, area, data );
+    case UsageLane::Display: return DrawDisplay( draw, area, data, gpuBusy );
     default: return std::nullopt;
     }
 }
@@ -992,6 +1367,24 @@ void UsageLaneTooltip( const UsageData& data, UsageLane lane )
         ImGui::Separator();
         TextDisabledUnformatted( "The share of time each GPU engine ran the game's work, averaged over each sample." );
         break;
+    case UsageLane::Display:
+    {
+        if( !data.display.empty() )
+        {
+            const auto count = CountDisplay( data, data.display.front().start, data.display.back().end );
+            snprintf( buf, sizeof( buf ), "%s over %s", RealToString( count.Total() ), TimeToString( data.display.back().end - data.display.front().start ) );
+            TextFocused( "Frames shown:", buf );
+            DisplayCountLines( count );
+        }
+        if( data.refreshPeriod > 0 ) TextFocused( "Refresh rate:", RefreshRate( data.refreshPeriod ) );
+        ImGui::Separator();
+        TextDisabledUnformatted( "Each bar is a frame the display showed, from the refresh the frame before appeared at" );
+        TextDisabledUnformatted( "to the refresh it appeared at; ticks mark the refreshes it missed. Zoomed out, a pixel" );
+        TextDisabledUnformatted( "shows the share of its time in frames that were on time, missed one refresh, or more." );
+        DisplayExplanation();
+        TextDisabledUnformatted( "From DXGI's frame statistics, which the engine reads once a frame while VSync is on." );
+        break;
+    }
     default:
         break;
     }

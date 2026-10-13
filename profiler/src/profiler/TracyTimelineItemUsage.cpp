@@ -1,4 +1,7 @@
+#include <algorithm>
+#include <cctype>
 #include <string>
+#include <vector>
 
 #include "TracyImGui.hpp"
 #include "TracyMouse.hpp"
@@ -54,8 +57,67 @@ const VramSeries* RangeSeries( const UsageData* usage, UsageLane lane )
     case UsageLane::Gpu:
         for( const auto& series : usage->engines ) if( !series.Empty() ) return &series;
         return nullptr;
+    case UsageLane::Display: return first( { &usage->displayRefreshes } );
     default: return nullptr;
     }
+}
+
+// The GPU context named for the direct queue, else the first Direct3D 12 one.
+const GpuCtxData* DirectQueue( const Worker& worker )
+{
+    const GpuCtxData* direct = nullptr;
+    for( const auto ctx : worker.GetGpuData() )
+    {
+        if( !ctx || ctx->threadData.empty() ) continue;
+        std::string name = ctx->name.Active() ? worker.GetString( ctx->name ) : "";
+        std::transform( name.begin(), name.end(), name.begin(), []( unsigned char c ) { return char( std::tolower( c ) ); } );
+        if( name.find( "direct" ) != std::string::npos ) return ctx;
+        if( !direct && ctx->type == GpuContextType::Direct3D12 ) direct = ctx;
+    }
+    return direct;
+}
+
+// The time the direct queue's top-level zones cover in [begin, end).
+std::optional<GpuBusy> DirectQueueBusy( const Worker& worker, int64_t begin, int64_t end )
+{
+    const auto direct = DirectQueue( worker );
+    if( !direct ) return std::nullopt;
+    std::vector<std::pair<int64_t, int64_t>> spans;
+    const auto add = [&]( const GpuEvent& ev ) {
+        const auto start = ev.GpuStart();
+        const auto zoneEnd = Worker::GetZoneEndDirect( ev );
+        if( start >= 0 && zoneEnd > begin && start < end ) spans.emplace_back( std::max( start, begin ), std::min( zoneEnd, end ) );
+        return start < end;
+    };
+    for( const auto& td : direct->threadData )
+    {
+        // Top-level zones do not overlap: from the one starting before the
+        // range on.
+        const auto& tl = td.second.timeline;
+        if( tl.is_magic() )
+        {
+            const auto& vec = *(const Vector<GpuEvent>*)&tl;
+            auto it = std::lower_bound( vec.begin(), vec.end(), begin, []( const GpuEvent& ev, int64_t t ) { return ev.GpuStart() < t; } );
+            if( it != vec.begin() ) --it;
+            for( ; it != vec.end() && add( *it ); ++it ) {}
+        }
+        else
+        {
+            auto it = std::lower_bound( tl.begin(), tl.end(), begin, []( const short_ptr<GpuEvent>& ev, int64_t t ) { return ev->GpuStart() < t; } );
+            if( it != tl.begin() ) --it;
+            for( ; it != tl.end() && add( **it ); ++it ) {}
+        }
+    }
+    std::sort( spans.begin(), spans.end() );
+    GpuBusy busy;
+    int64_t covered = INT64_MIN;
+    for( const auto& [start, stop] : spans )
+    {
+        const auto from = std::max( start, covered );
+        if( stop > from ) busy.busy += stop - from;
+        covered = std::max( covered, stop );
+    }
+    return busy;
 }
 }
 
@@ -85,8 +147,11 @@ bool TimelineItemUsage::DrawContents( const TimelineContext& ctx, int& offset )
     const auto top = ctx.wpos.y + offset;
     if( top + height >= ctx.yMin && top <= ctx.yMax )
     {
+        GpuBusyFn gpuBusy;
+        if( m_lane == UsageLane::Display && DirectQueue( m_worker ) )
+            gpuBusy = [this]( int64_t begin, int64_t end ) { return DirectQueueBusy( m_worker, begin, end ); };
         DrawOverviewLane( m_view, m_worker, ctx, top, height, HeaderLabel(), [&]( const VramPlotArea& area ) {
-            return DrawUsageLane( ImGui::GetWindowDrawList(), area, *usage, m_lane, plotHeight ); } );
+            return DrawUsageLane( ImGui::GetWindowDrawList(), area, *usage, m_lane, plotHeight, gpuBusy ); } );
     }
     offset += int( height );
     return true;

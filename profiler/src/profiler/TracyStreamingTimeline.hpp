@@ -68,6 +68,15 @@ public:
     void DrawFrameGraph();
     // The Tracy options that apply to this timeline.
     void DrawOptions();
+    // The viewer a click on a screenshot of the strip under the frame graph
+    // opens: a window of its own, drawn while it is open.
+    void DrawScreenshotViewer();
+    // For the smoke test: opens the viewer on the middle screenshot, false
+    // without screenshots; closes it; whether the screenshot list, the
+    // strip's thumbnails and the viewer's picture are all loaded.
+    bool OpenMiddleScreenshot();
+    void CloseScreenshotViewer() { m_viewerOpen = false; }
+    bool ScreenshotsSettled() const;
     // A time from the start of the program as the go-to popup reads it: typed
     // as [[h:]m:]s[.fraction] or as Tracy prints exact times.
     static std::optional<int64_t> ParseTimeText( const std::string& text );
@@ -261,6 +270,48 @@ private:
     // Serves the requests of VramResourcesAt until the timeline stops.
     void ServeVramResources( stream::EventStore& store );
 
+    // The screenshots (frame images) of the capture in time order.
+    struct Shot
+    {
+        uint64_t id = 0, frame = 0;
+        int64_t start = 0, end = 0;
+        uint16_t width = 0, height = 0;
+        bool flipped = false;
+    };
+    // A screenshot decoded upright, with its mip levels down to 1x1.
+    struct ShotPixels
+    {
+        uint64_t id = 0;
+        std::vector<int> widths, heights;
+        std::vector<std::vector<uint32_t>> levels;
+    };
+    struct ShotTexture
+    {
+        ImTextureID texture = 0;
+        int width = 0, height = 0;
+        uint64_t used = 0;
+    };
+    std::shared_ptr<const std::vector<Shot>> Shots() const;
+    // Loads the screenshot list, then decodes the thumbnails and the
+    // viewer's picture asked for, until the timeline stops.
+    void ServeShots( stream::EventStore& store );
+    // Uploads the decoded pictures; on the GUI thread.
+    void TakeShots();
+    // Asks for the thumbnails missing from those wanted, in that order.
+    void WantThumbnails( std::vector<uint64_t> ids );
+    const ShotTexture* Thumbnail( uint64_t id );
+    // Draws the strip of `height` at pos under the frame graph, whose bars
+    // span `columns` pixels: each screenshot under its frame, x of a time
+    // giving where. Returns the screenshot to mark in the graph, if any.
+    std::optional<float> DrawShotStrip( ImVec2 pos, float height, int columns, float labelWidth, const std::function<std::optional<float>( int64_t )>& timeX );
+    // Opens the viewer on a screenshot, or shows it in the open viewer.
+    void OpenShot( uint64_t id );
+    // Asks for the viewer's picture of a screenshot.
+    void WantPicture( uint64_t id );
+    // Moves the view to the frame of a screenshot.
+    void GoToShot( const Shot& shot );
+    float ShotStripHeight() const;
+
     std::filesystem::path m_journal;
     mutable std::mutex m_mutex;
     std::condition_variable m_signal;
@@ -300,6 +351,35 @@ private:
         uint64_t generation = 0;
     } m_vramRequest;
     std::thread m_vramThread;
+    // The screenshots, loaded and decoded on a handle of their own: the
+    // thumbnails asked for, first first, and the viewer's picture before them.
+    mutable std::mutex m_shotMutex;
+    std::condition_variable m_shotSignal;
+    std::shared_ptr<const std::vector<Shot>> m_shots;
+    std::vector<uint64_t> m_thumbQueue;
+    uint64_t m_pictureWanted = 0, m_pictureServed = 0;
+    std::vector<ShotPixels> m_thumbReady;
+    std::optional<ShotPixels> m_pictureReady;
+    std::thread m_shotThread;
+    // On the GUI thread: the uploaded thumbnails, least recently drawn first
+    // to go, the thumbnails last asked for, and the viewer's picture.
+    std::unordered_map<uint64_t, ShotTexture> m_thumbnails;
+    std::vector<uint64_t> m_thumbsAsked;
+    uint64_t m_shotTick = 0;
+    ShotTexture m_picture;
+    uint64_t m_pictureId = 0;
+    bool m_pictureValid = false;
+    // The strip and its viewer: shown, its size (small, medium, large), the
+    // screenshot open in the viewer, whether stepping through them moves the
+    // view, the viewer's zoom (0 fits the window) and the picture's point at
+    // the middle of the viewer, and where a right click on the strip began.
+    bool m_drawShots = true;
+    int m_shotSize = 1;
+    bool m_viewerOpen = false, m_viewerFollow = false, m_viewerFocusWindow = false;
+    uint64_t m_viewerShot = 0;
+    float m_viewerZoom = 0;
+    ImVec2 m_viewerCenter { 0, 0 };
+    std::optional<ImVec2> m_shotRightPress;
     std::optional<int64_t> m_vramClick;
     std::atomic<bool> m_vramLoading{ true };
     bool m_drawVram = true, m_showVram = false, m_drawUsage = true;
@@ -340,6 +420,17 @@ private:
     bool m_drawFrameTargets = false;
     std::array<float, 4> m_inertia {};
     float m_yDelta = 0, m_lanesHeight = 0;
+    // The direct GPU queue's top-level zones in a snapshot, merged and in
+    // time order, for the display lane's GPU busy times; spans of folded
+    // zones are marked, and the density runs kept apart.
+    struct BusySpans
+    {
+        const Snapshot* snapshot = nullptr;
+        uint64_t lane = 0;
+        bool loaded = false;
+        std::vector<std::pair<int64_t, int64_t>> spans, density;
+        std::vector<uint8_t> folded;
+    } m_busySpans;
     // The source of the zone under the mouse in the last frame, plus one, as
     // Tracy outlines the zones of the hovered zone's source location.
     uint32_t m_sourceHighlight = 0;
