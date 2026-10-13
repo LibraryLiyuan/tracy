@@ -193,6 +193,9 @@ struct CpuFrameScanOptions
     // When false, ScanView passes no representative event ref (an empty view)
     // to its sink, which then need not be formatted.
     bool runRefs = true;
+    // A frame-window evidence sink needs the native runs and quality audit,
+    // but not retained per-signature whole-capture denominator strings.
+    bool retainDenominators = true;
 };
 
 class ExactFrameCpuScanner

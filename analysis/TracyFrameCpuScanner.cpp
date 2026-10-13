@@ -1662,7 +1662,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         while( !storage.zones.empty() ) closeTop( storage.zones );
     if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
 
-    if( sink || viewSink )
+    if( options.retainDenominators && ( sink || viewSink ) )
     {
         for( const auto key : streamedPresence )
         {
@@ -1678,7 +1678,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 completeFramesBySet[frameSet], 0 } );
         }
     }
-    else
+    else if( options.retainDenominators )
     {
         AnalysisWorkspaceReservation presentWorkspace( options.workspace );
         std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> present;

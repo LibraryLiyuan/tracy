@@ -435,6 +435,7 @@ if(BUILD_TESTING)
     add_test(NAME tracy-exact-equal-distribution COMMAND tracy-exact-statistics-tests --equal-distribution-only)
     add_test(NAME tracy-exact-constant-distribution COMMAND tracy-exact-statistics-tests --constant-distribution-only)
     add_test(NAME tracy-exact-statistics-checkpoint COMMAND tracy-exact-statistics-tests --checkpoint-only)
+    add_test(NAME tracy-exact-statistics-merge-stream-limit COMMAND tracy-exact-statistics-tests --merge-stream-limit-only)
 
     add_executable(tracy-cache-publish-retry-tests tests/CachePublishRetryTests.cpp)
     target_link_libraries(tracy-cache-publish-retry-tests PRIVATE TracyAnalysis)

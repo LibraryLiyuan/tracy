@@ -13,6 +13,10 @@
 #include <random>
 #include <iostream>
 #include <sstream>
+#include <thread>
+#ifdef _WIN32
+#include <cstdio>
+#endif
 
 using namespace tracy::analysis;
 
@@ -335,8 +339,83 @@ void ParallelFinishMatches( const std::filesystem::path& root )
     std::cout << "parallel finish matches the serial finish\n";
 }
 
+// More than one Windows merge worker must leave room for the process's
+// existing CRT streams as well as the output streams. Exercise real spill
+// files and compare both the independently known totals and the serial hash.
+bool ParallelMergeWithExistingStreams( const std::filesystem::path& root )
+{
+#ifdef _WIN32
+    const auto previousLimit = _getmaxstdio();
+    if( _setmaxstdio( 512 ) != 512 ) return false;
+    struct RestoreLimit
+    {
+        int value;
+        ~RestoreLimit() { _setmaxstdio( value ); }
+    } restore { previousLimit };
+    std::vector<std::ifstream> existingStreams;
+    existingStreams.reserve( 200 );
+    for( size_t index = 0; index < 200; ++index )
+    {
+        existingStreams.emplace_back( "NUL", std::ios::binary );
+        if( !existingStreams.back().is_open() ) return false;
+    }
+#endif
+    std::string serialHash;
+    for( const size_t workers : { 1, 4 } )
+    {
+        const auto runRoot = root / std::to_string( workers );
+        auto workspace = std::make_shared<AnalysisWorkspaceBudget>(
+            512ull * 1024 * 1024, 256ull * 1024 * 1024 );
+        NeutralStatisticsStreamBuilder builder( runRoot, 64, 1, workspace );
+        builder.SetFinishWorkers( workers );
+        builder.SetProgress( []( std::string_view stage, uint64_t done, uint64_t total ) {
+            // Keep completed reader groups alive briefly so the test exercises
+            // overlapping merges even on fast disks. No file I/O is mocked.
+            if( stage.starts_with( "neutral_statistics_merge_pass_" ) && done == 0 && total != 0 )
+                std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
+        } );
+        for( uint64_t frame = 0; frame < 768; ++frame )
+            if( !builder.AddRun( Input( "stream-budget", frame, 12, 7, 2, 3 ) ) ) return false;
+        builder.AddDenominator( Denominator( "stream-budget", 768 ) );
+        builder.AddDomainAudit( { "cpu", true, "complete", 768, 768, 1,
+            std::string( 64, 'a' ), std::string( 64, 'a' ), true, {} } );
+        builder.SaveCheckpoint( runRoot / "checkpoint", std::string( 64, 'f' ) );
+        size_t spillFiles = 0;
+        for( const auto& entry : std::filesystem::directory_iterator( runRoot ) )
+            if( entry.path().extension() == ".work" ) ++spillFiles;
+        if( spillFiles <= 512 ) return false;
+        NeutralStatisticsResult result;
+        std::string error;
+        if( !builder.Finish( result, error ) )
+        {
+            std::cerr << "merge with existing streams failed: workers=" << workers
+                << " error=" << error << '\n';
+            return false;
+        }
+        if( !result.qualityComplete || result.unreportedGapCount != 0 || result.signatures.size() != 1 ) return false;
+        const auto& signature = result.signatures.front();
+        const auto& exclusive = signature.exclusive.perCompleteFrame;
+        if( signature.occurrenceCount != 768 || signature.inclusive.perCompleteFrame.total != 9216 ||
+            exclusive.count != 768 || exclusive.zeroCount != 0 || exclusive.total != 5376 ||
+            exclusive.min != 7 || exclusive.max != 7 || exclusive.median != 7 || exclusive.p99 != 7 ||
+            signature.wait.perCompleteFrame.total != 1536 || signature.criticalPath.perCompleteFrame.total != 2304 )
+            return false;
+        if( workers == 1 ) serialHash = result.contentSha256;
+        else if( result.contentSha256 != serialHash ) return false;
+    }
+    std::cout << "parallel merge preserves exact totals and serial checksum with existing streams\n";
+    return true;
+}
+
 int main( int argc, char** argv )
 {
+    if( argc > 1 && std::string_view( argv[1] ) == "--merge-stream-limit-only" )
+    {
+        const auto root = TemporaryRoot();
+        const auto ok = ParallelMergeWithExistingStreams( root );
+        std::filesystem::remove_all( root );
+        return ok ? 0 : 1;
+    }
     if(argc>1 && std::string_view(argv[1])=="--checkpoint-only")
     {
         const auto root=TemporaryRoot();const auto ok=CheckpointRoundTrip<NeutralStatisticsStreamBuilder>(root);

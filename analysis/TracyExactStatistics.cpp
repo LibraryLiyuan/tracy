@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -31,6 +32,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <syncstream>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -1371,11 +1373,19 @@ struct NeutralStatisticsStreamBuilder::Impl
 
         explicit Reader( const std::filesystem::path& path, uint64_t signatures,
             const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
-            : input( path, std::ios::binary ), budget( workspace,
+            : budget( workspace,
                 65536 + ZSTD_estimateDCtxSize() ), signatureLimit( signatures )
         {
+            errno = 0;
+            input.open( path, std::ios::binary );
+            const auto openError = errno;
             opened = input.is_open();
-            if( !opened ) return;
+            if( !opened )
+            {
+                std::osyncstream( std::cerr ) << "Query neutral-run open failed path=" << path
+                    << " errno=" << openError << '\n';
+                return;
+            }
             input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
             if( input.gcount() != sizeof( header ) ) { error = "neutral_run_header_truncated"; return; }
             if( std::memcmp( header.magic, "JNNRUN2", 8 ) != 0 || header.version != 2 ||
@@ -1556,7 +1566,7 @@ struct NeutralStatisticsStreamBuilder::Impl
         while( runs.size() > keep )
         {
             size_t concurrency = std::max<size_t>( 1, std::min<size_t>( finishWorkers, 4 ) );
-            size_t fanIn = 128;
+            size_t fanIn = FanIn;
             if( workspace )
             {
                 const auto budget = workspace->Snapshot();
@@ -1566,7 +1576,7 @@ struct NeutralStatisticsStreamBuilder::Impl
                 const auto perMerge = remaining / concurrency;
                 const auto readers = perMerge > 2ull * 1024 * 1024 ?
                     ( perMerge - 2ull * 1024 * 1024 ) / ( 1024 * 1024 ) : 0;
-                fanIn = size_t( std::clamp<uint64_t>( readers, 2, 128 ) );
+                fanIn = size_t( std::clamp<uint64_t>( readers, 2, FanIn ) );
             }
             std::vector<std::vector<std::filesystem::path>> groups;
             std::vector<std::filesystem::path> next;
@@ -1576,8 +1586,9 @@ struct NeutralStatisticsStreamBuilder::Impl
                 groups.emplace_back( runs.begin() + first, runs.begin() + last );
                 next.push_back( NextPath( "neutral-merge" ) );
             }
-            // Each merge opens up to FanIn runs; the C runtime allows 512 open
-            // streams by default, so at most four merges run at once.
+            // Bound input streams independently of the memory budget. Four
+            // 64-way merges use 256 input streams, leaving room for outputs
+            // and existing process streams under the CRT's default 512 limit.
             const auto threads = std::min( concurrency, groups.size() );
             const auto stage = [&]( size_t group ) {
                 return "neutral_statistics_merge_pass_" + std::to_string( pass ) +

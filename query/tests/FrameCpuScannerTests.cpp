@@ -713,8 +713,39 @@ bool WindowedScanMatches()
     return true;
 }
 
-int main()
+bool ForwardingWithoutDenominatorsMatches()
 {
+    CpuTreeSource source;
+    const auto scan=[&](bool retain) {
+        CpuFrameScanOptions options;
+        options.retainDenominators=retain;
+        options.includeExactSignatures=true;
+        options.includeLogicalSignatures=false;
+        options.definitionSink=[](const CpuSignatureDefinition&){return true;};
+        std::ostringstream stream;
+        auto result=ExactFrameCpuScanner(source,3).ScanView([&](const CpuSignatureFrameRunView& r) {
+            stream << r.signatureId << '|' << r.frameSetRef << '|' << r.frameIndex << '|'
+                << r.inclusiveNs << '|' << r.directChildUnionNs << '|' << r.exclusiveNs << '|'
+                << r.occurrenceCount << '|' << r.exact << '|' << r.representativeEventRef << '\n';
+            return true;
+        },options);
+        if(retain && result.denominators.empty()) throw std::runtime_error("default denominators missing");
+        if(!retain && !result.denominators.empty()) throw std::runtime_error("forward-only scan retains denominator strings");
+        stream << "quality|" << result.inputZoneCount << '|' << result.validZoneCount << '|'
+            << result.invalidZoneCount << '|' << result.completeFrameCount << '|'
+            << result.incompleteFrameCount << '|' << result.qualityComplete << '\n';
+        for(const auto& q:result.qualityFindings) stream << q.code << '|' << q.count << '\n';
+        return stream.str();
+    };
+    try {return scan(true)==scan(false);}
+    catch(const std::exception& e) {std::cerr << e.what() << '\n';return false;}
+}
+
+int main(int argc,char** argv)
+{
+    if(argc>1 && std::string_view(argv[1])=="--denominator-forward-only")
+        return ForwardingWithoutDenominatorsMatches() ? 0 : 1;
+    if(!ForwardingWithoutDenominatorsMatches()) return 1;
     if( !CompactRecordPassMatches() ) return 1;
     if( !WindowedScanMatches() ) return 1;
     bool workspaceTestsPassed = true;
