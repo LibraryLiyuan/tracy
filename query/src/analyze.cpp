@@ -215,7 +215,7 @@ bool RestoreStage( const fs::path& from, const fs::path& to, const std::string& 
         const auto name = receipt.at( "path" ).get<std::string>();
         if( std::find( StageFiles.begin(), StageFiles.end(), name ) == StageFiles.end() || !found.insert( name ).second ) return false;
         const auto path = from / name;
-        if( !fs::is_regular_file( path ) || fs::file_size( path ) != receipt.at( "bytes" ).get<uint64_t>() || analysis::Sha256File( path ) != receipt.at( "sha256" ) ) return false;
+        if( !fs::is_regular_file( path ) || fs::file_size( path ) != receipt.at( "bytes" ).get<uint64_t>() || analysis::Sha256File( path ) != receipt.at( "sha256" ).get<std::string>() ) return false;
     }
     for( const auto& name : StageFiles ) fs::copy_file( from / name, to / name );
     fs::copy_file( from / "triage-stage.json", to / "triage-stage.json" );
@@ -293,7 +293,7 @@ int main( int argc, char** argv )
         if( fs::exists( output ) && !fs::is_empty( output ) ) throw std::runtime_error( "output must be new or empty" );
         fs::create_directories( output ); ownsOutput = true;
         const auto started = Clock::now();
-        analysis::AnalysisProcessMemoryOptions memoryOptions; memoryOptions.maximumBytes = 4ull << 30;
+        analysis::AnalysisProcessMemoryOptions memoryOptions; memoryOptions.maximumBytes = 32ull << 30;
         analysis::AnalysisProcessMemoryGuard memory( memoryOptions ); std::stop_source stop; auto monitor = memory.Monitor( stop );
         const auto plan = planPath.empty() ? json::object() : Read( planPath ); Save( output / "plan.json", plan );
         if( mode == "shortlist" && ( !plan.value( "windows", json::array() ).empty() || !plan.value( "requests", json::array() ).empty() ) )
@@ -341,7 +341,7 @@ int main( int argc, char** argv )
             const auto ready = sessions.WaitReady( opened.id, std::chrono::hours( 24 ) );
             if( ready.state != analysis::TraceSourceState::Ready ) throw std::runtime_error( ready.errorMessage );
             const auto source = sessions.GetReadySource( ready.id ); const auto view = source->AcquireReadView();
-            if( view.revision != identity["revision"].get<uint64_t>() || source->GetTraceInfo().fingerprint != identity["source_sha256"] ) throw std::runtime_error( "source_revision_changed" );
+            if( view.revision != identity["revision"].get<uint64_t>() || source->GetTraceInfo().fingerprint != identity["source_sha256"].get<std::string>() ) throw std::runtime_error( "source_revision_changed" );
             manifest["open_ms"] = Milliseconds( step );
             query::QueryService service( sessions, 64ull << 20 );
             // Capture settings are recorded before heavy CPU/GPU scanning.

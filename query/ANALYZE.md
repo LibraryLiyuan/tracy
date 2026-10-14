@@ -118,7 +118,7 @@ occurrences; frame-clipped inclusive totals are explicitly separate.
 
 SQLite main cache stays at 64 MiB; compact readers use 8 MiB each. Result buffers
 and export staging caches are separate from these limits. The full-run private
-memory guard is 4 GiB. Fast runs avoid Worker memory.
+memory guard is 32 GiB. Fast runs avoid Worker memory.
 
 ## Build / verification
 
