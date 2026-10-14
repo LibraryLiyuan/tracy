@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-10",
+  "engine_head": "214a769e64ab3a765ef2acf4554799680fcff1c7",
+  "scope": "Current source config files, not effective runtime or deployed Player verification",
+  "configs": [
+    {
+      "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config/JNTracy.ini",
+      "sha256": "6978CDEE75C05B37852E3C8D25E6E1FCBF57F9DAE89F6D0830F030BA7C883854",
+      "settings": {
+        "preset": "HighEvidence",
+        "profile": "Detail",
+        "sampling_hz": "2000",
+        "unity_marker_depth": "0",
+        "gpu_reference_mode": "Enabled",
+        "gpu_reference_granularity": "Frame",
+        "gpu_memory": "true",
+        "catalog_enabled": "false"
+      }
+    },
+    {
+      "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config/JNTracy.HighEvidence.ini",
+      "sha256": "223FC82829021B0C512733B12D92A8A167300DBD8F9EA6FB98E4AFAC5CAB12AD",
+      "settings": {
+        "preset": "HighEvidence",
+        "profile": "Detail",
+        "sampling_hz": "2000",
+        "unity_marker_depth": "0",
+        "gpu_reference_mode": "Enabled",
+        "gpu_reference_granularity": null,
+        "gpu_memory": "true",
+        "catalog_enabled": "true"
+      }
+    }
+  ],
+  "readme": {
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config/README.zh-CN.md",
+    "sha256": "723AE9C8B0E220CF00985777AF1AEFB34C85C8BD81BBD7980D4CA991595F64A5",
+    "outdated_statement": "Default JNTracy.ini is an alias of Daily",
+    "drift_confirmed": true
+  },
+  "granularity_null_means": "not explicitly set in this INI, not evidence of effective runtime default"
+}

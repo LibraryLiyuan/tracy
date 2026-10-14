@@ -1,0 +1,338 @@
+{
+  "date": "2026-10-10",
+  "scope": "Referenced sources and focused verification files; hashes establish identity, not independent acceptance",
+  "sources": [
+    {
+      "path": "C:\\CodeProjects\\GodotProjects\\tracy-0.13.1\\profiler\\src\\profiler\\TracyView.cpp",
+      "kind": "file",
+      "exists": true,
+      "bytes": 58180,
+      "sha256": "3A0011C8BD6D1F3E6CC72B9C3DB492999F800C11B8CF3948A363CBD3220B47AB"
+    },
+    {
+      "path": "C:\\CodeProjects\\GodotProjects\\tracy-0.13.1\\profiler\\src\\profiler\\TracyView.hpp",
+      "kind": "file",
+      "exists": true,
+      "bytes": 48549,
+      "sha256": "913B2C438293A6A9FC8F33D78D5D0F1F933CE3DE527A9E0E00AB5939A31C2D18"
+    },
+    {
+      "path": "C:\\CodeProjects\\GodotProjects\\tracy-0.13.1\\skills\\diagnose-jn-unity-tracy\\SKILL.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 20408,
+      "sha256": "294E347146EFB978A2043973EFC1956086513C60FA1B24B8D68A57A13963699E"
+    },
+    {
+      "path": "C:\\workflow\\jnunity\\Runtime\\Profiler\\JNTracy\\Config\\JNTracy.HighEvidence.ini",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3825,
+      "sha256": "223FC82829021B0C512733B12D92A8A167300DBD8F9EA6FB98E4AFAC5CAB12AD"
+    },
+    {
+      "path": "C:\\workflow\\jnunity\\Runtime\\Profiler\\JNTracy\\Config\\JNTracy.ini",
+      "kind": "file",
+      "exists": true,
+      "bytes": 4719,
+      "sha256": "6978CDEE75C05B37852E3C8D25E6E1FCBF57F9DAE89F6D0830F030BA7C883854"
+    },
+    {
+      "path": "C:\\workflow\\jnunity\\Runtime\\Profiler\\JNTracy\\Config\\README.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3247,
+      "sha256": "723AE9C8B0E220CF00985777AF1AEFB34C85C8BD81BBD7980D4CA991595F64A5"
+    },
+    {
+      "path": "C:\\Users\\Admin\\.codex\\skills\\diagnose-jn-unity-tracy\\SKILL.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 20408,
+      "sha256": "294E347146EFB978A2043973EFC1956086513C60FA1B24B8D68A57A13963699E"
+    },
+    {
+      "path": "C:\\Users\\Admin\\.codex\\skills\\jntracy-stage-player-code\\SKILL.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 7317,
+      "sha256": "2A88129DD3A36527FF63BB267DE4C411934C488FFE99AEBE62D5FB0AFA3DF8A7"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\deployment-records\\20260816\\Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 23503,
+      "sha256": "D64886D3F9347687BCA6E7BE6C783D161D0650B58B0F629F292DA7264A2D3E9F"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 19053,
+      "sha256": "B756FBF6D2C0E3BA8D98574FD9B9D7AD17628E862726C1565A5708AE5540595B"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\GpuCatalog-DiskIndex\\Query-Final-Acceptance-20260929-r20\\Report.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 5154,
+      "sha256": "8F4E35B550B2FA1216E1AC350CACB15300AF9491CA2F6B1D081A703506EBD9E0"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\History\\Organization-20260911\\move-map.csv",
+      "kind": "file",
+      "exists": true,
+      "bytes": 42963,
+      "sha256": "084DB93EC0893C13FD03CD09A4C6943D5A6CD90990A3448BAFB877DA97E43B32"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\architecture.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 4375,
+      "sha256": "53C824523C2F0006A6118030C6CBBC0EB53F8685BDF098DC3EECA191A35A66CC"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\capabilities.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3807,
+      "sha256": "FAE236B2C08D0C52E742C47FD56C7112C9B385EF5C953C652D24FABB8B85958F"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\contracts.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 4202,
+      "sha256": "B84EC0EA879C6607305D014ADD41B6EDDBAEB68CF4823BD19BFBA2233C0651FE"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\03-cpu-job.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3259,
+      "sha256": "03F9E92361EEFC44EE39046D7AFCA6725BB26C12A9907FACD49C6829B34B7206"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\04-gpu-frame-dxr.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3091,
+      "sha256": "5EE83CF20BA32B9500E17F90CF3D59F3D1B06B51CAFCC0B7A5AFC32F633687E6"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\05-resource-memory.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3018,
+      "sha256": "7761DBE42886F67E0AD13DA2F932D4EF033431FC0F3B2564DB6215E1F56389A6"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\README.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 1386,
+      "sha256": "6E96214BD7F0A3B1740E0ECA02D2690F5F982D0B3DFC3AC9B827EE31458E65FD"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\README.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 2907,
+      "sha256": "FA4D8F4D594EDAEC55666201D3133E824DE9D89A52A5ECB521E3D4CDCA3B7436"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\resource-evolution.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3170,
+      "sha256": "4FB3BFACC9A5443843FE5462F269FE0E5B247A9FE59FAB1DB531641028905FB3"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\storage-evolution.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 2915,
+      "sha256": "F54F28687891957C27B4880668A6260825837D6BFD34F0A56F23427E260D876F"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\README.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3535,
+      "sha256": "83C0850D09C9A1F017D91B3ABBCCE0C0075F55D67E45E1C36CDC3AD0FF938538"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\runbook.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 5196,
+      "sha256": "BC2A5B2CFDE7BD7C1C1E6DD5A0C1F37AC674F7B7CD8CAC0AC103CD13FF8670E9"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\tool-catalog.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 5080,
+      "sha256": "D9C9C981B5CB24C7B2D0F52473AF869363A94A3AC2E9F29BC299D827442A5A17"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\decisions.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3009,
+      "sha256": "C510A12CA5FF21F74FC57A75673145BA6C965439175A650112D392C3F923D83B"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\metrics.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3471,
+      "sha256": "F075C30E9B1AFD5741BD8D6CF8E9A4B8BD86154573549EA0DC52D3FE15BB0188"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\validation.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3190,
+      "sha256": "41D318EDEFCB99DCE7B69D7AF54BB8C03ADDB16ECDFC3E77800922B0EE651EA6"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\README.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 4127,
+      "sha256": "8330F1ABC982ABA5E2307F9AA5DCC44CEEE3FC03A00E6171186828FBB6B67B9E"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 18908,
+      "sha256": "C239400BA6E66C087ECF765B1B869F0B492861AA0EF086CA34A113E238A59E06"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 13096,
+      "sha256": "FCDEF949025263D55E366A9243339E50128C5F79D21F36CA1BD2A168B6CB766D"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\output\\tracy-manual-zh-CN\\README.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3254,
+      "sha256": "103E10AA9ACD85BC75242B4EF128994A696A29F6749BEF20798BA89177DEC226"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\QS17-Skill-2.3.1-ReportIteration\\Typora\\Performance-Analysis-Report.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 16988,
+      "sha256": "7696E54AB47142D0726BB6227675CD6F317F657D2DE833583654D00277031F32"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\QS17-Skill-2.3.1-SharePackage\\README.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 1312,
+      "sha256": "C663E3B42FF1E15011EEB0DB45D6CF4DA29408A4918C8F8497E3FA5CF281A967"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Query-Cache-Storage-Optimization\\Implementation-Status.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 8365,
+      "sha256": "865807694A0D4E4B1669B4FBF6C549F6015EAA911B26B6D68977E9977F458E3C"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 10200,
+      "sha256": "DB3F8781F1BDAA94658CA292648C2FBD386EE1764232E9FF10B0681E51AC3415"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\插桩分析与报告格式约束建议.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 10091,
+      "sha256": "F08189EB2F82E16337AC81B41338B04EA0DEBB96033AFE5E3D2CE67905443186"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\Tracy分析与报告质量深度评审.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 22492,
+      "sha256": "5E7186E1B83E513F03C91EC2FF423A61FD37A02B0D6A662942E67354CF199BF8"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\TestMachine-Handoff\\2026-09-14\\README.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 7164,
+      "sha256": "12787E6022C3028B5D2B96917A61645833F8EB609BFF410D3D97F505D5948ECF"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Evidence\\20261007-mcp-parity-001\\README.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 24020,
+      "sha256": "6FC5F9169E142D1435A54273F4CCA2ADBE0722B2C0BFA240E3EF768DEB1A2975"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-MCP-Parity-Plan-20261007.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 25679,
+      "sha256": "2BC17E9C01715B7204CCA3C4BF8AFBC54005754A12F6482EE5A96C1C08B909AB"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 205162,
+      "sha256": "E9BFD76CC6D464C2A857D390A5C62BC0381A78DF6102F256CCAAD63E911BF778"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\",
+      "kind": "directory",
+      "exists": true
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\executables.json",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3992,
+      "sha256": "1A5103E1AD2C632AFA7166023B7F29B74CCA2D44D1702F9399430D127D67C471"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\validation.json",
+      "kind": "file",
+      "exists": true,
+      "bytes": 3181,
+      "sha256": "D93A8EEC73A1F9F2314DE7FA550CDEEA83DC6F2E3D80E637CB91E7686413F495"
+    },
+    {
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\UnityProfiler-Tracy-JobWorker-20260928\\SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "kind": "file",
+      "exists": true,
+      "bytes": 1618,
+      "sha256": "1AC4A383F2B23196449942FDFF6D64C44D5D86ED0B25B3FA863024B5E4AF369A"
+    },
+    {
+      "path": "C:\\workflow\\jnunity\\Runtime\\Profiler\\JNTracy\\Config\\",
+      "kind": "directory",
+      "exists": true
+    },
+    {
+      "path": "C:\\workflow\\T3_Builds\\t3_publication_cn_development_v0.0.2375.7327240_default\\T3_development_JNTracy_20261009-203345\\_JNTracyDeploymentManifest.json",
+      "kind": "file",
+      "exists": true,
+      "bytes": 46628,
+      "sha256": "0BD0E6B6C14F3730899CA0B183D2520929D90B34A6A9C10C50D3E71D0B9D174D"
+    }
+  ]
+}

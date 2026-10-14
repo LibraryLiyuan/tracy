@@ -1,0 +1,435 @@
+{
+  "date": "2026-10-10",
+  "documents": [
+    "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+    "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md"
+  ],
+  "local_link_count": 70,
+  "missing_count": 0,
+  "missing": [],
+  "thread_count": 113,
+  "unique_thread_count": 113,
+  "reviewed_turn_count": 288,
+  "links": [
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "sources.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "evidence/repository-snapshot.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\repository-snapshot.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Tracy-Integrated-3947331da/",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "evidence/tool-hash-check.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\tool-hash-check.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Tracy-Integrated-3947331da/validation.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\validation.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../01-system/architecture.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\architecture.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../02-chains/03-cpu-job.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\03-cpu-job.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../03-iterations/resource-evolution.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\resource-evolution.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../02-chains/04-gpu-frame-dxr.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\04-gpu-frame-dxr.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../02-chains/05-resource-memory.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\05-resource-memory.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../06-quality/metrics.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\metrics.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\deployment-records\\20260816\\Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config/",
+      "resolved_path": "C:\\workflow\\jnunity\\Runtime\\Profiler\\JNTracy\\Config\\",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../03-iterations/storage-evolution.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\storage-evolution.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Evidence\\20261007-mcp-parity-001\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\GpuCatalog-DiskIndex\\Query-Final-Acceptance-20260929-r20\\Report.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/SKILL.md",
+      "resolved_path": "C:\\Users\\Admin\\.codex\\skills\\diagnose-jn-unity-tracy\\SKILL.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\Tracy分析与报告质量深度评审.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\插桩分析与报告格式约束建议.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../QS17-Skill-2.3.1-SharePackage/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\QS17-Skill-2.3.1-SharePackage\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "C:/Users/Admin/.codex/skills/jntracy-stage-player-code/SKILL.md",
+      "resolved_path": "C:\\Users\\Admin\\.codex\\skills\\jntracy-stage-player-code\\SKILL.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../TestMachine-Handoff/2026-09-14/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\TestMachine-Handoff\\2026-09-14\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\UnityProfiler-Tracy-JobWorker-20260928\\SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "../../../output/tracy-manual-zh-CN/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\output\\tracy-manual-zh-CN\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "target": "sources.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "work-inventory.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\work-inventory.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../01-system/architecture.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\architecture.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../01-system/capabilities.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\capabilities.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../01-system/contracts.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\contracts.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../02-chains/README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../03-iterations/README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../04-branches/README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../05-operations/runbook.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\runbook.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../05-operations/tool-catalog.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\tool-catalog.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../06-quality/metrics.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\metrics.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../06-quality/validation.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\validation.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../06-quality/decisions.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\decisions.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\deployment-records\\20260816\\Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Query-Cache-Storage-Optimization/Implementation-Status.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Query-Cache-Storage-Optimization\\Implementation-Status.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\GpuCatalog-DiskIndex\\Query-Final-Acceptance-20260929-r20\\Report.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Fixed-Slice-MCP-Parity-Plan-20261007.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-MCP-Parity-Plan-20261007.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Fixed-Slice-Evidence\\20261007-mcp-parity-001\\README.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\Tracy分析与报告质量深度评审.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Skill-Quality-Review-20261008\\插桩分析与报告格式约束建议.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\UnityProfiler-Tracy-JobWorker-20260928\\SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../QS17-Skill-2.3.1-ReportIteration/Typora/Performance-Analysis-Report.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\QS17-Skill-2.3.1-ReportIteration\\Typora\\Performance-Analysis-Report.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../QS17-Skill-2.3.1-SharePackage/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\QS17-Skill-2.3.1-SharePackage\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Integrated-3947331da/",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Integrated-3947331da/executables.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\executables.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../Tracy-Integrated-3947331da/validation.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\validation.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "C:/workflow/T3_Builds/t3_publication_cn_development_v0.0.2375.7327240_default/T3_development_JNTracy_20261009-203345/_JNTracyDeploymentManifest.json",
+      "resolved_path": "C:\\workflow\\T3_Builds\\t3_publication_cn_development_v0.0.2375.7327240_default\\T3_development_JNTracy_20261009-203345\\_JNTracyDeploymentManifest.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../TestMachine-Handoff/2026-09-14/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\TestMachine-Handoff\\2026-09-14\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../output/tracy-manual-zh-CN/README.zh-CN.md",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\output\\tracy-manual-zh-CN\\README.zh-CN.md",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "../../../History/Organization-20260911/move-map.csv",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\History\\Organization-20260911\\move-map.csv",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/thread-read-audit.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\thread-read-audit.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/thread-inventory.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\thread-inventory.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/repository-snapshot.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\repository-snapshot.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/tool-hash-check.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\tool-hash-check.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/config-comparison.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\config-comparison.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/source-file-manifest.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\source-file-manifest.json",
+      "exists": true
+    },
+    {
+      "document": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\sources.zh-CN.md",
+      "target": "evidence/document-check.json",
+      "resolved_path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\09-handoff\\2026-10-10\\evidence\\document-check.json",
+      "exists": true
+    }
+  ]
+}

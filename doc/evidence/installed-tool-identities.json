@@ -1,0 +1,21 @@
+{
+  "scope": "Installed tool identity only; does not prove built from current mainline",
+  "checks": [
+    {
+      "config": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/config/stream-local.json",
+      "path": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/bin/tracy-analyze.exe",
+      "expected": "e707bab79af9caf40b04566ccc04e3739fd58a63c7684f1d55896916ae6eaf74",
+      "actual": "e707bab79af9caf40b04566ccc04e3739fd58a63c7684f1d55896916ae6eaf74",
+      "matches": true,
+      "bytes": 21241856
+    },
+    {
+      "config": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/config/stream-viewer-local.json",
+      "path": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/bin/tracy-profiler-offscreen.exe",
+      "expected": "9c18b11a105016a5a373a4c766c68f6c6dd3744925f53c4718323b37291c5288",
+      "actual": "9c18b11a105016a5a373a4c766c68f6c6dd3744925f53c4718323b37291c5288",
+      "matches": true,
+      "bytes": 30108672
+    }
+  ]
+}

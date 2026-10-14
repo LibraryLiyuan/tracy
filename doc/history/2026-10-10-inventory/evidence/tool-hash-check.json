@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-10",
+  "commit": "3947331da927aacb118fa2f566e670d17a30117b",
+  "configuration": "Release, validation build without LTO",
+  "scope": "Rechecked executable bytes against existing build manifest; did not rerun product acceptance",
+  "checks": [
+    {
+      "name": "tracy-profiler.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-profiler.exe",
+      "expected": "d30e598ade34a15d74c2692dfaf1547de2b8933715b215c8f146570b0e664c2a",
+      "actual": "d30e598ade34a15d74c2692dfaf1547de2b8933715b215c8f146570b0e664c2a",
+      "matches": true
+    },
+    {
+      "name": "tracy-query.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-query.exe",
+      "expected": "8d9ebb8a5136608cacad48d5a7d9ee592c08228f9dfe0d1c6c27db8646424f01",
+      "actual": "8d9ebb8a5136608cacad48d5a7d9ee592c08228f9dfe0d1c6c27db8646424f01",
+      "matches": true
+    },
+    {
+      "name": "tracy-capture.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-capture.exe",
+      "expected": "abd98ad7f369941f87669e3405f4e26cc7ff3e9e4de6868b80fa25d45772c4c4",
+      "actual": "abd98ad7f369941f87669e3405f4e26cc7ff3e9e4de6868b80fa25d45772c4c4",
+      "matches": true
+    },
+    {
+      "name": "tracy-stream-convert.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-stream-convert.exe",
+      "expected": "7c75fac8c7a6ee11fd64227adab0ca571a14386834e2bd4555cf3d7c9112b9bc",
+      "actual": "7c75fac8c7a6ee11fd64227adab0ca571a14386834e2bd4555cf3d7c9112b9bc",
+      "matches": true
+    },
+    {
+      "name": "tracy-capture-gui.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-capture-gui.exe",
+      "expected": "24c01bc1ff4addc420450ec4cb7369aff8a486f590e260ce04ef147b1e261a3c",
+      "actual": "24c01bc1ff4addc420450ec4cb7369aff8a486f590e260ce04ef147b1e261a3c",
+      "matches": true
+    },
+    {
+      "name": "tracy-stream.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-stream.exe",
+      "expected": "772d2779b3121484b2088d7fb0562ab56892e78cb6fb6a4a38757eeaa0d94d9f",
+      "actual": "772d2779b3121484b2088d7fb0562ab56892e78cb6fb6a4a38757eeaa0d94d9f",
+      "matches": true
+    },
+    {
+      "name": "tracy-stream-index.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-stream-index.exe",
+      "expected": "f3522a62948021ea9b1e888495ad2c0d3ce1dd460d76aa0b6708f8678a39f27c",
+      "actual": "f3522a62948021ea9b1e888495ad2c0d3ce1dd460d76aa0b6708f8678a39f27c",
+      "matches": true
+    },
+    {
+      "name": "tracy-stream-export.exe",
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\Tracy-Integrated-3947331da\\tracy-stream-export.exe",
+      "expected": "503b7291264f6fab2d39d7e8317980ba486e19a86b2674f796d474b6b3478770",
+      "actual": "503b7291264f6fab2d39d7e8317980ba486e19a86b2674f796d474b6b3478770",
+      "matches": true
+    }
+  ]
+}

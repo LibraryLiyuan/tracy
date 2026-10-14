@@ -1,0 +1,2894 @@
+{
+  "date": "2026-10-10",
+  "timezone": "Asia/Singapore",
+  "purpose": "Tracy AI 性能分析工作交接内容梳理",
+  "audience": "接手开发维护的同事，同时兼顾使用者",
+  "scope_note": "读取相关聊天的关键近期轮次，未把此记录解释为所有历史轮次的逐条审计；聊天结论保留其当时的版本与验收边界。",
+  "count": 113,
+  "threads": [
+    {
+      "id": "019fb779-f10c-74a2-bd54-88c17ac83276",
+      "title": "Unity Tracy 接入迭代 (3)",
+      "created_at": 1785489650,
+      "updated_at": 1785502485,
+      "url": "codex://threads/019fb779-f10c-74a2-bd54-88c17ac83276",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb83d-5fcc-7463-91da-1f90e58d753f",
+          "status": "completed",
+          "started_at": 1785502457,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb836-d133-7610-8a34-ba0e5c4e50bc",
+          "status": "completed",
+          "started_at": 1785502028,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0cd4a-7b2d-7ca3-b894-8623583b738c",
+      "title": "梳理 N30 相关文件夹",
+      "created_at": 1790150605,
+      "updated_at": 1790151417,
+      "url": "codex://threads/01a0cd4a-7b2d-7ca3-b894-8623583b738c",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0cd51-0c4a-7932-a0e9-486a2c0f6f4f",
+          "status": "completed",
+          "started_at": 1790151035,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0cd4a-7d86-7ab3-bc2a-503079bd6863",
+          "status": "completed",
+          "started_at": 1790150606,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0e761-ddf7-7842-a893-8f16159831b8",
+      "title": "Identify Tracy GPU memory curve",
+      "created_at": 1790588345,
+      "updated_at": 1790588554,
+      "url": "codex://threads/01a0e761-ddf7-7842-a893-8f16159831b8",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0e762-586b-7ef0-b860-3c2b4253bc91",
+          "status": "completed",
+          "started_at": 1790588377,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0b32a-88f5-7430-93d4-676f5176ce86",
+      "title": "评估30分钟Tracy文件处理能力",
+      "created_at": 1790147981,
+      "updated_at": 1790683379,
+      "url": "codex://threads/01a0b32a-88f5-7430-93d4-676f5176ce86",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0cd22-7282-7691-99fb-7a7b5cec52e3",
+          "status": "completed",
+          "started_at": 1790147981,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0cd02-db0b-7fb3-ad21-6ee1d215e6e4",
+          "status": "completed",
+          "started_at": 1790145911,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a07a72-b7eb-71a2-ae15-3a9de617e105",
+      "title": "分析 JNUnity 光追硬件开销",
+      "created_at": 1788760733,
+      "updated_at": 1788761326,
+      "url": "codex://threads/01a07a72-b7eb-71a2-ae15-3a9de617e105",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07a73-a083-7901-93d1-222552b8656b",
+          "status": "completed",
+          "started_at": 1788760793,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f8880-72f6-7f21-a205-d7c0443c11dc",
+      "title": "查找 Tracy 中文操作文档",
+      "created_at": 1784701552,
+      "updated_at": 1784707665,
+      "url": "codex://threads/019f8880-72f6-7f21-a205-d7c0443c11dc",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f8889-95e9-7ba2-89d4-a02d26682682",
+          "status": "completed",
+          "started_at": 1784702146,
+          "final_messages": 1
+        },
+        {
+          "id": "019f8886-d05a-7c83-a1ae-0d814a9b9376",
+          "status": "interrupted",
+          "started_at": 1784701964,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "019ff900-d457-7130-bb95-1a622eecc1b6",
+      "title": "Unity Tracy 接入迭代 (5)",
+      "created_at": 1786589009,
+      "updated_at": 1786589161,
+      "url": "codex://threads/019ff900-d457-7130-bb95-1a622eecc1b6",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019ff901-7013-7492-bdd3-d60f0316689b",
+          "status": "completed",
+          "started_at": 1786589048,
+          "final_messages": 1
+        },
+        {
+          "id": "019ff3cf-702c-7532-8076-85340f14c6e7",
+          "status": "completed",
+          "started_at": 1786501886,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb106-d8b5-7b52-b51e-2f6036a250dd",
+      "title": "Unity Tracy 测试场景 (2)",
+      "created_at": 1785381443,
+      "updated_at": 1785381448,
+      "url": "codex://threads/019fb106-d8b5-7b52-b51e-2f6036a250dd",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fadd4-dd7e-7220-9eea-9369dc5cb34d",
+          "status": "completed",
+          "started_at": 1785327836,
+          "final_messages": 1
+        },
+        {
+          "id": "019fadcd-c1fa-7832-8b47-6a0b579ae4c8",
+          "status": "completed",
+          "started_at": 1785327370,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a01f3b-f5a0-7273-b56e-ae7cddd7a636",
+      "title": "Unity Tracy 任务 (4)",
+      "created_at": 1787230418,
+      "updated_at": 1787279062,
+      "url": "codex://threads/01a01f3b-f5a0-7273-b56e-ae7cddd7a636",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0221c-2ee3-7830-a51c-e6cb99beda54",
+          "status": "completed",
+          "started_at": 1787278667,
+          "final_messages": 1
+        },
+        {
+          "id": "01a01fc5-7e85-7c21-ac6a-da120b6fa92b",
+          "status": "completed",
+          "started_at": 1787239431,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a04799-c461-7893-8296-56598dcde155",
+      "title": "规划 Tracy 仓库学习路径",
+      "created_at": 1788425656,
+      "updated_at": 1790678005,
+      "url": "codex://threads/01a04799-c461-7893-8296-56598dcde155",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a066ae-adbc-7813-8814-27da91142d42",
+          "status": "completed",
+          "started_at": 1788429118,
+          "final_messages": 1
+        },
+        {
+          "id": "01a066a6-fa6a-79a1-9b4b-da07d0ffb781",
+          "status": "completed",
+          "started_at": 1788428614,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0c47a-0683-7551-9e65-5bb58041abf3",
+      "title": "合并 Unity 与 PackageRepo 分支",
+      "created_at": 1790002726,
+      "updated_at": 1790061303,
+      "url": "codex://threads/01a0c47a-0683-7551-9e65-5bb58041abf3",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0c7f6-e95f-72c3-9ffe-fb9c63a8290f",
+          "status": "completed",
+          "started_at": 1790061242,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0c7f5-6d03-7450-88f5-743f3e2e4367",
+          "status": "completed",
+          "started_at": 1790061145,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a09e96-1d9d-7412-838e-d758a49c7aca",
+      "title": "部署 Tracy 诊断配置到测试机",
+      "created_at": 1789367033,
+      "updated_at": 1789367239,
+      "url": "codex://threads/01a09e96-1d9d-7412-838e-d758a49c7aca",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a09e96-7e13-77c2-ac0c-7f3c2298d89f",
+          "status": "completed",
+          "started_at": 1789367057,
+          "final_messages": 2
+        }
+      ]
+    },
+    {
+      "id": "019f6e82-2f2e-7602-ae7a-f0da6161643c",
+      "title": "试验 Godot Tracy 示例",
+      "created_at": 1784265458,
+      "updated_at": 1784268526,
+      "url": "codex://threads/019f6e82-2f2e-7602-ae7a-f0da6161643c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f6eae-f616-7922-a394-d78e5e00effd",
+          "status": "interrupted",
+          "started_at": null,
+          "final_messages": 0
+        },
+        {
+          "id": "019f6ea3-4d10-7630-a090-2a81f06084c8",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f6ad9-e469-78f3-b8f0-77b7c024c51b",
+      "title": "集成Tracy性能分析",
+      "created_at": 1784204097,
+      "updated_at": 1784257979,
+      "url": "codex://threads/019f6ad9-e469-78f3-b8f0-77b7c024c51b",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f6e0a-6d5f-7462-95e1-172ddbc62de9",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        },
+        {
+          "id": "019f6ada-247f-7101-9f64-34062b86aba3",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f5ec1-0dd3-7b33-835c-f5b48e62f67d",
+      "title": "对比 jnunity-study 文件夹",
+      "created_at": 1784001143,
+      "updated_at": 1784001293,
+      "url": "codex://threads/019f5ec1-0dd3-7b33-835c-f5b48e62f67d",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f5ec1-daae-77e2-a5af-22899711969d",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0a443-058d-7c11-96a4-9c2908771041",
+      "title": "查找 diagnose-jn-unity-tracy 技能",
+      "created_at": 1789462250,
+      "updated_at": 1789462268,
+      "url": "codex://threads/01a0a443-058d-7c11-96a4-9c2908771041",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a443-1bd0-7d40-ae83-2b200ed2e13c",
+          "status": "completed",
+          "started_at": 1789462256,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0c458-f485-7551-b3ba-31d5bb461100",
+      "title": "打开 Tracy 性能报告",
+      "created_at": 1790000559,
+      "updated_at": 1790000995,
+      "url": "codex://threads/01a0c458-f485-7551-b3ba-31d5bb461100",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0c45d-5c29-71e1-8c84-d219092296ff",
+          "status": "completed",
+          "started_at": 1790000847,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0c459-29c8-79c1-9ce9-d6be03b34cb2",
+          "status": "completed",
+          "started_at": 1790000572,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f7e24-9c70-7721-b35b-8ca1c287a0b0",
+      "title": "审阅 Godot Tracy GPU 修改 (2)",
+      "created_at": 1784527761,
+      "updated_at": 1784530578,
+      "url": "codex://threads/019f7e24-9c70-7721-b35b-8ca1c287a0b0",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7e4a-d6ba-7403-9e01-42f274ec953b",
+          "status": "interrupted",
+          "started_at": 1784530261,
+          "final_messages": 0
+        },
+        {
+          "id": "019f7e3e-f50a-77d3-8b6f-08b25a49eee0",
+          "status": "interrupted",
+          "started_at": 1784529483,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0c973-2637-7d00-af34-f8929cceb77a",
+      "title": "生成 T3 新打包工程",
+      "created_at": 1790086161,
+      "updated_at": 1790087637,
+      "url": "codex://threads/01a0c973-2637-7d00-af34-f8929cceb77a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0c989-52b3-7161-a12c-6cc7b2e971eb",
+          "status": "completed",
+          "started_at": 1790087615,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0c987-9cf9-7a31-8fb8-9bf22c4cc4d1",
+          "status": "completed",
+          "started_at": 1790087503,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb29a-5a37-7be2-b1aa-1d17ffed5739",
+      "title": "Unity Tracy 测试场景 (5)",
+      "created_at": 1785407888,
+      "updated_at": 1785750296,
+      "url": "codex://threads/019fb29a-5a37-7be2-b1aa-1d17ffed5739",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fc702-2549-7791-8c98-a02b82a19bf6",
+          "status": "completed",
+          "started_at": 1785750234,
+          "final_messages": 1
+        },
+        {
+          "id": "019fc701-39b0-7453-8600-95a20a4a5669",
+          "status": "interrupted",
+          "started_at": 1785750174,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0e728-773b-78c1-a163-5042273cf571",
+      "title": "查找补全 Tracy 调用栈的对话",
+      "created_at": 1790584583,
+      "updated_at": 1790585106,
+      "url": "codex://threads/01a0e728-773b-78c1-a163-5042273cf571",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0e728-fafe-7ca3-a425-79b7cabff667",
+          "status": "completed",
+          "started_at": 1790584617,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fabd3-99d5-76d0-aa93-92882375b60f",
+      "title": "Unity Tracy 接入验收测试",
+      "created_at": 1785294199,
+      "updated_at": 1785332877,
+      "url": "codex://threads/019fabd3-99d5-76d0-aa93-92882375b60f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fae20-005d-7ab2-be89-6d787d9a73fa",
+          "status": "completed",
+          "started_at": 1785332760,
+          "final_messages": 1
+        },
+        {
+          "id": "019fad4c-ade0-7bf2-b57e-29950925ec5c",
+          "status": "completed",
+          "started_at": 1785318911,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fff52-dbbd-7432-9d2c-9796fbe2cdfb",
+      "title": "Unity Tracy 任务",
+      "created_at": 1786695048,
+      "updated_at": 1787206133,
+      "url": "codex://threads/019fff52-dbbd-7432-9d2c-9796fbe2cdfb",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a01dc9-2f09-7502-8555-2ebe9e2e2aab",
+          "status": "completed",
+          "started_at": 1787206119,
+          "final_messages": 1
+        },
+        {
+          "id": "01a01dc8-a751-75d2-a3fb-932330c702fd",
+          "status": "completed",
+          "started_at": 1787206084,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f9205-a9ff-7453-8a70-be67ca108d21",
+      "title": "查找Tracy流式传输对话",
+      "created_at": 1784861272,
+      "updated_at": 1784861464,
+      "url": "codex://threads/019f9205-a9ff-7453-8a70-be67ca108d21",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f9208-2f01-7fc3-9eaa-8da0da791063",
+          "status": "completed",
+          "started_at": 1784861437,
+          "final_messages": 1
+        },
+        {
+          "id": "019f9205-ab98-7ea1-b026-9746ad979c01",
+          "status": "completed",
+          "started_at": 1784861272,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a09627-7fa6-7e03-acf7-e9628f7006b5",
+      "title": "查找 report-13 和原始 Tracy 文件",
+      "created_at": 1789225566,
+      "updated_at": 1789226758,
+      "url": "codex://threads/01a09627-7fa6-7e03-acf7-e9628f7006b5",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a09639-3521-7ad2-86ef-ae55ccdeaadb",
+          "status": "completed",
+          "started_at": 1789226726,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0962d-d522-7103-ab2e-355d7d062d16",
+          "status": "completed",
+          "started_at": 1789225981,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0c7fc-b356-7ba1-a7fb-936f58457312",
+      "title": "排查 game.exe 启动崩溃",
+      "created_at": 1790061622,
+      "updated_at": 1790062196,
+      "url": "codex://threads/01a0c7fc-b356-7ba1-a7fb-936f58457312",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0c7fc-b688-7013-82e0-d30840929bd8",
+          "status": "completed",
+          "started_at": 1790061622,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f840a-2697-7491-b931-25b1b656c7bd",
+      "title": "读取 Tracy 更改方案文档",
+      "created_at": 1784626690,
+      "updated_at": 1784637028,
+      "url": "codex://threads/019f840a-2697-7491-b931-25b1b656c7bd",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f84a5-4c5e-77a0-aeca-4535f351ba1b",
+          "status": "completed",
+          "started_at": 1784636853,
+          "final_messages": 1
+        },
+        {
+          "id": "019f84a0-a0ab-7943-86c1-aecf576ada52",
+          "status": "completed",
+          "started_at": 1784636547,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fad9c-3b7f-7830-a0e2-a2b9bf97dda4",
+      "title": "Unity Tracy 接入验收测试 (2)",
+      "created_at": 1785324125,
+      "updated_at": 1785325466,
+      "url": "codex://threads/019fad9c-3b7f-7830-a0e2-a2b9bf97dda4",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fadb0-3be0-79d2-9de1-f73704314f25",
+          "status": "interrupted",
+          "started_at": 1785325435,
+          "final_messages": 0
+        },
+        {
+          "id": "019fadae-4388-7511-aee1-70bb8badc6a8",
+          "status": "interrupted",
+          "started_at": 1785325306,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0a31e-39c3-7580-b0e3-c1dcbc8c9d71",
+      "title": "SKILL新版本试验 (2)",
+      "created_at": 1789443062,
+      "updated_at": 1789444068,
+      "url": "codex://threads/01a0a31e-39c3-7580-b0e3-c1dcbc8c9d71",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a321-4c91-7601-9f90-a578da9f002b",
+          "status": "completed",
+          "started_at": 1789443263,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a307-8129-79d1-8824-13ad0a8a7d57",
+          "status": "completed",
+          "started_at": 1789441573,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a07ac9-fd87-7373-a7b4-06777b7e5d5e",
+      "title": "分析 JNUnity 光追硬件开销 (2)",
+      "created_at": 1788766453,
+      "updated_at": 1788766542,
+      "url": "codex://threads/01a07ac9-fd87-7373-a7b4-06777b7e5d5e",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07aca-2eee-7c50-ad82-d862a290013c",
+          "status": "completed",
+          "started_at": 1788766465,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07a73-a083-7901-93d1-222552b8656b",
+          "status": "completed",
+          "started_at": 1788760793,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f6fbd-9263-7193-9324-308ad770c4c7",
+      "title": "Locate Tracy integration",
+      "created_at": 1784286131,
+      "updated_at": 1784289301,
+      "url": "codex://threads/019f6fbd-9263-7193-9324-308ad770c4c7",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f6fe7-92dc-7143-a85c-2986b1362807",
+          "status": "completed",
+          "started_at": 1784288875,
+          "final_messages": 1
+        },
+        {
+          "id": "019f6fc0-4593-7231-975a-0853169b1145",
+          "status": "completed",
+          "started_at": 1784286299,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fc754-dcf6-75a3-b346-38731ba634c0",
+      "title": "Unity Tracy 测试场景 (7)",
+      "created_at": 1785755655,
+      "updated_at": 1785912938,
+      "url": "codex://threads/019fc754-dcf6-75a3-b346-38731ba634c0",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fd0b0-f996-79b0-8d91-0bc2c6c1af97",
+          "status": "completed",
+          "started_at": 1785912687,
+          "final_messages": 1
+        },
+        {
+          "id": "019fd0a1-db2d-7422-9f3f-afeb2329a3b8",
+          "status": "completed",
+          "started_at": 1785911696,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb335-db10-71e2-8002-317c4505cc0b",
+      "title": "Unity Tracy 接入迭代 (2)",
+      "created_at": 1785418079,
+      "updated_at": 1785419292,
+      "url": "codex://threads/019fb335-db10-71e2-8002-317c4505cc0b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb33c-198c-71f1-b450-6644d6ff9634",
+          "status": "completed",
+          "started_at": 1785418488,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb324-60cf-7e23-9bd4-33a466ecaae8",
+          "status": "completed",
+          "started_at": 1785416933,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0239c-e420-7353-a236-ab124dd9ab6a",
+      "title": "Unity Tracy 测试分析 (2)",
+      "created_at": 1787303879,
+      "updated_at": 1787304019,
+      "url": "codex://threads/01a0239c-e420-7353-a236-ab124dd9ab6a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0239d-9a24-7081-a8a7-999ddc1246c0",
+          "status": "completed",
+          "started_at": 1787303926,
+          "final_messages": 1
+        },
+        {
+          "id": "01a02376-7830-7632-88d1-f8583a15ef1a",
+          "status": "completed",
+          "started_at": 1787301361,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0ebfa-c439-7f93-b24b-d0dca127f609",
+      "title": "优化 Tracy 小问题",
+      "created_at": 1790665539,
+      "updated_at": 1790671802,
+      "url": "codex://threads/01a0ebfa-c439-7f93-b24b-d0dca127f609",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0ec3f-7ef2-7833-a982-a541ff30307e",
+          "status": "completed",
+          "started_at": 1790669979,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ec33-fcfb-7203-a776-fadaa04186a6",
+          "status": "completed",
+          "started_at": 1790669225,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a056be-11f7-7c63-bd74-a638d78734fe",
+      "title": "规划 Tracy 仓库上传 Git",
+      "created_at": 1788161692,
+      "updated_at": 1788162470,
+      "url": "codex://threads/01a056be-11f7-7c63-bd74-a638d78734fe",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a056c8-fbde-7571-a3fa-57d3825d91b5",
+          "status": "completed",
+          "started_at": 1788162407,
+          "final_messages": 1
+        },
+        {
+          "id": "01a056c6-9c79-7190-99ce-d3bdaee23f9f",
+          "status": "completed",
+          "started_at": 1788162251,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0f138-c8ca-7de1-a44c-63b2c0480a4d",
+      "title": "重新编译 Tracy 可执行文件",
+      "created_at": 1790753425,
+      "updated_at": 1790768069,
+      "url": "codex://threads/01a0f138-c8ca-7de1-a44c-63b2c0480a4d",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0f215-85c3-73b1-99fc-173d501e86b0",
+          "status": "completed",
+          "started_at": 1790767891,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0f20d-6671-7d22-bb51-b42d640c5313",
+          "status": "completed",
+          "started_at": 1790767359,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f6eb1-2ce1-7f43-82fa-1292bd7911de",
+      "title": "试验 Godot Tracy 示例 (2)",
+      "created_at": 1784268537,
+      "updated_at": 1784289914,
+      "url": "codex://threads/019f6eb1-2ce1-7f43-82fa-1292bd7911de",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f6ff6-a02c-7c40-ba9f-2901eb87d10e",
+          "status": "completed",
+          "started_at": 1784289861,
+          "final_messages": 1
+        },
+        {
+          "id": "019f6ff1-3172-7f92-a4c2-ddc1d4ec9a2d",
+          "status": "completed",
+          "started_at": 1784289505,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f60ed-0148-7502-8daa-f8fdda1e7735",
+      "title": "应用 PackageRepo patch",
+      "created_at": 1784037577,
+      "updated_at": 1784038263,
+      "url": "codex://threads/019f60ed-0148-7502-8daa-f8fdda1e7735",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f60f6-807f-7a11-a42d-fa3c814aef42",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        },
+        {
+          "id": "019f60ed-89dc-7ff3-a6f5-2260f47c136d",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fad1d-e890-74b0-bfeb-8979c125f1f0",
+      "title": "Unity Tracy 接入 (2) (2)",
+      "created_at": 1785315846,
+      "updated_at": 1785329812,
+      "url": "codex://threads/019fad1d-e890-74b0-bfeb-8979c125f1f0",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fadec-66a9-7aa2-9091-9a9f59326adc",
+          "status": "completed",
+          "started_at": 1785329379,
+          "final_messages": 1
+        },
+        {
+          "id": "019fade2-92f7-7ca2-85fe-0e409c4602fb",
+          "status": "completed",
+          "started_at": 1785328735,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0998b-a004-70b2-8d3b-53c2d1126f57",
+      "title": "查找 Tracy 性能分析对话",
+      "created_at": 1789282459,
+      "updated_at": 1789282553,
+      "url": "codex://threads/01a0998b-a004-70b2-8d3b-53c2d1126f57",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0998c-8031-7111-a051-6af0fc75ab44",
+          "status": "completed",
+          "started_at": 1789282517,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a056d4-65f7-7f01-82db-b7bfcdebb17a",
+      "title": "Unity Tracy SKILL迭代 (2)",
+      "created_at": 1788163155,
+      "updated_at": 1788244747,
+      "url": "codex://threads/01a056d4-65f7-7f01-82db-b7bfcdebb17a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a05bae-8e13-7670-a8ea-b5a564d8c9cb",
+          "status": "completed",
+          "started_at": 1788244561,
+          "final_messages": 1
+        },
+        {
+          "id": "01a05ba6-0e64-77d3-be01-c68226051d61",
+          "status": "completed",
+          "started_at": 1788244004,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a11aa4-42e1-7d30-bbf5-980a5b90ec04",
+      "title": "查找超过10分钟的Tracy录制",
+      "created_at": 1791448335,
+      "updated_at": 1791449349,
+      "url": "codex://threads/01a11aa4-42e1-7d30-bbf5-980a5b90ec04",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a11aa4-463f-7052-aa17-7f8dbb26da12",
+          "status": "completed",
+          "started_at": 1791448335,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0ed69-3595-7030-9ce5-e27a2f73d9f0",
+      "title": "分享 JN Tracy Skill 路径",
+      "created_at": 1790689490,
+      "updated_at": 1790689623,
+      "url": "codex://threads/01a0ed69-3595-7030-9ce5-e27a2f73d9f0",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0ed69-5b8e-7863-8ae0-373e043a4888",
+          "status": "completed",
+          "started_at": 1790689500,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0eb50-f8d2-7353-9d56-94627bb44ef2",
+      "title": "Query 长录制优化时间",
+      "created_at": 1790654347,
+      "updated_at": 1790683365,
+      "url": "codex://threads/01a0eb50-f8d2-7353-9d56-94627bb44ef2",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0eb78-582e-7aa1-ab4f-8c99aa53e39c",
+          "status": "interrupted",
+          "started_at": 1790656927,
+          "final_messages": 0
+        },
+        {
+          "id": "01a0eb58-8538-7b10-9d3c-0e7e2178ee1a",
+          "status": "interrupted",
+          "started_at": 1790654842,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0c420-8f54-71d0-b210-efe428970d3f",
+      "title": "启动 Unity 录制 Profiler 数据",
+      "created_at": 1789996863,
+      "updated_at": 1790583907,
+      "url": "codex://threads/01a0c420-8f54-71d0-b210-efe428970d3f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0c460-83f0-7ec3-9350-531f5f6a8b85",
+          "status": "completed",
+          "started_at": 1790001054,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0c422-2d93-7bb1-b8ca-196e6c9e97de",
+          "status": "completed",
+          "started_at": 1789996969,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a11f9d-389d-7e21-ae93-8b9275b568c2",
+      "title": "切换到 JNTracyUnity 分支",
+      "created_at": 1791531759,
+      "updated_at": 1791533712,
+      "url": "codex://threads/01a11f9d-389d-7e21-ae93-8b9275b568c2",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a11fb8-2999-7f61-b953-a8946136d440",
+          "status": "completed",
+          "started_at": 1791533525,
+          "final_messages": 1
+        },
+        {
+          "id": "01a11fa9-93f4-7c50-b923-9fa11d6e3bfe",
+          "status": "completed",
+          "started_at": 1791532569,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb779-08bd-7d03-83fe-da402f44d99b",
+      "title": "Unity Tracy 接入迭代 (2)",
+      "created_at": 1785489590,
+      "updated_at": 1785489596,
+      "url": "codex://threads/019fb779-08bd-7d03-83fe-da402f44d99b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb772-5985-77f0-8a95-411059b712f5",
+          "status": "completed",
+          "started_at": 1785489152,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb76d-152f-7712-bb0f-27b14778c1a7",
+          "status": "completed",
+          "started_at": 1785488807,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f7d91-98d7-70a1-bcf8-e1bc562c2c4b",
+      "title": "介绍 Tracy 示例功能",
+      "created_at": 1784518126,
+      "updated_at": 1784520280,
+      "url": "codex://threads/019f7d91-98d7-70a1-bcf8-e1bc562c2c4b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7db1-9ab7-7220-b3ef-979a30f955b7",
+          "status": "interrupted",
+          "started_at": 1784520219,
+          "final_messages": 0
+        },
+        {
+          "id": "019f7daf-bb66-7750-9eff-6a99fe6be160",
+          "status": "interrupted",
+          "started_at": 1784520096,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "019faca0-08cf-7402-936f-8a8041af4a5c",
+      "title": "Unity Tracy 接入 (2)",
+      "created_at": 1785307597,
+      "updated_at": 1785315815,
+      "url": "codex://threads/019faca0-08cf-7402-936f-8a8041af4a5c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fad1b-c38e-7860-8c9e-f5366bf509de",
+          "status": "completed",
+          "started_at": 1785315705,
+          "final_messages": 1
+        },
+        {
+          "id": "019fad01-211c-7a41-b04f-9a53f4e3a044",
+          "status": "interrupted",
+          "started_at": 1785313960,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0c3f0-1ac2-7070-9095-c8f813a6bfaa",
+      "title": "查找报告中的Tracy文件",
+      "created_at": 1790065892,
+      "updated_at": 1790580426,
+      "url": "codex://threads/01a0c3f0-1ac2-7070-9095-c8f813a6bfaa",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0cdd9-23d0-7182-abbc-a7057ad5df5d",
+          "status": "completed",
+          "started_at": 1790159954,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0cdbc-7b63-7d90-bf7a-bf76e6e47ac6",
+          "status": "completed",
+          "started_at": 1790158076,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fadb0-85af-7b52-9582-c0f84f4cde4c",
+      "title": "Unity Tracy 测试场景",
+      "created_at": 1785325454,
+      "updated_at": 1785404349,
+      "url": "codex://threads/019fadb0-85af-7b52-9582-c0f84f4cde4c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb262-30b7-7771-93d5-beeecb271c38",
+          "status": "completed",
+          "started_at": 1785404207,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb25e-6b20-7412-883a-d0545654f2de",
+          "status": "completed",
+          "started_at": 1785403960,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0a072-94e5-79f1-b6cc-ca6531804e34",
+      "title": "复制 Tracy 文件到独立目录",
+      "created_at": 1789398258,
+      "updated_at": 1789398366,
+      "url": "codex://threads/01a0a072-94e5-79f1-b6cc-ca6531804e34",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a073-9a0d-7ac3-a84b-316487fa0d24",
+          "status": "completed",
+          "started_at": 1789398325,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb262-416a-79e3-b113-3719ca180c7c",
+      "title": "Unity Tracy 测试场景 (4)",
+      "created_at": 1785404211,
+      "updated_at": 1785404469,
+      "url": "codex://threads/019fb262-416a-79e3-b113-3719ca180c7c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb265-3fa5-7942-a737-8235f0b926c0",
+          "status": "completed",
+          "started_at": 1785404407,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb263-1ee4-7b32-9536-bbc7575aa180",
+          "status": "completed",
+          "started_at": 1785404268,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0a836-5c32-7d31-991c-bb6022db6714",
+      "title": "比较 Tracy 文件切分格式",
+      "created_at": 1789528529,
+      "updated_at": 1789528642,
+      "url": "codex://threads/01a0a836-5c32-7d31-991c-bb6022db6714",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a837-2198-79d0-aef6-9491d54fddd1",
+          "status": "completed",
+          "started_at": 1789528580,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f7d96-1c2d-75e2-b162-0b60a0a5e1a3",
+      "title": "审阅 Godot Tracy GPU 修改",
+      "created_at": 1784518422,
+      "updated_at": 1784528029,
+      "url": "codex://threads/019f7d96-1c2d-75e2-b162-0b60a0a5e1a3",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7e22-097c-7ab2-947d-cd1f6f010f56",
+          "status": "completed",
+          "started_at": 1784527587,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7e14-7f4e-7562-9264-5dfd4efaee1f",
+          "status": "completed",
+          "started_at": 1784526700,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a0426c-f7b0-7b03-a4a5-0a2f0cc6bab7",
+      "title": "Unity Tracy SKILL优化 (2)",
+      "created_at": 1787820832,
+      "updated_at": 1787821542,
+      "url": "codex://threads/01a0426c-f7b0-7b03-a4a5-0a2f0cc6bab7",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a04277-7156-74d1-9f79-85ec2e7289d3",
+          "status": "completed",
+          "started_at": 1787821519,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0422a-0e7c-71c1-ad21-7ff9aae7cacc",
+          "status": "completed",
+          "started_at": 1787816447,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fc264-0bc1-7d42-9132-e6eff20daff3",
+      "title": "Unity Tracy 接入迭代 (4)",
+      "created_at": 1785672764,
+      "updated_at": 1786083095,
+      "url": "codex://threads/019fc264-0bc1-7d42-9132-e6eff20daff3",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fdad7-d13d-7ea2-9965-acee1e406d4b",
+          "status": "completed",
+          "started_at": 1786083004,
+          "final_messages": 1
+        },
+        {
+          "id": "019fc27c-875b-7231-8648-452cd7f895ff",
+          "status": "completed",
+          "started_at": 1785674368,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fb108-91f9-7dd3-9f55-cc69b78fc43b",
+      "title": "Unity Tracy 测试场景 (3)",
+      "created_at": 1785381556,
+      "updated_at": 1785392716,
+      "url": "codex://threads/019fb108-91f9-7dd3-9f55-cc69b78fc43b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fb1b2-327b-7bc0-83fd-4e73f0a6387d",
+          "status": "completed",
+          "started_at": 1785392673,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb1a7-1b64-7e31-a1d7-427e76049e69",
+          "status": "completed",
+          "started_at": 1785391946,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a09ec8-e8d8-7240-8beb-8f6cb81c710f",
+      "title": "说明启动游戏与 Tracy 录制",
+      "created_at": 1789370362,
+      "updated_at": 1789372256,
+      "url": "codex://threads/01a09ec8-e8d8-7240-8beb-8f6cb81c710f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a09ee4-f7e2-7d53-9273-7c0e43a02126",
+          "status": "completed",
+          "started_at": 1789372200,
+          "final_messages": 1
+        },
+        {
+          "id": "01a09ee4-0e77-74b0-a750-b46da7a3229a",
+          "status": "interrupted",
+          "started_at": 1789372141,
+          "final_messages": 0
+        }
+      ]
+    },
+    {
+      "id": "01a0a077-abd0-7db1-9ff6-637473fd4a4d",
+      "title": "查找今早的 Tracy 性能报告对话",
+      "created_at": 1789398592,
+      "updated_at": 1789398653,
+      "url": "codex://threads/01a0a077-abd0-7db1-9ff6-637473fd4a4d",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a077-e46c-78f2-ad3e-66a8aae5e7ea",
+          "status": "completed",
+          "started_at": 1789398606,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019fc6b6-3ee4-7351-bda5-d2ad3b4359f0",
+      "title": "Unity Tracy 测试场景 (6)",
+      "created_at": 1785745260,
+      "updated_at": 1785745784,
+      "url": "codex://threads/019fc6b6-3ee4-7351-bda5-d2ad3b4359f0",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fc6b8-9aab-79b2-aed4-0ae494f98a4d",
+          "status": "completed",
+          "started_at": 1785745414,
+          "final_messages": 1
+        },
+        {
+          "id": "019fb2fc-09b5-7301-b8de-8580d020639b",
+          "status": "completed",
+          "started_at": 1785414289,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "019f87e8-8291-70b2-a618-782a59bc6878",
+      "title": "分析 Unreal Insights 流式写盘",
+      "created_at": 1784691594,
+      "updated_at": 1784820161,
+      "url": "codex://threads/019f87e8-8291-70b2-a618-782a59bc6878",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f8f2f-eea4-70a3-a00d-848dc3ad4813",
+          "status": "completed",
+          "started_at": 1784813711,
+          "final_messages": 1
+        },
+        {
+          "id": "019f8f29-22ed-7dd1-ac2d-07ed5cd89a50",
+          "status": "completed",
+          "started_at": 1784813265,
+          "final_messages": 1
+        }
+      ]
+    },
+    {
+      "id": "01a07bb2-2bac-7611-bb9d-51328b969dff",
+      "title": "规划 Tracy AI 性能分析文档",
+      "created_at": 1788781669,
+      "updated_at": 1788784126,
+      "url": "codex://threads/01a07bb2-2bac-7611-bb9d-51328b969dff",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07bd7-1a27-7dc3-bd01-a0be5ee5805b",
+          "status": "completed",
+          "started_at": 1788784089,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07bb7-1105-7271-9314-09628ed94443",
+          "status": "completed",
+          "started_at": 1788781990,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07bb5-56d6-7610-b480-13dcfc321df8",
+          "status": "completed",
+          "started_at": 1788781876,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07bb3-0c44-7b30-b5ef-160e18a5ef1b",
+          "status": "completed",
+          "started_at": 1788781726,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a11a32-c791-7b91-8c2a-16b15eba525f",
+      "title": "优化 SKILL 执行流程",
+      "created_at": 1791440898,
+      "updated_at": 1791548717,
+      "url": "codex://threads/01a11a32-c791-7b91-8c2a-16b15eba525f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a1209f-36e9-7b23-bec0-d6f98d03ee5c",
+          "status": "completed",
+          "started_at": 1791548667,
+          "final_messages": 1
+        },
+        {
+          "id": "01a12099-323c-7911-af2e-f0086ddd9071",
+          "status": "completed",
+          "started_at": 1791548273,
+          "final_messages": 1
+        },
+        {
+          "id": "01a11a98-59d0-78d3-bcd3-737f91513c04",
+          "status": "completed",
+          "started_at": 1791447554,
+          "final_messages": 1
+        },
+        {
+          "id": "01a11a7e-290a-7ab2-95c8-b028936e59af",
+          "status": "completed",
+          "started_at": 1791445838,
+          "final_messages": 1
+        },
+        {
+          "id": "01a11a37-bf3b-7f52-81b1-f10ca53383d4",
+          "status": "completed",
+          "started_at": 1791441223,
+          "final_messages": 1
+        },
+        {
+          "id": "01a11a36-c310-7ba1-a0b2-40e5e1cc265f",
+          "status": "completed",
+          "started_at": 1791441158,
+          "final_messages": 2
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a09ef3-6776-7173-9bb7-d8ffd26472bc",
+      "title": "检查 Query 长录制与 GPUCatalog",
+      "created_at": 1790573405,
+      "updated_at": 1790687361,
+      "url": "codex://threads/01a09ef3-6776-7173-9bb7-d8ffd26472bc",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0ed47-0dda-75b2-850b-85632d70f887",
+          "status": "completed",
+          "started_at": 1790687251,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ed46-2446-7e50-b8f1-3c78ac8da020",
+          "status": "completed",
+          "started_at": 1790687192,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ed1a-eefa-77e1-998b-9ca0fa832460",
+          "status": "completed",
+          "started_at": 1790684360,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ecbc-8268-7261-91ff-3988e41dec86",
+          "status": "completed",
+          "started_at": 1790678172,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ecba-6f27-7b72-83c2-b90552009ba0",
+          "status": "completed",
+          "started_at": 1790678036,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0ecab-b01f-7253-a1f3-8cbbd2e7a21a",
+          "status": "completed",
+          "started_at": 1790677069,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a120a1-ff7c-76c2-b8b0-d410a7b16dad",
+      "title": "试验 SKILL 并生成替换包",
+      "created_at": 1791548850,
+      "updated_at": 1791559668,
+      "url": "codex://threads/01a120a1-ff7c-76c2-b8b0-d410a7b16dad",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a120d0-2fb3-7e81-87b1-dfc1f881ec74",
+          "status": "completed",
+          "started_at": 1791551877,
+          "final_messages": 3
+        },
+        {
+          "id": "01a120cd-f43d-7df3-8cf6-b45a3b628fb1",
+          "status": "completed",
+          "started_at": 1791551730,
+          "final_messages": 1
+        },
+        {
+          "id": "01a120a3-284f-7023-98ea-72759429bdcd",
+          "status": "completed",
+          "started_at": 1791548926,
+          "final_messages": 2
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a11fc4-f913-7cc2-a0a8-4c2092d7289a",
+      "title": "检查 Tracy 合并冲突",
+      "created_at": 1791534365,
+      "updated_at": 1791600100,
+      "url": "codex://threads/01a11fc4-f913-7cc2-a0a8-4c2092d7289a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a12096-dc68-7981-b57c-cf701819f47d",
+          "status": "completed",
+          "started_at": 1791548120,
+          "final_messages": 1
+        },
+        {
+          "id": "01a12071-71c3-7950-bbca-7e7c817b8943",
+          "status": "completed",
+          "started_at": 1791545668,
+          "final_messages": 1
+        },
+        {
+          "id": "01a1206e-d4b7-70e3-a21b-663a45f8a3cd",
+          "status": "completed",
+          "started_at": 1791545496,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": [
+        "01a12066-078e-7d03-b8bb-2324ab2c4cbc",
+        "01a1205c-79c7-7ad3-9b6d-576991d8905a",
+        "01a1205a-bbef-74e1-917c-4e5a6dbeb573",
+        "01a11fe1-237d-72c3-84c8-433d17128c5f",
+        "01a11fd5-a969-7ab2-ad0c-4af0762dae34"
+      ]
+    },
+    {
+      "id": "01a0ed47-7317-7df1-b432-86e25bb26ed7",
+      "title": "Diagnose Tracy file crash",
+      "created_at": 1790687278,
+      "updated_at": 1791439492,
+      "url": "codex://threads/01a0ed47-7317-7df1-b432-86e25bb26ed7",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a1198b-d398-7151-ade8-862b6fa20731",
+          "status": "interrupted",
+          "started_at": 1791429956,
+          "final_messages": 0
+        },
+        {
+          "id": "01a1159e-ed72-7ee1-ba52-8833692addcd",
+          "status": "completed",
+          "started_at": 1791364099,
+          "final_messages": 1
+        },
+        {
+          "id": "01a114f8-9889-72b0-9ba3-f7ff1bc8ecc9",
+          "status": "interrupted",
+          "started_at": 1791353198,
+          "final_messages": 0
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0e6e5-a318-7572-9fcd-b17011967d63",
+      "title": "查看共享对话内容",
+      "created_at": 1790580204,
+      "updated_at": 1791440875,
+      "url": "codex://threads/01a0e6e5-a318-7572-9fcd-b17011967d63",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0e6e5-b58b-73f0-905b-4acea608b43b",
+          "status": "completed",
+          "started_at": 1790580209,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0e741-1c34-7fc2-971b-3c697825e910",
+      "title": "Compare Job worker traces",
+      "created_at": 1790651887,
+      "updated_at": 1790652296,
+      "url": "codex://threads/01a0e741-1c34-7fc2-971b-3c697825e910",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0eb2b-7171-7a91-a96b-22479400598c",
+          "status": "completed",
+          "started_at": 1790651888,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e7fe-bbec-7b40-8dda-ebc49a043cf5",
+          "status": "completed",
+          "started_at": 1790598626,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e775-e4b3-7be0-804b-6b39308ea821",
+          "status": "completed",
+          "started_at": 1790589658,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0e753-ce39-79f3-872d-934e2a3ae7da",
+      "title": "检查录制配置与 GPU 数据缺失",
+      "created_at": 1790587424,
+      "updated_at": 1790588983,
+      "url": "codex://threads/01a0e753-ce39-79f3-872d-934e2a3ae7da",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0e76b-66a4-7970-b71b-dcbd9555082d",
+          "status": "completed",
+          "started_at": 1790588970,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e769-388e-7b11-9452-a5a68ff1697d",
+          "status": "completed",
+          "started_at": 1790588827,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e764-0516-70b2-80bc-c619877f286a",
+          "status": "completed",
+          "started_at": 1790588486,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0b2b1-ae65-71e3-8c2c-359f1193893c",
+      "title": "优化SKILL",
+      "created_at": 1789704384,
+      "updated_at": 1790221771,
+      "url": "codex://threads/01a0b2b1-ae65-71e3-8c2c-359f1193893c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0d17a-8fb3-7ff0-92de-9bf56eb13d1d",
+          "status": "completed",
+          "started_at": 1790220865,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0d174-cff9-7a50-8a8d-9d65882f4ca9",
+          "status": "completed",
+          "started_at": 1790220488,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0d171-ab80-7303-be49-192b14e65ba5",
+          "status": "completed",
+          "started_at": 1790220282,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f9eb5-a8b7-7610-9bea-96fe276177bc",
+      "title": "讨论 Unity Tracy 接入方案",
+      "created_at": 1785074133,
+      "updated_at": 1785294428,
+      "url": "codex://threads/019f9eb5-a8b7-7610-9bea-96fe276177bc",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fabd2-f302-7a70-b947-29f29b9c0cd7",
+          "status": "completed",
+          "started_at": 1785294156,
+          "final_messages": 1
+        },
+        {
+          "id": "019fa94d-c213-77a3-98f8-6bd4f7ce531b",
+          "status": "completed",
+          "started_at": 1785251873,
+          "final_messages": 1
+        },
+        {
+          "id": "019fa8ec-a86c-7213-8471-554db251f64c",
+          "status": "completed",
+          "started_at": 1785245509,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019fa6d6-bae5-7551-8e9c-1a073692bbc8",
+      "title": "讨论 Unity Tracy 接入方案 (2)",
+      "created_at": 1785210518,
+      "updated_at": 1785210565,
+      "url": "codex://threads/019fa6d6-bae5-7551-8e9c-1a073692bbc8",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fa6d7-2333-7482-b7a8-985a0e18f63b",
+          "status": "completed",
+          "started_at": 1785210544,
+          "final_messages": 1
+        },
+        {
+          "id": "019fa687-728a-7b91-a3d0-dbb7cace35c4",
+          "status": "completed",
+          "started_at": 1785205322,
+          "final_messages": 1
+        },
+        {
+          "id": "019fa33b-177b-72c2-a34e-fead8a80633e",
+          "status": "completed",
+          "started_at": 1785149986,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019fb31e-022a-75f0-8d77-457e85b5d59b",
+      "title": "Unity Tracy 接入迭代",
+      "created_at": 1785416516,
+      "updated_at": 1786692387,
+      "url": "codex://threads/019fb31e-022a-75f0-8d77-457e85b5d59b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fff26-6d25-7681-ba84-98999ec422a7",
+          "status": "completed",
+          "started_at": 1786692136,
+          "final_messages": 1
+        },
+        {
+          "id": "019fff13-5026-7081-bbec-9173e95e7133",
+          "status": "completed",
+          "started_at": 1786690883,
+          "final_messages": 1
+        },
+        {
+          "id": "019ffef5-fa15-7e82-beb4-c7a6f3366530",
+          "status": "completed",
+          "started_at": 1786688961,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019fdad7-42c6-75f3-913d-e513f2a73de0",
+      "title": "Unity Tracy 接入迭代 (5)",
+      "created_at": 1786082968,
+      "updated_at": 1786082968,
+      "url": "codex://threads/019fdad7-42c6-75f3-913d-e513f2a73de0",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fda05-a0ce-75f2-970a-e146e43f4bae",
+          "status": "interrupted",
+          "started_at": 1786069229,
+          "final_messages": 0
+        },
+        {
+          "id": "019fd6f2-8578-72c1-ba89-4ec75761ed45",
+          "status": "completed",
+          "started_at": 1786017645,
+          "final_messages": 1
+        },
+        {
+          "id": "019fd6ea-2523-7c30-9f3d-edd28f450f32",
+          "status": "completed",
+          "started_at": 1786017097,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019fff43-e0c0-7f92-8f2e-23ac217fed22",
+      "title": "Unity Tracy 接入迭代 (6)",
+      "created_at": 1786694066,
+      "updated_at": 1786694405,
+      "url": "codex://threads/019fff43-e0c0-7f92-8f2e-23ac217fed22",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019fff46-24c8-7f42-9252-d2f5bbd706e7",
+          "status": "completed",
+          "started_at": 1786694214,
+          "final_messages": 1
+        },
+        {
+          "id": "019ffe31-e532-7901-973b-6b2086e07160",
+          "status": "completed",
+          "started_at": 1786676110,
+          "final_messages": 1
+        },
+        {
+          "id": "019ffe2e-7150-7112-848f-6c2522d90069",
+          "status": "completed",
+          "started_at": 1786675884,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a01813-dbe7-74e2-a934-a260e51997cd",
+      "title": "Unity Tracy 接入迭代 (8)",
+      "created_at": 1787110349,
+      "updated_at": 1787120399,
+      "url": "codex://threads/01a01813-dbe7-74e2-a934-a260e51997cd",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a018ac-f1d7-7960-bf63-2052e351bf6a",
+          "status": "completed",
+          "started_at": 1787120382,
+          "final_messages": 1
+        },
+        {
+          "id": "01a018aa-1380-75a0-a8c9-957be95f179e",
+          "status": "completed",
+          "started_at": 1787120194,
+          "final_messages": 1
+        },
+        {
+          "id": "01a018a8-f40a-7de3-87f7-4c6de7b69e66",
+          "status": "completed",
+          "started_at": 1787120120,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a01e85-2a38-7522-ac40-4d1f76a2a90f",
+      "title": "Unity Tracy stream转换优化",
+      "created_at": 1787218438,
+      "updated_at": 1787459699,
+      "url": "codex://threads/01a01e85-2a38-7522-ac40-4d1f76a2a90f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a02ce4-f556-7bf0-afcd-dcc9f01f97ca",
+          "status": "completed",
+          "started_at": 1787459597,
+          "final_messages": 1
+        },
+        {
+          "id": "01a022b5-cef6-7673-8fb0-89d06aef05c9",
+          "status": "completed",
+          "started_at": 1787288735,
+          "final_messages": 1
+        },
+        {
+          "id": "01a022b4-ec57-7813-85fe-8b09352ffc3b",
+          "status": "completed",
+          "started_at": 1787288677,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0224d-ecc3-73c0-8f22-0b3593dea589",
+      "title": "Unity Tracy ResourceGraph",
+      "created_at": 1787281927,
+      "updated_at": 1787345156,
+      "url": "codex://threads/01a0224d-ecc3-73c0-8f22-0b3593dea589",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a02464-0946-7a03-b61f-be89ea904387",
+          "status": "completed",
+          "started_at": 1787316930,
+          "final_messages": 1
+        },
+        {
+          "id": "01a02461-a406-7ba3-8528-abcb99e1f8a6",
+          "status": "completed",
+          "started_at": 1787316773,
+          "final_messages": 0
+        },
+        {
+          "id": "01a0245d-ecb7-7ff1-81a8-cd2270368fd9",
+          "status": "completed",
+          "started_at": 1787316530,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a02865-794d-79e2-9593-13766256b402",
+      "title": "Unity Tracy GPU Catalog",
+      "created_at": 1787384134,
+      "updated_at": 1787557446,
+      "url": "codex://threads/01a02865-794d-79e2-9593-13766256b402",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a032b9-c120-7713-91c6-7c2eb932eacc",
+          "status": "completed",
+          "started_at": 1787557429,
+          "final_messages": 1
+        },
+        {
+          "id": "01a032b5-21b9-7633-804f-184a2f7babd5",
+          "status": "completed",
+          "started_at": 1787557126,
+          "final_messages": 1
+        },
+        {
+          "id": "01a032ad-4df1-79e0-b41f-431c64b84265",
+          "status": "completed",
+          "started_at": 1787556613,
+          "final_messages": 1
+        },
+        {
+          "id": "01a032a9-73eb-7fd1-8515-8ca1e889253b",
+          "status": "completed",
+          "started_at": 1787556361,
+          "final_messages": 1
+        },
+        {
+          "id": "01a032a1-35eb-76b2-baef-91ff371709ed",
+          "status": "completed",
+          "started_at": 1787555821,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a032a7-9ee0-7801-830e-cf69a4d82e18",
+      "title": "Unity Tracy 显存迭代计划",
+      "created_at": 1787556241,
+      "updated_at": 1788417134,
+      "url": "codex://threads/01a032a7-9ee0-7801-830e-cf69a4d82e18",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a065f7-31ce-7321-8bd2-b4c42dc3ec74",
+          "status": "completed",
+          "started_at": 1788417094,
+          "final_messages": 1
+        },
+        {
+          "id": "01a065f5-187c-7e13-8d77-b33167158d67",
+          "status": "completed",
+          "started_at": 1788416956,
+          "final_messages": 1
+        },
+        {
+          "id": "01a065f2-d8c8-7162-a166-7c3554a5d49d",
+          "status": "completed",
+          "started_at": 1788416809,
+          "final_messages": 1
+        },
+        {
+          "id": "01a065f1-1312-78f2-a301-0226eb917d79",
+          "status": "completed",
+          "started_at": 1788416693,
+          "final_messages": 1
+        },
+        {
+          "id": "01a065ef-456f-7f40-97e6-e3fa755ab8d7",
+          "status": "completed",
+          "started_at": 1788416574,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a032bb-52a1-7921-91b2-52446e6e93f2",
+      "title": "Unity Tracy GUI迭代",
+      "created_at": 1787557532,
+      "updated_at": 1787651816,
+      "url": "codex://threads/01a032bb-52a1-7921-91b2-52446e6e93f2",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a03855-f925-7d43-a28a-6fd2c9abb14c",
+          "status": "completed",
+          "started_at": 1787651553,
+          "final_messages": 1
+        },
+        {
+          "id": "01a03829-f616-72b3-a115-ed1eb71b3bef",
+          "status": "completed",
+          "started_at": 1787648669,
+          "final_messages": 1
+        },
+        {
+          "id": "01a03816-4142-7903-a7ac-b855f288a85a",
+          "status": "completed",
+          "started_at": 1787647377,
+          "final_messages": 1
+        },
+        {
+          "id": "01a03806-da4c-7490-81af-4e2a71989f1b",
+          "status": "completed",
+          "started_at": 1787646368,
+          "final_messages": 1
+        },
+        {
+          "id": "01a03804-9352-7c91-ab3e-05903ab35e89",
+          "status": "completed",
+          "started_at": 1787646219,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a04df8-afa8-7260-bcaf-ee241a473fd5",
+      "title": "Unity Tracy SKILL迭代",
+      "created_at": 1788014538,
+      "updated_at": 1788161505,
+      "url": "codex://threads/01a04df8-afa8-7260-bcaf-ee241a473fd5",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a056ba-2d8a-71e1-8dbe-aab18483d776",
+          "status": "completed",
+          "started_at": 1788161437,
+          "final_messages": 1
+        },
+        {
+          "id": "01a055ef-8985-79f1-ba38-826753c7b6f0",
+          "status": "completed",
+          "started_at": 1788148156,
+          "final_messages": 1
+        },
+        {
+          "id": "01a055e4-f772-73a0-a095-392923561704",
+          "status": "completed",
+          "started_at": 1788147464,
+          "final_messages": 1
+        },
+        {
+          "id": "01a055e3-01c8-7b72-a4da-9f563d39342c",
+          "status": "completed",
+          "started_at": 1788147335,
+          "final_messages": 1
+        },
+        {
+          "id": "01a055e1-6823-7102-a22e-678bd42bf726",
+          "status": "completed",
+          "started_at": 1788147230,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a060f4-9c22-7880-b173-1ea6458b2246",
+      "title": "Unity Tracy 显存迭代计划 (2)",
+      "created_at": 1788333038,
+      "updated_at": 1788333040,
+      "url": "codex://threads/01a060f4-9c22-7880-b173-1ea6458b2246",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a06067-6900-7a13-b126-ad16cbbfd4dc",
+          "status": "completed",
+          "started_at": 1788323784,
+          "final_messages": 1
+        },
+        {
+          "id": "01a06066-0eb6-7b13-a9c7-0763816392a2",
+          "status": "completed",
+          "started_at": 1788323696,
+          "final_messages": 1
+        },
+        {
+          "id": "01a05d74-41a9-7250-abc4-5aac08c2798e",
+          "status": "completed",
+          "started_at": 1788274295,
+          "final_messages": 1
+        },
+        {
+          "id": "01a05d71-c096-74b1-ae3b-3ea92d0b955d",
+          "status": "completed",
+          "started_at": 1788274131,
+          "final_messages": 1
+        },
+        {
+          "id": "01a05d6f-7135-7cd2-b935-51a0a22ec365",
+          "status": "completed",
+          "started_at": 1788273979,
+          "final_messages": 0
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0656b-fc8a-7393-894b-9b2556589f15",
+      "title": "Unity Tracy 原始额外开销问题",
+      "created_at": 1788407971,
+      "updated_at": 1788488102,
+      "url": "codex://threads/01a0656b-fc8a-7393-894b-9b2556589f15",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a06a32-460a-7f71-a140-a3f466e13ac5",
+          "status": "completed",
+          "started_at": 1788488074,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0673d-96e4-7871-b5d9-f41736eb25fa",
+          "status": "completed",
+          "started_at": 1788438484,
+          "final_messages": 1
+        },
+        {
+          "id": "01a06733-c724-7960-bb83-b641a62264b4",
+          "status": "completed",
+          "started_at": 1788437841,
+          "final_messages": 1
+        },
+        {
+          "id": "01a06731-564e-7023-8e0d-7ba1fcbf4166",
+          "status": "completed",
+          "started_at": 1788437681,
+          "final_messages": 1
+        },
+        {
+          "id": "01a066f8-26a9-7d00-9e59-175d9e027c99",
+          "status": "completed",
+          "started_at": 1788433934,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0719c-b969-70f0-8c27-525114eeec86",
+      "title": "Unity Tracy Session验收",
+      "created_at": 1788612491,
+      "updated_at": 1788773883,
+      "url": "codex://threads/01a0719c-b969-70f0-8c27-525114eeec86",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07b39-bbff-75c1-9d9a-6ab7bb5d1d3d",
+          "status": "completed",
+          "started_at": 1788773776,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07b38-fb7e-7531-a320-d37b4e54f88c",
+          "status": "interrupted",
+          "started_at": 1788773727,
+          "final_messages": 0
+        },
+        {
+          "id": "01a07b37-c862-7080-a79c-8316c034c52e",
+          "status": "completed",
+          "started_at": 1788773648,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07af6-eb06-7623-b838-0dab0d4c5082",
+          "status": "completed",
+          "started_at": 1788769397,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07aba-1681-7ab0-b566-f2ebe3b9220d",
+          "status": "completed",
+          "started_at": 1788765410,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a075a3-4fa6-7be1-827b-33960910fb3d",
+      "title": "Unity Tracy 修复若干bug",
+      "created_at": 1788680032,
+      "updated_at": 1788766806,
+      "url": "codex://threads/01a075a3-4fa6-7be1-827b-33960910fb3d",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07ace-e6a4-77a1-b9e1-608a7674335d",
+          "status": "completed",
+          "started_at": 1788766774,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07ace-bbb1-7391-b41a-995bc7b2540c",
+          "status": "interrupted",
+          "started_at": 1788766763,
+          "final_messages": 0
+        },
+        {
+          "id": "01a07acd-2db8-7bf1-8310-36512b6930fc",
+          "status": "completed",
+          "started_at": 1788766662,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07acc-96f9-7f00-9f09-b1514e2b3ebd",
+          "status": "completed",
+          "started_at": 1788766623,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0760a-7c44-7aa1-9140-8a085af3b64f",
+          "status": "completed",
+          "started_at": 1788686793,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a07beb-62b4-74b2-af84-73e0de7cf53f",
+      "title": "Unity Tracy Query 内部分析缓存",
+      "created_at": 1789039671,
+      "updated_at": 1789039724,
+      "url": "codex://threads/01a07beb-62b4-74b2-af84-73e0de7cf53f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a08b12-fcad-74a1-8836-5978119c7abc",
+          "status": "completed",
+          "started_at": 1789039672,
+          "final_messages": 1
+        },
+        {
+          "id": "01a08b06-e73e-7fe1-9340-f515c120b97e",
+          "status": "completed",
+          "started_at": 1789038880,
+          "final_messages": 2
+        },
+        {
+          "id": "01a08afe-641f-71f1-a5be-982b87c876c4",
+          "status": "completed",
+          "started_at": 1789038322,
+          "final_messages": 1
+        },
+        {
+          "id": "01a08a59-1b27-7e11-8d93-0382e19359b5",
+          "status": "completed",
+          "started_at": 1789027490,
+          "final_messages": 1
+        },
+        {
+          "id": "01a08a53-1d0f-7642-b83b-2aba9a4a4029",
+          "status": "completed",
+          "started_at": 1789027097,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a09f47-1097-70f3-b3d7-d8daae7f431e",
+      "title": "优化 Query的存储问题",
+      "created_at": 1789438621,
+      "updated_at": 1789442539,
+      "url": "codex://threads/01a09f47-1097-70f3-b3d7-d8daae7f431e",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a315-adc4-7850-8cfd-bf0c01d95782",
+          "status": "completed",
+          "started_at": 1789442502,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a2f6-c4f6-75f2-afb9-b9d88fe94fb7",
+          "status": "completed",
+          "started_at": 1789440476,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a2da-770c-7ea1-abc6-70e27edbcbf7",
+          "status": "completed",
+          "started_at": 1789438621,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a078-ecbc-7a01-987a-684946199ae1",
+          "status": "completed",
+          "started_at": 1789398674,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a078-5aa1-7091-9526-5881cb97ff06",
+          "status": "completed",
+          "started_at": 1789398637,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a09f5f-eea8-7750-a3b5-94ecacf5da81",
+      "title": "迭代 JN Tracy Player 技能",
+      "created_at": 1789380259,
+      "updated_at": 1789382204,
+      "url": "codex://threads/01a09f5f-eea8-7750-a3b5-94ecacf5da81",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a09f7d-407b-7922-8b31-c2c45cb4fe46",
+          "status": "completed",
+          "started_at": 1789382181,
+          "final_messages": 1
+        },
+        {
+          "id": "01a09f63-1c5e-7fd2-98a4-44cb5975c200",
+          "status": "completed",
+          "started_at": 1789380467,
+          "final_messages": 1
+        },
+        {
+          "id": "01a09f61-e7b5-7830-8102-4c547e9126f8",
+          "status": "completed",
+          "started_at": 1789380388,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a096de-d4c8-7c00-abb3-f98faf739a45",
+      "title": "SKILL新版本试验",
+      "created_at": 1789367586,
+      "updated_at": 1789706870,
+      "url": "codex://threads/01a096de-d4c8-7c00-abb3-f98faf739a45",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a94d-562c-7ff2-a031-d17f1ab587f9",
+          "status": "completed",
+          "started_at": 1789546812,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a94c-38a8-7230-af5e-80f0eab44c04",
+          "status": "completed",
+          "started_at": 1789546739,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a551-8d4d-7191-a7aa-6422ce28faf1",
+          "status": "completed",
+          "started_at": 1789479980,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a54d-9341-7ce0-9c39-c7f62e40d4da",
+          "status": "completed",
+          "started_at": 1789479719,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a53b-f7fd-7e52-b857-d99e882ae8dd",
+          "status": "completed",
+          "started_at": 1789478565,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0a33b-ee90-7373-8c10-5286bb3548e2",
+      "title": "INI文件切换",
+      "created_at": 1789445009,
+      "updated_at": 1789704263,
+      "url": "codex://threads/01a0a33b-ee90-7373-8c10-5286bb3548e2",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a33c-ce6d-7fb3-a76b-1c6758c08214",
+          "status": "completed",
+          "started_at": 1789445066,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0a326-b197-7c12-8ec8-87b2af1d787f",
+      "title": "讨论 Tracy Capture GUI 设计",
+      "created_at": 1789443617,
+      "updated_at": 1790580468,
+      "url": "codex://threads/01a0a326-b197-7c12-8ec8-87b2af1d787f",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0a955-6630-7e83-a0ac-d8668b4ca700",
+          "status": "completed",
+          "started_at": 1789547341,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a954-704f-7711-9ddd-849a21b816d3",
+          "status": "completed",
+          "started_at": 1789547278,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a8e2-75d3-7611-8d6b-c75356cdc63b",
+          "status": "completed",
+          "started_at": 1789539808,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0a8e2-34fb-7eb2-ad91-cae340e19677",
+          "status": "failed",
+          "started_at": 1789539792,
+          "final_messages": 0
+        },
+        {
+          "id": "01a0a85a-3c24-77c0-b4ea-4ef3bc4e4bde",
+          "status": "completed",
+          "started_at": 1789530881,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0c82c-6b96-7733-be54-6b8323771096",
+      "title": "统计两个仓库分支差异",
+      "created_at": 1790064749,
+      "updated_at": 1790583628,
+      "url": "codex://threads/01a0c82c-6b96-7733-be54-6b8323771096",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0e717-5e79-7003-a291-c6b8e7196693",
+          "status": "completed",
+          "started_at": 1790583463,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e70f-dfb0-7430-a73c-d7d38b068635",
+          "status": "completed",
+          "started_at": 1790582972,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e70c-7287-7273-a3c4-53292e78a10f",
+          "status": "completed",
+          "started_at": 1790582747,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0e6f9-a5aa-7fd1-ba70-2588df0955e5",
+          "status": "completed",
+          "started_at": 1790581515,
+          "final_messages": 2
+        },
+        {
+          "id": "01a0e6f2-09e0-7180-9319-c8aed2eaf712",
+          "status": "completed",
+          "started_at": 1790581017,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a0b340-ff4d-7883-9bf0-6138c5535843",
+      "title": "查找 N30 Session Store 分支",
+      "created_at": 1789713776,
+      "updated_at": 1789713916,
+      "url": "codex://threads/01a0b340-ff4d-7883-9bf0-6138c5535843",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0b341-44c0-7ac2-a90d-1eb706f3a44f",
+          "status": "completed",
+          "started_at": 1789713794,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f7e5a-8e33-7441-af96-d1576834045b",
+      "title": "起草Unity接入Tracy方案",
+      "created_at": 1784531296,
+      "updated_at": 1784537390,
+      "url": "codex://threads/019f7e5a-8e33-7441-af96-d1576834045b",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7eb4-2d85-7482-aace-14c8844af093",
+          "status": "completed",
+          "started_at": 1784537165,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7e83-2fb4-71e3-883a-964b55c06d8c",
+          "status": "completed",
+          "started_at": 1784533954,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7e76-e306-72a3-814c-769d0e00a693",
+          "status": "completed",
+          "started_at": 1784533148,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f887e-ce84-7801-baf5-fa863d79195f",
+      "title": "分析 tracy 仓库扩展",
+      "created_at": 1784701444,
+      "updated_at": 1784701955,
+      "url": "codex://threads/019f887e-ce84-7801-baf5-fa863d79195f",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f887f-2198-7fa0-8326-a5a2c8880ee7",
+          "status": "completed",
+          "started_at": 1784701461,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f8928-25d0-77f2-9a29-7fca55717825",
+      "title": "查找 Tracy 大模型性能数据 API",
+      "created_at": 1784712542,
+      "updated_at": 1784713005,
+      "url": "codex://threads/019f8928-25d0-77f2-9a29-7fca55717825",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f892b-2d39-79d1-ad1f-39c9b50d178c",
+          "status": "completed",
+          "started_at": 1784712736,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019fff65-5eda-7fb0-ad31-f3332e5a7507",
+      "title": "Unity Tracy 显存资源获取",
+      "created_at": 1786696261,
+      "updated_at": 1787042602,
+      "url": "codex://threads/019fff65-5eda-7fb0-ad31-f3332e5a7507",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a01400-4c54-7fb3-984e-3537fbe6931c",
+          "status": "completed",
+          "started_at": 1787041959,
+          "final_messages": 1
+        },
+        {
+          "id": "01a01400-132a-7901-b21e-e81a19649b36",
+          "status": "interrupted",
+          "started_at": 1787041944,
+          "final_messages": 0
+        },
+        {
+          "id": "019fff81-e0f2-79c2-b795-68347a34624c",
+          "status": "completed",
+          "started_at": 1786698129,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a01dd5-ca62-7cd0-845d-0f2246930d2c",
+      "title": "Unity Tracy 显存资源依赖分析",
+      "created_at": 1787206945,
+      "updated_at": 1787285184,
+      "url": "codex://threads/01a01dd5-ca62-7cd0-845d-0f2246930d2c",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a0222e-604d-7841-80fe-d0ab6d2631f6",
+          "status": "completed",
+          "started_at": 1787279859,
+          "final_messages": 1
+        },
+        {
+          "id": "01a01f9b-4703-7771-b9fa-e8cc53f62f61",
+          "status": "completed",
+          "started_at": 1787236665,
+          "final_messages": 1
+        },
+        {
+          "id": "01a01e78-3a6d-7893-b66b-8ec01cfc865f",
+          "status": "interrupted",
+          "started_at": 1787217590,
+          "final_messages": 0
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a06173-6263-78e1-9f40-f6e79f25b4f9",
+      "title": "Tracy默认开销问题",
+      "created_at": 1788341347,
+      "updated_at": 1788405813,
+      "url": "codex://threads/01a06173-6263-78e1-9f40-f6e79f25b4f9",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a06539-fbc3-7ce0-81f9-ca1c7defba33",
+          "status": "completed",
+          "started_at": 1788404693,
+          "final_messages": 1
+        },
+        {
+          "id": "01a061e6-5546-7762-ac84-2b41ea6f25f6",
+          "status": "completed",
+          "started_at": 1788348880,
+          "final_messages": 1
+        },
+        {
+          "id": "01a061de-049c-72f0-a6ab-db49b10008fe",
+          "status": "completed",
+          "started_at": 1788348335,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a06b1b-01a5-71e3-bd0c-982472885a99",
+      "title": "整理Tracy Unity性能分析自评",
+      "created_at": 1788503327,
+      "updated_at": 1788503578,
+      "url": "codex://threads/01a06b1b-01a5-71e3-bd0c-982472885a99",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a06b1c-0d7e-7391-9711-e12c4cc1939a",
+          "status": "completed",
+          "started_at": 1788503395,
+          "final_messages": 1
+        },
+        {
+          "id": "01a06b1b-f11a-7ab1-8270-cf6497f28089",
+          "status": "interrupted",
+          "started_at": 1788503388,
+          "final_messages": 0
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a07aca-cbe9-75b0-a880-5cdc509fed96",
+      "title": "分析 JNUnity 光追硬件开销 (3)",
+      "created_at": 1788782076,
+      "updated_at": 1788782356,
+      "url": "codex://threads/01a07aca-cbe9-75b0-a880-5cdc509fed96",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a07bba-8019-7df2-a144-4e0f7940e45c",
+          "status": "completed",
+          "started_at": 1788782215,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07bb8-62a8-7801-9576-0679f5198745",
+          "status": "completed",
+          "started_at": 1788782076,
+          "final_messages": 1
+        },
+        {
+          "id": "01a07ba8-9b14-75a3-9eb3-afc12149ab0c",
+          "status": "completed",
+          "started_at": 1788781042,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a05af4-26f3-7590-81ed-337c0167b1b5",
+      "title": "Unity Tracy SKILL迭代 (3)",
+      "created_at": 1788232345,
+      "updated_at": 1788232485,
+      "url": "codex://threads/01a05af4-26f3-7590-81ed-337c0167b1b5",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a05af5-0191-75e0-958e-103a98c6c4d6",
+          "status": "completed",
+          "started_at": 1788232401,
+          "final_messages": 1
+        },
+        {
+          "id": "01a05736-4f63-7c23-9e28-594c519eaf7f",
+          "status": "completed",
+          "started_at": 1788169572,
+          "final_messages": 1
+        },
+        {
+          "id": "01a0572a-7bcf-75a1-ba6a-4547551dbb0d",
+          "status": "completed",
+          "started_at": 1788168797,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a06aa5-94ba-7853-842f-c1354d85061e",
+      "title": "Unity Tracy SKILL迭代",
+      "created_at": 1789201506,
+      "updated_at": 1789204937,
+      "url": "codex://threads/01a06aa5-94ba-7853-842f-c1354d85061e",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a094ea-ea9c-7520-90f4-b139b5cc70e0",
+          "status": "completed",
+          "started_at": 1789204818,
+          "final_messages": 1
+        },
+        {
+          "id": "01a094b8-606d-7273-9543-3f416e3d1893",
+          "status": "interrupted",
+          "started_at": 1789201506,
+          "final_messages": 0
+        },
+        {
+          "id": "01a094a3-ce5c-7801-8d7e-6977f0779e31",
+          "status": "completed",
+          "started_at": 1789200158,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a04d7e-d2ea-7440-b5d3-22a247139bb5",
+      "title": "Unity Tracy 配置测试机",
+      "created_at": 1788006552,
+      "updated_at": 1788014307,
+      "url": "codex://threads/01a04d7e-d2ea-7440-b5d3-22a247139bb5",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a04df4-226b-7320-a0b2-3d1fefa28aa1",
+          "status": "completed",
+          "started_at": 1788014240,
+          "final_messages": 1
+        },
+        {
+          "id": "01a04df0-5441-7b61-80d6-2e04a6e89e26",
+          "status": "completed",
+          "started_at": 1788013990,
+          "final_messages": 1
+        },
+        {
+          "id": "01a04dee-97ba-7112-88e1-2eaeffb5ca87",
+          "status": "completed",
+          "started_at": 1788013877,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "01a052e4-95bd-7ac0-b46a-3d0e9b99bbb5",
+      "title": "打包 jntracy Player Skill",
+      "created_at": 1788097107,
+      "updated_at": 1788097202,
+      "url": "codex://threads/01a052e4-95bd-7ac0-b46a-3d0e9b99bbb5",
+      "scope": "all_available_turns",
+      "reviewed_turns": [
+        {
+          "id": "01a052e4-dea6-7523-8caf-ef5e9926ac22",
+          "status": "completed",
+          "started_at": 1788097126,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f6ab7-07b0-7081-9ce6-e9133128474a",
+      "title": "集成 Tracy 性能分析",
+      "created_at": 1784201812,
+      "updated_at": 1784204084,
+      "url": "codex://threads/019f6ab7-07b0-7081-9ce6-e9133128474a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "cf5733e9-5682-4c3f-8325-5c3d21710163",
+          "status": "interrupted",
+          "started_at": null,
+          "final_messages": 0
+        },
+        {
+          "id": "e7c624c3-b2a4-4d71-b50a-d53b43b63660",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        },
+        {
+          "id": "4093839c-d09a-40f4-aaa6-55cd9e206309",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f6e0a-7e45-7951-86d2-1bd20b85413a",
+      "title": "集成Tracy性能分析 (2)",
+      "created_at": 1784257614,
+      "updated_at": 1784260226,
+      "url": "codex://threads/019f6e0a-7e45-7951-86d2-1bd20b85413a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f6e30-d3f0-79f0-9b48-d55ec99cfbd3",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        },
+        {
+          "id": "019f6e2e-1983-7eb3-8655-6520354032f0",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        },
+        {
+          "id": "019f6e22-530e-7910-b53f-e6dcaae47fc8",
+          "status": "completed",
+          "started_at": null,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f6ff8-7163-7c80-922b-37ed4de5a04a",
+      "title": "接入D3D12 Tracy GPU分析",
+      "created_at": 1784289990,
+      "updated_at": 1784521078,
+      "url": "codex://threads/019f6ff8-7163-7c80-922b-37ed4de5a04a",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7db9-9fe8-7c73-bc0f-7e89f6bf6a6c",
+          "status": "completed",
+          "started_at": 1784520744,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7db3-84fb-77c2-b125-5ed935906c7d",
+          "status": "completed",
+          "started_at": 1784520344,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7daa-a8fb-7b81-9b00-371719210099",
+          "status": "completed",
+          "started_at": 1784519764,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    },
+    {
+      "id": "019f7e4f-bf14-79b2-8be1-4cb5d2383070",
+      "title": "审阅 Godot Tracy GPU 修改 (3)",
+      "created_at": 1784530588,
+      "updated_at": 1784531236,
+      "url": "codex://threads/019f7e4f-bf14-79b2-8be1-4cb5d2383070",
+      "scope": "selected_recent_turns",
+      "reviewed_turns": [
+        {
+          "id": "019f7e56-f5ae-7661-827d-e909a07329de",
+          "status": "completed",
+          "started_at": 1784531056,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7e53-3d0e-7ac3-953b-a38653f05a87",
+          "status": "completed",
+          "started_at": 1784530812,
+          "final_messages": 1
+        },
+        {
+          "id": "019f7e50-1658-7222-870c-1a5663578a8f",
+          "status": "completed",
+          "started_at": 1784530605,
+          "final_messages": 1
+        }
+      ],
+      "additional_earlier_turns": []
+    }
+  ]
+}

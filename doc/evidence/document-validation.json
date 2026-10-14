@@ -1,0 +1,35 @@
+{
+  "schema": "jntracy-document-validation/v1",
+  "date": "2026-10-14",
+  "passed": true,
+  "markdown_files": 92,
+  "authored_pages": 29,
+  "archived_markdown": 63,
+  "local_links_checked": 1412,
+  "external_urls_not_fetched": 147,
+  "json_files_parsed": 31,
+  "source_hashes_checked": 111,
+  "source_hash_matches": 111,
+  "git_heads": [
+    {
+      "repo": "tracy",
+      "expected": "f49190f2541c8da739d6c74fd2fe34eeff222e5e",
+      "actual": "f49190f2541c8da739d6c74fd2fe34eeff222e5e",
+      "matches": true
+    },
+    {
+      "repo": "jnunity",
+      "expected": "c2877d4b053c3e084b0316fc08bc6a1209e2baa8",
+      "actual": "c2877d4b053c3e084b0316fc08bc6a1209e2baa8",
+      "matches": true
+    },
+    {
+      "repo": "PackageRepo",
+      "expected": "0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+      "actual": "0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+      "matches": true
+    }
+  ],
+  "errors": [],
+  "warnings": []
+}

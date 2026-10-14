@@ -1,0 +1,9 @@
+{
+  "date": "2026-10-14",
+  "initial_deleted_doc_count": 31,
+  "final_deleted_doc_count": 31,
+  "deleted_set_unchanged": true,
+  "unexpected_status": [],
+  "git_commit_created": false,
+  "capture_note": "First-line status whitespace parsing was corrected before this comparison; no extra deletion or restoration occurred."
+}

@@ -1,0 +1,76 @@
+{
+  "relations": [
+    {
+      "ref": "dev",
+      "head": "b6d3cfddff40a0b11b630f6beb496c355487ae08",
+      "exists": true,
+      "included_in_mainline": false,
+      "includes_mainline": true
+    },
+    {
+      "ref": "feature/JNTracy-N30-LongTraceSessionStore",
+      "head": "8df7b0a19e08c93dfb9c8bc51aee721462489684",
+      "exists": true,
+      "included_in_mainline": false,
+      "includes_mainline": false
+    },
+    {
+      "ref": "feature/JNTracy-FixedSlices",
+      "head": "2b32e8316e77634b818fb30ee865dddb978b0a1e",
+      "exists": true,
+      "included_in_mainline": false,
+      "includes_mainline": false
+    },
+    {
+      "ref": "f62bd2d69",
+      "head": "f62bd2d690a90930cc316cec0152f962a427640b",
+      "exists": true,
+      "included_in_mainline": false,
+      "includes_mainline": false
+    },
+    {
+      "ref": "d261d1288",
+      "head": "d261d128875f331a7505d14349ee1773b0dd8129",
+      "exists": true,
+      "included_in_mainline": false,
+      "includes_mainline": false
+    },
+    {
+      "ref": "e4cfeb20a",
+      "head": "e4cfeb20a7f0efffb5fa1b5e49c5c8fe2cde3851",
+      "exists": true,
+      "included_in_mainline": true,
+      "includes_mainline": false
+    },
+    {
+      "ref": "a35a9886",
+      "head": "a35a9886540c1cf1f1e970c49e52e34cfb93a956",
+      "exists": true,
+      "included_in_mainline": true,
+      "includes_mainline": false
+    },
+    {
+      "ref": "3947331da",
+      "head": "3947331da927aacb118fa2f566e670d17a30117b",
+      "exists": true,
+      "included_in_mainline": true,
+      "includes_mainline": false
+    }
+  ],
+  "dev_only_commits": [
+    "b6d3cfddf Merge branch 'mainline' into dev",
+    "d261d1288 提高分析内存上限并修正哈希字符串比较",
+    "f7869289c Merge branch 'feature/tieshou-tracy' of code.byted.org:jng/tracy into feature/tieshou-tracy",
+    "f62bd2d69 修复 Query 归并文件流耗尽与 CPU 窗口扫描内存占用"
+  ],
+  "dev_diff_numstat": [
+    "17\t6\tanalysis/TracyExactStatistics.cpp",
+    "2\t2\tanalysis/TracyFrameCpuScanner.cpp",
+    "3\t0\tanalysis/TracyFrameCpuScanner.hpp",
+    "1\t1\tquery/ANALYZE.md",
+    "1\t0\tquery/CMakeLists.txt",
+    "2\t2\tquery/src/analyze.cpp",
+    "79\t0\tquery/tests/ExactStatisticsTests.cpp",
+    "32\t1\tquery/tests/FrameCpuScannerTests.cpp"
+  ]
+}

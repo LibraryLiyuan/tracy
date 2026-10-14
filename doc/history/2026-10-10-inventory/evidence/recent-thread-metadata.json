@@ -1,0 +1,369 @@
+{
+  "date": "2026-10-10",
+  "threads": [
+    {
+      "id": "019fa25b-03ee-7450-a7c5-9bbc7f6db3dc",
+      "title": "（未读）梳理引擎项目知识点与面试题",
+      "summary": "整理Unity 2022定制引擎、Tracy二次开发、全链路性能分析、LLM/MCP知识点与面试问题",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1785141240000
+    },
+    {
+      "id": "019f648c-745d-7943-ab70-bd2aa0268f2f",
+      "title": "（未读）梳理 GPU 图形知识",
+      "summary": null,
+      "cwd": "C:\\Users\\Admin\\Documents\\Codex\\2026-07-15\\gpu-rendertarget-gpu-pass-gpu-gpu-2",
+      "updated_at": 1784187975000
+    },
+    {
+      "id": "019f69d3-44f6-7bd0-829e-81a24fd615ec",
+      "title": "（未读）梳理 JNRP 调用链",
+      "summary": null,
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1784188516000
+    },
+    {
+      "id": "01a07bb2-2bac-7611-bb9d-51328b969dff",
+      "title": "规划 Tracy AI 性能分析文档",
+      "summary": "Tracy AI性能分析文档：自动登录、PackageRepo、jnunity分支明细",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1788784126000
+    },
+    {
+      "id": "01a04799-c461-7893-8296-56598dcde155",
+      "title": "规划 Tracy 仓库学习路径",
+      "summary": "制定 Tracy 0.13.1 仓库深度理解方案，结合 VS、VS Code 与 CodeGraph 技能",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790678005
+    },
+    {
+      "id": "01a09ef3-6776-7173-9bb7-d8ffd26472bc",
+      "title": "检查 Query 长录制与 GPUCatalog",
+      "summary": "Query 缓存加载、内存上限、GPUCatalog、长录制",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790687361
+    },
+    {
+      "id": "01a0c82c-6b96-7733-be54-6b8323771096",
+      "title": "统计两个仓库分支差异",
+      "summary": "jnunity、PackageRepo、origin/T3/unity-2022.3.67f1、origin/t3/development、Diff文件、修改行",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790583628
+    },
+    {
+      "id": "01a11a32-c791-7b91-8c2a-16b15eba525f",
+      "title": "优化 SKILL 执行流程",
+      "summary": "结合历史分析结果深度分析；优化插桩深度、报告格式，约束 SKILL 分析质量",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791548717
+    },
+    {
+      "id": "01a120a1-ff7c-76c2-b8b0-d410a7b16dad",
+      "title": "试验 SKILL 并生成替换包",
+      "summary": "在 T3_development 打包中试验 jntracy-stage-player-code，替换 junity、PackageRepo 与 T3 项目代码并生成新包",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791559668
+    },
+    {
+      "id": "01a11fc4-f913-7cc2-a0a8-4c2092d7289a",
+      "title": "检查 Tracy 合并冲突",
+      "summary": "检查 C:\\CodeProjects\\GodotProjects\\tracy-0.13.1 合并到 dev 分支前是否存在冲突",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791600100
+    },
+    {
+      "id": "01a11f9d-389d-7e21-ae93-8b9275b568c2",
+      "title": "切换到 JNTracyUnity 分支",
+      "summary": "C:\\workflow\\jnunity 本地仓库切换到 feature/JNTracyUnity",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791533712
+    },
+    {
+      "id": "01a11aa4-42e1-7d30-bbf5-980a5b90ec04",
+      "title": "查找超过10分钟的Tracy录制",
+      "summary": "在本地查找录制时长超过10分钟的Tracy stream文件和Tracy文件",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791449349
+    },
+    {
+      "id": "01a0ed47-7317-7df1-b432-86e25bb26ed7",
+      "title": "Diagnose Tracy file crash",
+      "summary": "Tracy dev 分支、30分钟 stream、input-r14.tracy、profiler GUI 闪退、job_stage",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791439492
+    },
+    {
+      "id": "01a10c75-4f77-78e1-92e0-4a5c89de6bd2",
+      "title": "查看对话进度",
+      "summary": "查询 Codex 对话 01a0ed47-7317-7df1-b432-86e25bb26ed7 的当前进度",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791210903
+    },
+    {
+      "id": "01a10c75-c8a4-7102-bb3b-9562f30ec452",
+      "title": "解释 GPT 对话工作树",
+      "summary": "说明 GPT 对话中的工作树含义",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791290707
+    },
+    {
+      "id": "01a0f138-c8ca-7de1-a44c-63b2c0480a4d",
+      "title": "重新编译 Tracy 可执行文件",
+      "summary": "在 C:\\CodeProjects\\GodotProjects\\tracy-0.13.1 重新编译并生成最新的 Tracy EXE",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790768069
+    },
+    {
+      "id": "01a0ed69-3595-7030-9ce5-e27a2f73d9f0",
+      "title": "分享 JN Tracy Skill 路径",
+      "summary": "提供 jntracy-stage-player-code SKILL.md 路径供同事使用",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790689623
+    },
+    {
+      "id": "01a0ebfa-c439-7f93-b24b-d0dca127f609",
+      "title": "优化 Tracy 小问题",
+      "summary": "Tracy线程排布优化、显存曲线、生成新的tracy整套exe录制",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790671802
+    },
+    {
+      "id": "01a0ebe1-60eb-7d71-b054-7f223eb8933a",
+      "title": "创建 mainline 分支",
+      "summary": "在 C:\\CodeProjects\\GodotProjects\\tracy-0.13.1 新建 mainline 分支，后续设为默认分支",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790664536
+    },
+    {
+      "id": "01a0eb50-f8d2-7353-9d56-94627bb44ef2",
+      "title": "Query 长录制优化时间",
+      "summary": "冷建、Scan耗时分布与大幅优化方向；30分钟tracy数据，profiler GUI打开Tracy",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790683365
+    },
+    {
+      "id": "01a0e741-1c34-7fc2-971b-3c697825e910",
+      "title": "Compare Job worker traces",
+      "summary": "Compare Tracy Player_20260923 trace with Unity Profiler 2.data, focusing on Job worker threads via s",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790652296
+    },
+    {
+      "id": "01a0e753-ce39-79f3-872d-934e2a3ae7da",
+      "title": "检查录制配置与 GPU 数据缺失",
+      "summary": "检查 Player_20260923_212056-report-trace-portable 的录制设置，查明为何没有 GPU Resource 数据",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790588983
+    },
+    {
+      "id": "01a0e761-ddf7-7842-a893-8f16159831b8",
+      "title": "Identify Tracy GPU memory curve",
+      "summary": "Player_20260923_212056.tracy GPU memory curve identification",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790588554
+    },
+    {
+      "id": "01a0e728-773b-78c1-a163-5042273cf571",
+      "title": "查找补全 Tracy 调用栈的对话",
+      "summary": "搜索关于对比 Unity Profiler 与 Tracy 录制数据并补全 Tracy 调用栈的对话",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790585106
+    },
+    {
+      "id": "01a0e71e-74cd-73c2-8dda-1c6bdcee3a2b",
+      "title": "启动T3 Unity项目",
+      "summary": "用jnunity的unity启动T3项目，连接PackageRepo，录制Unity profiler数据",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790683385
+    },
+    {
+      "id": "01a0e6e5-a318-7572-9fcd-b17011967d63",
+      "title": "查看共享对话内容",
+      "summary": "查看共享对话内容；Player Tracy 录制、性能分析报告、Profiler 截图、便携包",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1791440875
+    },
+    {
+      "id": "01a0b2b1-ae65-71e3-8c2c-359f1193893c",
+      "title": "优化SKILL",
+      "summary": "基于AI性能分析结果继续优化SKILL细节",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790221771
+    },
+    {
+      "id": "01a0c3f0-1ac2-7070-9095-c8f813a6bfaa",
+      "title": "查找报告中的Tracy文件",
+      "summary": "JNTracy 分支合并；用正确的 Profiler 打开 T3-manual.tracy",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790580426
+    },
+    {
+      "id": "01a0cd4a-7b2d-7ca3-b894-8623583b738c",
+      "title": "梳理 N30 相关文件夹",
+      "summary": "识别 N23至N30 文件夹内容并判断可删除项",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790151417
+    },
+    {
+      "id": "01a0b32a-88f5-7430-93d4-676f5176ce86",
+      "title": "评估30分钟Tracy文件处理能力",
+      "summary": "评估30分钟tracy文件、SKILL、浏览器打开、tracy文件大小、文件切分可行性",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790683379
+    },
+    {
+      "id": "01a0c973-2637-7d00-af34-f8929cceb77a",
+      "title": "生成 T3 新打包工程",
+      "summary": "参考 jntracy-stage-player-code，替换 T3_development 并生成新的打包工程",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790087637
+    },
+    {
+      "id": "01a0c7fc-b356-7ba1-a7fb-936f58457312",
+      "title": "排查 game.exe 启动崩溃",
+      "summary": "检查 T3_development 中 game.exe 启动崩溃的日志",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790062196
+    },
+    {
+      "id": "01a0c47a-0683-7551-9e65-5bb58041abf3",
+      "title": "合并 Unity 与 PackageRepo 分支",
+      "summary": "更新 C:\\workflow\\jnunity 和 C:\\workflow\\PackageRepo 分支并合并远程修改",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790061303
+    },
+    {
+      "id": "01a0c48d-1338-7bd1-b229-fc0d2c6eecb0",
+      "title": "查看线程执行情况",
+      "summary": "查询 codex://threads/01a09ef3-6776-7173-9bb7-d8ffd26472bc 当前执行状态",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790584574
+    },
+    {
+      "id": "01a0c420-8f54-71d0-b210-efe428970d3f",
+      "title": "启动 Unity 录制 Profiler 数据",
+      "summary": "启动 Unity 并使用 Unity Profiler 录制性能数据",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790583907
+    },
+    {
+      "id": "01a0c458-f485-7551-b3ba-31d5bb461100",
+      "title": "打开 Tracy 性能报告",
+      "summary": "使用 Tracy Profiler 打开 QS17-Skill-2.3.1-ReportIteration 中的 Tracy 报告文件",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790000995
+    },
+    {
+      "id": "01a0c402-e54e-7672-b6e6-4b1caf52c10a",
+      "title": "清理 JN-Unity-T3 大文件",
+      "summary": "检查 JN-Unity-T3 文件夹并识别可安全删除的大型缓存与构建文件",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790060205
+    },
+    {
+      "id": "01a0c3f2-d30c-7be3-9c12-57498ba96c70",
+      "title": "查找 Codex 对话内容",
+      "summary": "查找中转站 paru 中对话 ID 27cc936c1af197f261209054af9e7e89 的内容",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789995245
+    },
+    {
+      "id": "01a0bd87-1da1-7151-8cff-3d37640ca814",
+      "title": "“codex://threads/01a09ef3-6776-7173-9bb7-d8ffd26472bc”这个任务使…",
+      "summary": "“codex://threads/01a09ef3-6776-7173-9bb7-d8ffd26472bc”这个任务使用GPT 5.6 Luna max的智力是否可以比较稳定的完成？",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789886286
+    },
+    {
+      "id": "01a0b340-ff4d-7883-9bf0-6138c5535843",
+      "title": "查找 N30 Session Store 分支",
+      "summary": "确认 Tracy 仓库分支及 dev 分支是否包含 N30 Session Store 修改",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789713916
+    },
+    {
+      "id": "01a0afd0-a28e-7b11-8389-f1386246b118",
+      "title": "忽略 Godot build 文件夹",
+      "summary": "更新 tracy-0.13.1 项目 gitignore，忽略所有 build 文件夹",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789656202
+    },
+    {
+      "id": "01a0a3ae-c594-75d3-9c6d-0d0028a36585",
+      "title": "Stream转换问题",
+      "summary": "转换器 磁盘支撑 GPUCatalog 长数据 实现讨论 内存压力",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789704259
+    },
+    {
+      "id": "01a0a326-b197-7c12-8ec8-87b2af1d787f",
+      "title": "讨论 Tracy Capture GUI 设计",
+      "summary": "Tracy Capture GUI 设计、dev 分支、录制启动流程、capture、GUI",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1790580468
+    },
+    {
+      "id": "01a096de-d4c8-7c00-abb3-f98faf739a45",
+      "title": "SKILL新版本试验",
+      "summary": "SKILL新版本试验 profiler tracy文件人工校验 Frames 第351帧 Player.Frame",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789706870
+    },
+    {
+      "id": "01a0a836-5c32-7d31-991c-bb6022db6714",
+      "title": "比较 Tracy 文件切分格式",
+      "summary": "评估 tracy-stream 与 tracy 文件按 5 分钟切分的实现便利性",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789528642
+    },
+    {
+      "id": "01a0a443-058d-7c11-96a4-9c2908771041",
+      "title": "查找 diagnose-jn-unity-tracy 技能",
+      "summary": "确认是否可搜索到 diagnose-jn-unity-tracy 技能及其可用性",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789462268
+    },
+    {
+      "id": "01a0a33b-ee90-7373-8c10-5286bb3548e2",
+      "title": "INI文件切换",
+      "summary": "Tracy抓取Unity数据 数据等级 ini文件配置 diagnose-jn-unity-tracy",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789704263
+    },
+    {
+      "id": "01a0a31e-39c3-7580-b0e3-c1dcbc8c9d71",
+      "title": "SKILL新版本试验 (2)",
+      "summary": "确认Frames第351帧与Player.Frame帧号区别，使用Tracy Profiler人工校验分析报告",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789444068
+    },
+    {
+      "id": "01a09f47-1097-70f3-b3d7-d8daae7f431e",
+      "title": "优化 Query的存储问题",
+      "summary": "Query缓存优化 存储的扩大问题 本地文件存储",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789442539
+    },
+    {
+      "id": "01a0a077-abd0-7db1-9ff6-637473fd4a4d",
+      "title": "查找今早的 Tracy 性能报告对话",
+      "summary": "定位今天早上运行 diagnose-jn-unity-tracy 生成性能分析报告的对话",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789398653
+    },
+    {
+      "id": "01a0a072-94e5-79f1-b6cc-ca6531804e34",
+      "title": "复制 Tracy 文件到独立目录",
+      "summary": "将 JN-Unity-T3 的 GPUCatalogOff-HighEvidence Tracy 文件复制到独立目录，供 diagnose-jn-unity-tracy 性能分析",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789398366
+    },
+    {
+      "id": "01a09f5f-eea8-7750-a3b5-94ecacf5da81",
+      "title": "迭代 JN Tracy Player 技能",
+      "summary": "迭代 jntracy-stage-player-code，参考 build-t3-win-dlls 和 build-t3-win-gameassembly",
+      "cwd": "C:\\Users\\Admin\\Documents\\JN-Unity-T3",
+      "updated_at": 1789382204
+    }
+  ]
+}

@@ -1,0 +1,161 @@
+{
+  "date": "2026-10-10",
+  "observed_at_utc": "2026-10-10T06:16:08.3955278Z",
+  "scope": "Read-only local Git refs; no fetch; tracked status only; observations non-atomic",
+  "repositories": [
+    {
+      "path": "C:/workflow/jnunity",
+      "branch": "feature/JNTracyUnity",
+      "head": "214a769e64ab3a765ef2acf4554799680fcff1c7",
+      "tracked_change_count": 0,
+      "tracked_changes": [],
+      "untracked": "not enumerated",
+      "codegraph": false
+    },
+    {
+      "path": "C:/workflow/PackageRepo",
+      "branch": "feature/Pack-JNTracy",
+      "head": "761bcc31f406cda58e98ffd51400d78dda5c04cd",
+      "tracked_change_count": 0,
+      "tracked_changes": [],
+      "untracked": "not enumerated",
+      "codegraph": false
+    },
+    {
+      "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1",
+      "branch": "dev",
+      "head": "3947331da927aacb118fa2f566e670d17a30117b",
+      "tracked_change_count": 0,
+      "tracked_changes": [],
+      "untracked": "not enumerated",
+      "codegraph": true
+    },
+    {
+      "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-fixed-slices",
+      "branch": "feature/JNTracy-FixedSlices",
+      "head": "2b32e8316e77634b818fb30ee865dddb978b0a1e",
+      "tracked_change_count": 82,
+      "tracked_changes": [
+        " M analysis/TracyAnalysisDiskBudget.hpp",
+        " M analysis/TracyProcessCommitLimit.hpp",
+        " M analysis/TracyTraceSource.hpp",
+        " M analysis/TracyWorkerTraceSource.cpp",
+        " M analysis/TracyWorkerTraceSource.hpp",
+        " M capture/CMakeLists.txt",
+        " M capture/src/FixedSliceCpuNativeTraceWriter.hpp",
+        " M capture/src/FixedSliceCpuNativeValidation.hpp",
+        " M capture/src/FixedSliceCpuPagedProjection.hpp",
+        " M capture/src/FixedSliceCpuStorageIndex.hpp",
+        " M capture/src/FixedSliceGpuNativeCandidate.hpp",
+        " M capture/src/FixedSliceJnActivityIndex.hpp",
+        " M capture/src/FixedSliceJnIndexedProjection.hpp",
+        " M capture/src/FixedSliceJnIndexedSource.hpp",
+        " M capture/src/FixedSliceJnNativeCandidate.hpp",
+        " M capture/src/FixedSliceJnNativeTraceWriter.hpp",
+        " M capture/src/FixedSliceJnPagedPayload.hpp",
+        " M capture/src/FixedSliceNativeAssembly.hpp",
+        " M capture/src/FixedSliceNativeAssemblyCandidate.hpp",
+        " M capture/src/FixedSliceNormalFramePagedProjection.hpp",
+        " M capture/src/FixedSliceReadHooks.hpp",
+        " M capture/src/FixedSliceSelectedCollection.hpp",
+        " M capture/src/stream-convert.cpp",
+        " M capture/tests/ConversionFilesTests.cpp",
+        " M capture/tests/FixedSliceCliTests.cpp",
+        " M capture/tests/FixedSliceFrameNativeTraceTests.cpp",
+        " M capture/tests/FixedSliceGpuIndexTests.cpp",
+        " M capture/tests/FixedSliceGpuNativeTraceTests.cpp",
+        " M capture/tests/FixedSliceJnActivityIndexTests.cpp",
+        " M capture/tests/FixedSliceJnIndexedSourceTests.cpp",
+        " M capture/tests/FixedSliceJnNativeTraceTests.cpp",
+        " M capture/tests/FixedSliceManifestPublisherTests.cpp",
+        " M capture/tests/FixedSliceSelectedCollectionTests.cpp",
+        " M capture/tests/FixedSliceSemanticsTests.cpp",
+        " M capture/tests/MutableRowsTests.cpp",
+        " M capture/tests/OfflineValidationStringSourceTests.cpp",
+        " M capture/tests/PagedRecordVisitTests.cpp",
+        " M capture/tests/ResourceSetSealTests.cpp",
+        " M capture/tests/ResourceSetStoreTests.cpp",
+        " M profiler/CMakeLists.txt",
+        " M profiler/src/BackendGlfw.cpp",
+        " M profiler/src/WindowPosition.cpp",
+        " M profiler/src/profiler/TracyFixedSliceFileRead.hpp",
+        " M profiler/src/profiler/TracyView.cpp",
+        " M profiler/src/profiler/TracyView.hpp",
+        " M profiler/src/profiler/TracyView_EvidenceNavigation.cpp",
+        " M profiler/src/profiler/TracyView_FixedSlice.cpp",
+        " M profiler/src/profiler/TracyView_FrameOverview.cpp",
+        " M profiler/src/profiler/TracyView_FrameTimeline.cpp",
+        " M profiler/src/profiler/TracyView_Jobs.cpp",
+        " M query/CMakeLists.txt",
+        " M query/schema/coverage-fields-v1.json",
+        " M query/schema/coverage-mcp-v1.json",
+        " M query/schema/coverage-v1.json",
+        " M query/schema/tracy-query-v1.schema.json",
+        " M query/src/TracyQueryExplicitPassBuilder.cpp",
+        " M query/src/TracyQueryIndex.cpp",
+        " M query/src/TracyQueryIndex.hpp",
+        " M query/src/TracyQueryResourceContext.cpp",
+        " M query/src/TracyQueryResourceContext.hpp",
+        " M query/src/TracyQueryService.cpp",
+        " M query/src/TracySegmentTraceSource.cpp",
+        " M query/src/TracySegmentTraceSource.hpp",
+        " M query/src/TracySessionManager.cpp",
+        " M query/src/TracySessionManager.hpp",
+        " M query/src/main.cpp",
+        " M query/tests/CompressedQueryIndexTests.cpp",
+        " M query/tests/ProtocolTests.cpp",
+        " M query/tests/QueryExplicitPassBuilderTests.cpp",
+        " M query/tests/QueryResourceContextTests.cpp",
+        " M server/TracyFileRead.hpp",
+        " M server/TracyFileReadHooks.hpp",
+        " M server/TracyFixedSliceAnalysis.hpp",
+        " M server/TracyFixedSliceCoreAnalysis.hpp",
+        " M server/TracyFixedSliceFormat.hpp",
+        " M server/TracyFixedSliceJnPayload.hpp",
+        " M server/TracyFixedSliceReadPolicy.hpp",
+        " M server/TracyFixedSliceSemantics.hpp",
+        " M server/TracyFixedSliceViewModel.hpp",
+        " M server/TracyWorker.cpp",
+        " M server/TracyWorker.hpp",
+        " M storage/TracyMutableRows.hpp"
+      ],
+      "untracked": "not enumerated",
+      "codegraph": false
+    },
+    {
+      "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session",
+      "branch": "feature/JNTracy-N30-LongTraceSessionStore",
+      "head": "8df7b0a19e08c93dfb9c8bc51aee721462489684",
+      "tracked_change_count": 0,
+      "tracked_changes": [],
+      "untracked": "not enumerated",
+      "codegraph": false
+    }
+  ],
+  "tracy_dev_ancestry": [
+    {
+      "ref": "e4cfeb20",
+      "included_in_local_dev": true
+    },
+    {
+      "ref": "a35a9886",
+      "included_in_local_dev": true
+    },
+    {
+      "ref": "9aa6bf60",
+      "included_in_local_dev": true
+    },
+    {
+      "ref": "18c556f6",
+      "included_in_local_dev": true
+    },
+    {
+      "ref": "8df7b0a1",
+      "included_in_local_dev": false
+    },
+    {
+      "ref": "7eb9e55d",
+      "included_in_local_dev": false
+    }
+  ]
+}

@@ -1,0 +1,272 @@
+{
+  "checked_at": "2026-09-07T20:26:30.4592781+08:00",
+  "scope": "Markdown local links, explicit anchors, fences, encoding and source identity drift; not product tests",
+  "markdown_files": 37,
+  "links_checked": 459,
+  "total_characters": 96740.0,
+  "errors": [],
+  "source_count": 38,
+  "source_drift": [],
+  "files": [
+    {
+      "characters": 2261,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\README.md",
+      "headings": 5,
+      "bytes": 3800,
+      "sha256": "0245BCFEFA4BA6FA54EDB2A47834B2429C5B958BAD6464C6B5B389AC40C07828"
+    },
+    {
+      "characters": 2364,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\STATUS.md",
+      "headings": 5,
+      "bytes": 3874,
+      "sha256": "37F597000605220FA3146E9DD879F37A246721C58D6CBFB6F2B7479F3E76FF6A"
+    },
+    {
+      "characters": 2687,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\architecture.md",
+      "headings": 6,
+      "bytes": 4375,
+      "sha256": "53C824523C2F0006A6118030C6CBBC0EB53F8685BDF098DC3EECA191A35A66CC"
+    },
+    {
+      "characters": 2385,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\capabilities.md",
+      "headings": 2,
+      "bytes": 3807,
+      "sha256": "FAE236B2C08D0C52E742C47FD56C7112C9B385EF5C953C652D24FABB8B85958F"
+    },
+    {
+      "characters": 2666,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\01-system\\contracts.md",
+      "headings": 5,
+      "bytes": 4202,
+      "sha256": "B84EC0EA879C6607305D014ADD41B6EDDBAEB68CF4823BD19BFBA2233C0651FE"
+    },
+    {
+      "characters": 1933,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\01-capture.md",
+      "headings": 5,
+      "bytes": 3123,
+      "sha256": "56C3FDD47067EF2B74C9A5D8A5ED66FB7CCD2EFDB6E7CD4B68033A12540D6C1C"
+    },
+    {
+      "characters": 1976,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\02-storage-query.md",
+      "headings": 5,
+      "bytes": 3266,
+      "sha256": "795C7A8960159085A56D4E632D773400C64E7DDCF94031FC76B3F64B8E3F3F88"
+    },
+    {
+      "characters": 2077,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\03-cpu-job.md",
+      "headings": 5,
+      "bytes": 3259,
+      "sha256": "03F9E92361EEFC44EE39046D7AFCA6725BB26C12A9907FACD49C6829B34B7206"
+    },
+    {
+      "characters": 2023,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\04-gpu-frame-dxr.md",
+      "headings": 5,
+      "bytes": 3091,
+      "sha256": "5EE83CF20BA32B9500E17F90CF3D59F3D1B06B51CAFCC0B7A5AFC32F633687E6"
+    },
+    {
+      "characters": 1874,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\05-resource-memory.md",
+      "headings": 5,
+      "bytes": 3018,
+      "sha256": "7761DBE42886F67E0AD13DA2F932D4EF033431FC0F3B2564DB6215E1F56389A6"
+    },
+    {
+      "characters": 2140,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\06-ai-analysis.md",
+      "headings": 7,
+      "bytes": 3528,
+      "sha256": "91E6FAEA1212EA74314731EFFEC2E3A831FDA7E8D2B4469644738B446DA29F8E"
+    },
+    {
+      "characters": 1336,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\07-build-delivery.md",
+      "headings": 4,
+      "bytes": 2366,
+      "sha256": "ECC7DE0283EBE669F3A9B9B24BC247CD2D6232C46FB227C0B058DDB18EEDF78D"
+    },
+    {
+      "characters": 834,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\02-chains\\README.md",
+      "headings": 1,
+      "bytes": 1386,
+      "sha256": "6E96214BD7F0A3B1740E0ECA02D2690F5F982D0B3DFC3AC9B827EE31458E65FD"
+    },
+    {
+      "characters": 2030,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\capture-foundation.md",
+      "headings": 6,
+      "bytes": 3496,
+      "sha256": "BC8D580D9184B3A69981BD7EED966F861CDC1F014C43FCAC1968BFE669015754"
+    },
+    {
+      "characters": 1282,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\gpu-evolution.md",
+      "headings": 5,
+      "bytes": 2064,
+      "sha256": "08691ACB39033BA09CCC5D1286C0CA8A76389BBED85FE49E564E99131C5BCBF4"
+    },
+    {
+      "characters": 2531,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\queryscan-evolution.md",
+      "headings": 7,
+      "bytes": 4289,
+      "sha256": "2810E1F730747A01141DFBE7998C138FA9981940A9027AF19D6DECC365D4AB40"
+    },
+    {
+      "characters": 1633,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\README.md",
+      "headings": 3,
+      "bytes": 2907,
+      "sha256": "FA4D8F4D594EDAEC55666201D3133E824DE9D89A52A5ECB521E3D4CDCA3B7436"
+    },
+    {
+      "characters": 1826,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\resource-evolution.md",
+      "headings": 6,
+      "bytes": 3170,
+      "sha256": "4FB3BFACC9A5443843FE5462F269FE0E5B247A9FE59FAB1DB531641028905FB3"
+    },
+    {
+      "characters": 1735,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\03-iterations\\storage-evolution.md",
+      "headings": 6,
+      "bytes": 2915,
+      "sha256": "F54F28687891957C27B4880668A6260825837D6BFD34F0A56F23427E260D876F"
+    },
+    {
+      "characters": 7656,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\jnunity.md",
+      "headings": 12,
+      "bytes": 10616,
+      "sha256": "1B16CC38DEBA1668690EB6512112B5BC69AD950DA09988EFDB427D82134CA87A"
+    },
+    {
+      "characters": 6071,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\PackageRepo.md",
+      "headings": 9,
+      "bytes": 8321,
+      "sha256": "6FCF6B474358AA5583F2AFC33D235CDF6558EAC6DBBB0E4FFACA749DE10A176B"
+    },
+    {
+      "characters": 2427,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\README.md",
+      "headings": 5,
+      "bytes": 3535,
+      "sha256": "83C0850D09C9A1F017D91B3ABBCCE0C0075F55D67E45E1C36CDC3AD0FF938538"
+    },
+    {
+      "characters": 11254,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\04-branches\\tracy.md",
+      "headings": 14,
+      "bytes": 15396,
+      "sha256": "EA1211E2AE1B4DB8CF2005744D961F0E0052559DD7122AEE3E36CE42799EA695"
+    },
+    {
+      "characters": 1890,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\config-compatibility.md",
+      "headings": 5,
+      "bytes": 3024,
+      "sha256": "AE5EEE70B86AE614B3F5D5BA4AC1286C2A8A93ED695D1033AC627B7C23DDB7B3"
+    },
+    {
+      "characters": 3364,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\runbook.md",
+      "headings": 8,
+      "bytes": 5196,
+      "sha256": "BC2A5B2CFDE7BD7C1C1E6DD5A0C1F37AC674F7B7CD8CAC0AC103CD13FF8670E9"
+    },
+    {
+      "characters": 3612,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\tool-catalog.md",
+      "headings": 6,
+      "bytes": 5080,
+      "sha256": "D9C9C981B5CB24C7B2D0F52473AF869363A94A3AC2E9F29BC299D827442A5A17"
+    },
+    {
+      "characters": 1841,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\05-operations\\troubleshooting.md",
+      "headings": 2,
+      "bytes": 3035,
+      "sha256": "BB1C3D8A4715C7447192FFB82429AD3BB7611B8F9C85914DC5B538F9617E7841"
+    },
+    {
+      "characters": 1835,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\decisions.md",
+      "headings": 2,
+      "bytes": 3009,
+      "sha256": "C510A12CA5FF21F74FC57A75673145BA6C965439175A650112D392C3F923D83B"
+    },
+    {
+      "characters": 1929,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\metrics.md",
+      "headings": 5,
+      "bytes": 3471,
+      "sha256": "F075C30E9B1AFD5741BD8D6CF8E9A4B8BD86154573549EA0DC52D3FE15BB0188"
+    },
+    {
+      "characters": 1776,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\06-quality\\validation.md",
+      "headings": 6,
+      "bytes": 3190,
+      "sha256": "41D318EDEFCB99DCE7B69D7AF54BB8C03ADDB16ECDFC3E77800922B0EE651EA6"
+    },
+    {
+      "characters": 1427,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\07-collaboration\\maintenance.md",
+      "headings": 7,
+      "bytes": 3311,
+      "sha256": "945E83B7757F1A902C9E21D5520E727F4BBA9E091D1AAE11D584FB9976F508BF"
+    },
+    {
+      "characters": 1165,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\07-collaboration\\starting-prompts.md",
+      "headings": 5,
+      "bytes": 2457,
+      "sha256": "4039CD00F32DEDAC153F08D36E8A6D39B96C6268472076D573C897469A3981F0"
+    },
+    {
+      "characters": 1236,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\07-collaboration\\templates.md",
+      "headings": 17,
+      "bytes": 2650,
+      "sha256": "D9BD6077990E073697C0D1FC3C0411E9037255F2612F9BD75FBDE378BC246181"
+    },
+    {
+      "characters": 1826,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\08-references\\known-gaps.md",
+      "headings": 4,
+      "bytes": 3314,
+      "sha256": "15B8743B6C74FA094DB2463A5C00F52A730B2526CA3A267F62E68A524DF4BEE1"
+    },
+    {
+      "characters": 8079,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\08-references\\source-index.md",
+      "headings": 42,
+      "bytes": 10820,
+      "sha256": "6D96CD45DF24D49D657B5793B11C70952D4E5BA7C9949734CCAD66E60E094A1B"
+    },
+    {
+      "characters": 1226,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-Docs\\sessions\\2026-09-07-documentation-bootstrap.md",
+      "headings": 7,
+      "bytes": 2444,
+      "sha256": "83475A799392CF0F033BEBF3CB95B15C9AEC035EF4AA0A3C9A2FE6DDA4A50492"
+    },
+    {
+      "characters": 533,
+      "path": "C:\\Users\\Admin\\Documents\\JN-Unity-T3\\JNTracy-文档导航.md",
+      "headings": 1,
+      "bytes": 752,
+      "sha256": "A340DB7F47CCC486E179EC3EC4DAB25EBF4E2BB3AEEDAD56E6071BEAF43D1907"
+    }
+  ],
+  "status": "PASS"
+}

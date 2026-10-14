@@ -1,0 +1,230 @@
+[
+  {
+    "id": "S01",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-JNTracy-AI-Deployment-and-Test.zh-CN.md",
+    "title": "三仓部署与同事验收指南",
+    "scope": "历史部署合同，不能代表所有新分支"
+  },
+  {
+    "id": "S02",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+    "title": "GPU L0 OriginFrameId 交接",
+    "scope": "设计与待实施边界"
+  },
+  {
+    "id": "S03",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+    "title": "Render Thread 嵌套与覆盖修复",
+    "scope": "专项验收"
+  },
+  {
+    "id": "S04",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/DXR-GpuTiming-20260907/DXR-GPU-Timing-Acceptance.zh-CN.md",
+    "title": "DXR GPU 耗时实现与验收",
+    "scope": "含本地 Player 故障和 Editor 补记"
+  },
+  {
+    "id": "S05",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+    "title": "N31 Managed GPU Catalog 计划",
+    "scope": "目标及历史性能观测，不是最终验收"
+  },
+  {
+    "id": "S06",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+    "title": "GPU Memory 长 Trace 窗口交接",
+    "scope": "规模问题与架构建议"
+  },
+  {
+    "id": "S07",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-06-query-native-deterministic-scan-design.zh-CN.md",
+    "title": "Query 原生扫描设计",
+    "scope": "设计文件；部分措辞已被后续合同收紧"
+  },
+  {
+    "id": "S08",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-06-query-native-deterministic-scan-implementation-plan.zh-CN.md",
+    "title": "QueryScan 实施计划",
+    "scope": "阶段拆解和工作区"
+  },
+  {
+    "id": "S09",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/QSCAN-13-Native-Scan-Real-Trace-Acceptance.zh-CN.md",
+    "title": "QSCAN13 真实 Trace 验收",
+    "scope": "历史阶段通过，Session 延期"
+  },
+  {
+    "id": "S10",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/Implementation-Progress.zh-CN.md",
+    "title": "QSCAN14 实施进度",
+    "scope": "真实短 Trace 验收失败，安装未完成"
+  },
+  {
+    "id": "S11",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/FW5-Short-Trace-Memory-Guard-Failure.zh-CN.md",
+    "title": "FW5 内存保护失败记录",
+    "scope": "取消证据和未验证假设"
+  },
+  {
+    "id": "S12",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/query-native-scan-workflow.md",
+    "title": "Query 1.35 扫描恢复合同",
+    "scope": "草案工作流"
+  },
+  {
+    "id": "S13",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/candidate-investigation.md",
+    "title": "候选调查与停止合同",
+    "scope": "草案调查及实际 MCP 回执要求"
+  },
+  {
+    "id": "S14",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/capture-workflow.md",
+    "title": "采集停止与转换合同",
+    "scope": "采集辅助路由"
+  },
+  {
+    "id": "S15",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/report-contract.md",
+    "title": "报告合同",
+    "scope": "草案报告与产物结构"
+  },
+  {
+    "id": "S16",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance/README.zh-CN.md",
+    "title": "N00 起始迭代验收索引",
+    "scope": "历史专项与生产门禁状态"
+  },
+  {
+    "id": "S17",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/GPU-Resource-Catalog-Acceptance/N27-GPU-Resource-Catalog-Acceptance.zh-CN.md",
+    "title": "N27 Catalog 集中验收",
+    "scope": "功能通过及生产例外"
+  },
+  {
+    "id": "S18",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/N28-ResourceGraph-Schema3-Repair-and-Completion-Plan.zh-CN.md",
+    "title": "N28 ResourceGraph Schema3 计划",
+    "scope": "来源链、生命周期与连接约束"
+  },
+  {
+    "id": "S19",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n29-gpu-analysis/doc/JN-Tracy-N29-GPU-Resource-Analysis-Sidecar-Acceptance.zh-CN.md",
+    "title": "N29 GPU Sidecar 验收",
+    "scope": "Passed With Declared Exceptions"
+  },
+  {
+    "id": "S20",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30-Long-Trace-Session-Store-Acceptance.zh-CN.md",
+    "title": "N30 Session 验收记录",
+    "scope": "历次阶段证据"
+  },
+  {
+    "id": "S21",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-Trusted-Session-Completion-Plan.zh-CN.md",
+    "title": "N30A 可信 Session 收口计划",
+    "scope": "2026-09-02 A7 历史完成及源降级"
+  },
+  {
+    "id": "S22",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-P3-Short-Differential-Failure-Review.zh-CN.md",
+    "title": "N30A P3 双路径失败复核",
+    "scope": "2026-09-07 失败，未继续新 30m"
+  },
+  {
+    "id": "S23",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+    "title": "N27 GUI 验收",
+    "scope": "PreviewCandidate 及人工验收边界"
+  },
+  {
+    "id": "S24",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+    "title": "离线转换优化验收记录",
+    "scope": "历史算法与阶段观测"
+  },
+  {
+    "id": "S25",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/TestMachine-Handoff/2026-08-29/JN-Tracy-Test-Machine-Deployment-Handoff.zh-CN.md",
+    "title": "测试机部署交接",
+    "scope": "固定旧快照"
+  },
+  {
+    "id": "S26",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Analysis/G01-Static-20260826-200012-Full-20260830/AnalysisReport/Evidence-Index.md",
+    "title": "G01 证据索引示例",
+    "scope": "历史报告结构参考"
+  },
+  {
+    "id": "S27",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/SKILL.md",
+    "title": "草案 Skill 入口",
+    "scope": "现场读取 version 2.0.1"
+  },
+  {
+    "id": "S28",
+    "path": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/SKILL.md",
+    "title": "已安装 Skill 入口",
+    "scope": "现场读取 version 1.1.3"
+  },
+  {
+    "id": "S29",
+    "path": "C:/Users/Admin/.codex/skills/jntracy-stage-player-code/SKILL.md",
+    "title": "Player staging 工具合同",
+    "scope": "文档资料；本次未执行部署"
+  },
+  {
+    "id": "S30",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/start-capture.ps1",
+    "title": "启动采集脚本",
+    "scope": "已检查参数与正文入口"
+  },
+  {
+    "id": "S31",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/monitor-capture.ps1",
+    "title": "采集监控脚本",
+    "scope": "已检查参数与正文入口"
+  },
+  {
+    "id": "S32",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/stop-capture.ps1",
+    "title": "停止采集脚本",
+    "scope": "已检查参数与正文入口"
+  },
+  {
+    "id": "S33",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/convert-stream.ps1",
+    "title": "转换与发布脚本",
+    "scope": "已检查参数与正文入口"
+  },
+  {
+    "id": "S34",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/start-query-mcp.ps1",
+    "title": "旧配置 MCP 启动脚本",
+    "scope": "未传新版 analysis-root 参数"
+  },
+  {
+    "id": "S35",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/resolve-profile.ps1",
+    "title": "旧 JSON 配置解析脚本",
+    "scope": "四份 JSON 配置入口"
+  },
+  {
+    "id": "S36",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-07-frame-window-candidate-and-investigation-implementation-plan.zh-CN.md",
+    "title": "帧窗口调查实施计划",
+    "scope": "实施进度引用的正式计划"
+  },
+  {
+    "id": "S37",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/GPU-Zone-OriginFrameId-and-Hierarchy-Architecture-Brainstorming-20260906.zh-CN.md",
+    "title": "GPU 帧归属与层级架构讨论",
+    "scope": "设计资料"
+  },
+  {
+    "id": "S38",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/FW5-Run2-Exact-Statistics-Memory.zh-CN.md",
+    "title": "FW5 run2精确统计内存阻断与回归",
+    "scope": "run2失败、空异常vector容量修正；第三轮未执行"
+  }
+]

@@ -1,0 +1,956 @@
+{
+  "metadata": {
+    "name": "PackageRepo",
+    "root": "C:/workflow/PackageRepo",
+    "branch": "feature/Pack-JNTracy",
+    "base": "origin/t3/development",
+    "head": "0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+    "base_head": "7c158b18995a397e587855d8968b726426fdf1be",
+    "merge_base": "92f1ededb40cfada15df61411a5ad0a7d2ce12eb",
+    "comparison": "92f1ededb40cfada15df61411a5ad0a7d2ce12eb..0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+    "left_right": "102\t2",
+    "status_porcelain": [],
+    "total_files": 99,
+    "added": 10454,
+    "deleted": 44,
+    "categories": {
+      "构建与程序集": {
+        "files": 6,
+        "added": 87,
+        "deleted": 5,
+        "binary_files": 0
+      },
+      "实现代码与工具": {
+        "files": 53,
+        "added": 9913,
+        "deleted": 37,
+        "binary_files": 0
+      },
+      "配置与数据合同": {
+        "files": 3,
+        "added": 20,
+        "deleted": 2,
+        "binary_files": 0
+      },
+      "Unity 元数据": {
+        "files": 36,
+        "added": 333,
+        "deleted": 0,
+        "binary_files": 0
+      },
+      "测试与验收工具": {
+        "files": 1,
+        "added": 101,
+        "deleted": 0,
+        "binary_files": 0
+      }
+    },
+    "recent_commits": [
+      "0ac6735ce|2026-10-10T15:53:45+08:00|Merge origin/t3/development into feature/Pack-JNTracy",
+      "92f1ededb|2026-10-10T03:37:36Z|Merge 'mainline' into 't3/development'",
+      "d05387eee|2026-10-10T03:29:18Z|Merge 'bugfix/fix-vg-terrain-flicking&fuse' into 'mainline'",
+      "35e9bbde9|2026-10-10T03:19:59Z|Merge 'mainline' into 't3/development'",
+      "ebc4bff18|2026-10-10T03:18:46Z|Merge 'feature/haircompare' into 'mainline'",
+      "29d75dfd0|2026-10-10T03:16:26Z|Merge 'codex/fluidninja-quality-performance' into 'mainline'",
+      "9a245eb3d|2026-10-10T11:09:29+08:00|heterogeneous volume fog bugfix",
+      "8a0891cf9|2026-10-10T03:07:41Z|Merge 'cherry-pick-commit-4d78edd2' into 't3/development'",
+      "0f0c21c81|2026-10-10T03:06:19Z|Merge 'codex/fix-forward-vsm-bindings' into 'mainline'",
+      "4d78edd26|2026-10-10T03:06:19Z|Merge 'codex/fix-forward-vsm-bindings' into 'mainline'",
+      "cd00de773|2026-10-10T11:01:50+08:00|fix: preserve produced VSM bindings across cache swaps",
+      "3f133d026|2026-10-10T10:53:09+08:00|fix: rebind forward VSM resources in consuming passes"
+    ]
+  },
+  "files": [
+    {
+      "path": "com.jngame.assets-pipeline/Runtime/JNGame.AssetsPipeline.Runtime.asmdef",
+      "change": "M",
+      "added": 10,
+      "deleted": 3,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "b69d7bad2b76136a81e3eb5679abf25d6a9432ad3dbc32822e996d674d2e1438"
+    },
+    {
+      "path": "com.jngame.assets-pipeline/Runtime/ResourceSystem/ResourceSystem.LoadTaskQueue.cs",
+      "change": "M",
+      "added": 48,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "167c652ab26b8fcee1d404c05a9e9871e9d1c00e518ba3d6cd29c2bd30fe2f22"
+    },
+    {
+      "path": "com.jngame.assets-pipeline/Runtime/ResourceSystem/ResourceSystem.cs",
+      "change": "M",
+      "added": 7,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "1ff437809054c22931f618c549d8e09aa2e8568c78dcf9d7fb5064ea419a56df"
+    },
+    {
+      "path": "com.jngame.assets-pipeline/Runtime/ResourceSystem/Task/LoadAssetTask.cs",
+      "change": "M",
+      "added": 4,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "05834bbafbfb0ba3f56abe9bfb541dfa46ccd003d31c858cd1ffe2d1a9b7afe0"
+    },
+    {
+      "path": "com.jngame.assets-pipeline/package.json",
+      "change": "M",
+      "added": 3,
+      "deleted": 2,
+      "category": "配置与数据合同",
+      "exists_in_worktree": true,
+      "sha256": "21b63a03500ea2371f7327027c112ec621c65782b59cb2f2c837dab6bef79b46"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Editor/Diagnostics/JNTracyGpuValidation.cs",
+      "change": "A",
+      "added": 180,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "db595f743437d0bc0e2581c20b794850654e373b4264c7651ed3c58178af858f"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Editor/Diagnostics/JNTracyGpuValidation.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "e6493c9ee238f8347a82d0a4ba1616b0f59a30810d23eb8fc31eb26f805e362f"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/Component/HDWorld.cs",
+      "change": "M",
+      "added": 16,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "a51b87a216c1f628481dee60a0c7e61b35453626f0fcab75b6e0d713420676ce"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGBuilder.cs",
+      "change": "M",
+      "added": 34,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "51e5cd74f3d01ad8a39ca337256b45c9c261627382f35a365cec768622f251b9"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGPassBuilder.cs",
+      "change": "M",
+      "added": 17,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "dcb63a3677a75fc05070e4bca18175fee9e07903c5b25a6880210bcb172cec5d"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGResourceAliasing.cs",
+      "change": "M",
+      "added": 8,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "130270f39f548c18f75275b31e772369c5a2f382626db545e1c09aa30763406d"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGResourceComputeBuffer.cs",
+      "change": "M",
+      "added": 12,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "af6a53d4778021354ce531e0460a0e0f21fbce0abf7e1b28372abaec12531722"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGResourceFactory.cs",
+      "change": "M",
+      "added": 79,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "7ab18ce5f2dd4d4a6a10cf75840d291f2e3546404de4804cfddadc7da9d8d265"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGResourceTexture.cs",
+      "change": "M",
+      "added": 11,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "518c6f14705d11306d43a37d46f1ac8d7cbad402e4b3368a6c312234698367e1"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderGraph/RDGResources.cs",
+      "change": "M",
+      "added": 96,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "1177bef411212c713cd4ca1549a5640cfe43203464332ed8d80b21ee72f94b53"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPasses/FinalBlitPass.cs",
+      "change": "M",
+      "added": 43,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "bcb6b3e8f93f881a83bf03612d1a84053870095bf7678d278286296515906739"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPasses/ScreenProbePass.cs",
+      "change": "M",
+      "added": 5,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "2e1e48a3de14752d2818f748800b39ebc61f9f61d5b0d05d00266536a2c93638"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPasses/TSRPass.cs",
+      "change": "M",
+      "added": 11,
+      "deleted": 6,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "ea099d8b35da860a3277c5d1dd8b2debcceb572605fe37dffed8691c82d5ab1d"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPasses/UI/UIFinalBlitPass.cs",
+      "change": "M",
+      "added": 39,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "d24f415129f978cfbe66bd7a55b2224aed7ba07fe7b2b107a6e79da2eb51c040"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPipeline/JNRPGpuPassRegistry.cs",
+      "change": "M",
+      "added": 377,
+      "deleted": 11,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "1b2fdca32d9b8b27b093bfc0be0a9653a6c4b7841c807c081e3d02ea74cf496b"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/RenderPipeline/JNRenderPipeline.cs",
+      "change": "M",
+      "added": 31,
+      "deleted": 3,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "8e02817cb695265ddbfa79ca232ee141bef46ea5725404863529c5640257ee0a"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/JNVirtualGeometryTracyCatalog.cs",
+      "change": "A",
+      "added": 501,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "d0decfff016053819bd9c201d7a4a70b95b98c5d5918ba5e0c239731e658ecad"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/JNVirtualGeometryTracyCatalog.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "60a7329addff6b625924084ceba0268774c0d9f045fde72b211d3f316e126c2e"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGConsoleHWRasterPass.cs",
+      "change": "M",
+      "added": 5,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "725efa632a685697cfaf64b0a7a43abad0e34d2b8be88906cc7666460a31b078"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGCullingAfterVSMPass.cs",
+      "change": "M",
+      "added": 5,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "ea05ae863a2257d3d89b4edf6492bb713f8e649f1d200a85e3adb731ffb70c9c"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGCullingPass.cs",
+      "change": "M",
+      "added": 5,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "f80a6649d8084b5aab983b1e986552b81017dd435b892c47c51e12ab95e974a2"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGHizPass.cs",
+      "change": "M",
+      "added": 5,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "ed09ad5e8508dc7ea7d93b67dafb31fe4d61a1cf63d65bdc1ce5d95ca5d39822"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGStreamingBurstHelper.cs",
+      "change": "M",
+      "added": 2,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "40db00f239835428df70da4d5833532ea03f4dec95b56f28624bdc9f340d403f"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualGeometry/Render/VGStreamingManager.cs",
+      "change": "M",
+      "added": 17,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "d6736349e046db26901721717f4d0c996f495e132a772eba7237a89f02d38351"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualShadowMap/VSMBuildPageAllocationsPass.cs",
+      "change": "M",
+      "added": 11,
+      "deleted": 9,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "588aeafb04472fcff81fe0eb68fe1b83407e4479399efd45c71955f97f071565"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/BuiltIn/VirtualShadowMap/VirtualShadowMapCacheManager.cs",
+      "change": "M",
+      "added": 4,
+      "deleted": 2,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "8a3a28d0c1946950263b23d9f28a4a6e2a61236bf5c5710caaed4220e7c0737b"
+    },
+    {
+      "path": "com.jngame.render-pipelines/Runtime/JNGame.RenderPipelines.Runtime.asmdef",
+      "change": "M",
+      "added": 7,
+      "deleted": 1,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "6056c6db3b1c5b1e71f05c9dfb9986b69885999941fe3c01aed6adcb8b6231d3"
+    },
+    {
+      "path": "com.jngame.render-pipelines/package.json",
+      "change": "M",
+      "added": 1,
+      "deleted": 0,
+      "category": "配置与数据合同",
+      "exists_in_worktree": true,
+      "sha256": "ae1487a26c0f41bcf054ec4481e210a6c24d517c82199c8108057f68b69db6be"
+    },
+    {
+      "path": "com.jngame.tracy/Editor.meta",
+      "change": "A",
+      "added": 8,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "3cc0d80d338cefe87e2a89e5b7db0cc81caf3879313013689a3f99efe0698879"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/CodeGen.meta",
+      "change": "A",
+      "added": 8,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "91eb73e2bfd6f04a266dc219f916dfe3c59028b5159fd69297f238697048c9a4"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/CodeGen/JNGame.Tracy.CodeGen.asmdef",
+      "change": "A",
+      "added": 26,
+      "deleted": 0,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "a6369733f547d11b507d5fcb3fb8d140b15bb21042e37e1f0210537763443837"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/CodeGen/JNGame.Tracy.CodeGen.asmdef.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "fe6a6f467811a81d8e03e1c2401defd7b4f58c687983d4e81da578fc3b26b575"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/CodeGen/JNTraceSourceStackILPostProcessor.cs",
+      "change": "A",
+      "added": 265,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "6199ee9821cc2fa94997de851c6f8516dba7193534da02e17e29ab206e39384e"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/CodeGen/JNTraceSourceStackILPostProcessor.cs.meta",
+      "change": "A",
+      "added": 2,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "b010b2e0cd40a600b6540f23f0c0b4f906367ac271527c10b195424c2c2c0eeb"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNGame.Tracy.Editor.asmdef",
+      "change": "A",
+      "added": 18,
+      "deleted": 0,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "181d20369467714fa63baf4dbe7a22a12c85c580526e1e422ebc242768f97b1a"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNGame.Tracy.Editor.asmdef.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "25b2fe9aa01793fee49c21a912c2d51c95c38e2ef95af64b20b9bfe052bd0b78"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyManagedValidation.cs",
+      "change": "A",
+      "added": 359,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "c0d4225586182cc9906bb367194a0882dbbfd33a9b753fe57af57f2dbb2907d8"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyManagedValidation.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "96e541c0131997d7569c83e9f6804ef3a57bac8bb087ecf7fd1d611347943653"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyN11Validation.cs",
+      "change": "A",
+      "added": 243,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "962e83b552fad97f5a29c1cc8ad80b4f80840158d5c63327a72249037588d230"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyN11Validation.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "3184a50c7f972517b8488249efd64ec9a5dbe008d1b7f08f711575bebb01b097"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyN16SourceStackValidation.cs",
+      "change": "A",
+      "added": 119,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "90c44f24af8f71f63a86fac0f430b2c9adb48235bcc0b263d0bb8a62fe48647f"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyN16SourceStackValidation.cs.meta",
+      "change": "A",
+      "added": 2,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "1583056d6d0a71b75aae816e79d0cc5f180543bb36bc3c190917b01a03b102bb"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyT3AutoLogin.cs",
+      "change": "A",
+      "added": 1575,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "5b15901501b3fe72551371defd7dbc9c3cc30c3feb80559d45376f4389f9fc38"
+    },
+    {
+      "path": "com.jngame.tracy/Editor/JNTracyT3AutoLogin.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "5cc2fae041e6563518fefcf8885db2bd3b77594235114ecbceaeaa9bbb99cbdf"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime.meta",
+      "change": "A",
+      "added": 8,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "3d0bf0618057034f94f2a17d620cddd1d35927e16d660a285114b226eaea6dd6"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNGame.Tracy.asmdef",
+      "change": "A",
+      "added": 20,
+      "deleted": 0,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "34e717bd3bd164a1a1c6997232b40d6d165e9cdf3e32b6e8b105f8fa359c3eea"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNGame.Tracy.asmdef.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "caeec2a09298bb43290a6c5aa433368906e2122c783e5e5d480953d6ad23d253"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceFrameImage.cs",
+      "change": "A",
+      "added": 965,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "eae714016f263a7959d1d92bf451cbb66eccd231cedee3f4bd5ee4488ee4e9ba"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceFrameImage.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "39a4189cf7d108c6e18351c7a567d0be6176e317ed27f9a04e2ca18dd49e29f2"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGc.cs",
+      "change": "A",
+      "added": 205,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "a1628aee626051a14ed38047710478e1ffccef14835ebf7da5f2428a19589e34"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGc.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "99ab66c818bb0f8f0cc23929e98f5f57738d52b08260bf91f4bbd36c597e0ffd"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuCatalog.cs",
+      "change": "A",
+      "added": 351,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "257b5452821ce4dc33b325402ee5fdd7f922e949c567bef73b2b04965aaf029b"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuCatalog.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "73df8aaf3f48f0d03395913875330f8e72987a423fba3aa0f14edd5bc71b8ba6"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuPassMarker.cs",
+      "change": "A",
+      "added": 169,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "7663da96df8b42ba11939dc7792dbdf5ea365b5a97a4474f2a4e453c616b5c3d"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuPassMarker.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "cc2420445dddcfb1f3dc7e49a9e946cb47363709f0c14278931e53c4a9eeaa2b"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuTaxonomy.cs",
+      "change": "A",
+      "added": 42,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "ec2fde1f5b4f3dc9f6487267ffa9899b904abdc4067e4343d2e51d4829d3e306"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceGpuTaxonomy.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "0fffc7841b9df21df47ea023315e9f26b7735b553eac61a70fa14025450c6cd7"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceIO.cs",
+      "change": "A",
+      "added": 132,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "253d27b18226db8ea17c95e712058edafa8a878687f2047f0bc308f6567099dd"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceIO.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "edbe1a7492cf29e3c5c0d8017900437b88751130cc0de036ff5ad6cff9ef7c26"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceLock.cs",
+      "change": "A",
+      "added": 80,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "3399b644ace876dd8ff8b703228784594fedd87de4220d1ef92d233ed19a4ac7"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceLock.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "ae3daee5049558f50f1fddf0455d3e7da939dfbff700ba2e1cf58b8ccf68ff43"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceLua.cs",
+      "change": "A",
+      "added": 125,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "04076fdaad542cf45cd6cd31f8f90dd126d122dc968291108bec01140058b6b4"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceLua.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "f1eba7b844735000c713f66cc145faaeb63331d780cc241c851d06909bbabbf4"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceMarker.cs",
+      "change": "A",
+      "added": 289,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "36c248dbebb656d9315557a084583f7970d1383368cfa36d55e2aeb28fb84135"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceMarker.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "42d4d3f4bfffd787d61e3d65a15a38eff3768dcd7cfbda8c8ccb418941d32950"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceMemory.cs",
+      "change": "A",
+      "added": 48,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "4b90f8264680f3a549259c13350693a9db63441ac138350c2cebf5a5f630f42f"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceMemory.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "f8fddf892f3ba489db9a3c45dd80292c73a540fc3cc1517957a31428b890b9bb"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracePlot.cs",
+      "change": "A",
+      "added": 18,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "b8334b944d217dc31c051ffadc0bff29638cd72bfbd1cbebac8dd19c9cb83845"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracePlot.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "232d0fd34a3b5667845be87c236c270746c6e05384cb2287956f175026c51dd4"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceScope.cs",
+      "change": "A",
+      "added": 34,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "57f9a915eb6f3c570460918440bf5cc05a2d20dc8dbf764112005e5be4e9c9b1"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceScope.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "ccf55eb8aab0a5e8d72ad4ad3adac9e09c3ae6897174da3cba3963c653e537f1"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceScriptStack.cs",
+      "change": "A",
+      "added": 247,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "bb1681b42344f59dd6c4cb8ec9dcc055df0dab50eae7663dc0ce124434bf3a21"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceScriptStack.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "4a80fb35e9bfa38954a532e84df9209051cd840678a0c8c50673e64791b739ea"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceSourceStack.cs",
+      "change": "A",
+      "added": 189,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "a6033a1ca295b367b4a0045d83a5c4e8bfd98a2c6fc1f68ba0440cb692e241e0"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceSourceStack.cs.meta",
+      "change": "A",
+      "added": 2,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "8a849526ff746f486d2619d3a7c783d2723f3295b9b1f1e344957c2fc4076743"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceUtf8.cs",
+      "change": "A",
+      "added": 20,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "174c764ca7dd1176d8e2615a89e65d8b53c8bc40711eb0d1c59d3c3b748322a3"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceUtf8.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "f53a785c172f14ac3987f809ccc7cb9f127971b598e46bb1279d3a626c84092f"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceUtility.cs",
+      "change": "A",
+      "added": 119,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "b7df5f649e6c8f39e392bd9a37a257f74d54a7d661a23972670572c7b276e07a"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTraceUtility.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "45391636692e224ab309b02e57823675fda362ea97f3b911daea77e4e59424fb"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyNative.cs",
+      "change": "A",
+      "added": 579,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "983b8ed5f84bf593fe2b919895baef5186a13d9384d68a4a4fc3e1cb81a044a4"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyNative.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "ed26779b804c38c37a3942ef8c8a41562f306288d803bbd19516c14a5c982bcd"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyRuntime.cs",
+      "change": "A",
+      "added": 877,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "3dc6eb10856996aca706b5254c2d3ee8a5f0d5249849363e8c120b6c6e57531f"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyRuntime.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "dfdce8ae377f79769e96ce5af7c99906c273641005bc2afbeecd971a88c0164f"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyT3PlayerAutoLogin.cs",
+      "change": "A",
+      "added": 851,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "e9dc52001f7a33dd8f97e75fc7494c2b82aeee255f431bccb5615510490fcbc8"
+    },
+    {
+      "path": "com.jngame.tracy/Runtime/JNTracyT3PlayerAutoLogin.cs.meta",
+      "change": "A",
+      "added": 11,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "258d5016eee79229a733a6548bbd48b21410f2a2dc427ff3c2f72827e71b9a19"
+    },
+    {
+      "path": "com.jngame.tracy/Tools.meta",
+      "change": "A",
+      "added": 8,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "4be868ef7e79457908d1e8b586157ecb1942832efe81bbc73a4faf1d993663cd"
+    },
+    {
+      "path": "com.jngame.tracy/Tools/Invoke-JNTracyPlayerAutoCapture.ps1",
+      "change": "A",
+      "added": 386,
+      "deleted": 0,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "3f7712e8b3e99ec9664dc1fb61b31a7ec8603ae2015cec249ebe74d9d589beb3"
+    },
+    {
+      "path": "com.jngame.tracy/Tools/Invoke-JNTracyPlayerAutoCapture.ps1.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "59cbcc1d249bb319e9b0303fbc91489d8a3ef0bafeb3c6b8d3d51d55220ad6ff"
+    },
+    {
+      "path": "com.jngame.tracy/Tools/Test-JNTracyPlayerAutomation.ps1",
+      "change": "A",
+      "added": 101,
+      "deleted": 0,
+      "category": "测试与验收工具",
+      "exists_in_worktree": true,
+      "sha256": "96fd51e71b647924567aaed7d905371cf19a12b2818973238c300b8fd4656a14"
+    },
+    {
+      "path": "com.jngame.tracy/Tools/Test-JNTracyPlayerAutomation.ps1.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "053f2d27feb63169d2fe9e14641cd592803b250da2212c28857b0d9d9c191fed"
+    },
+    {
+      "path": "com.jngame.tracy/package.json",
+      "change": "A",
+      "added": 16,
+      "deleted": 0,
+      "category": "配置与数据合同",
+      "exists_in_worktree": true,
+      "sha256": "828f09820b90fd26911786cf38ab8369d5970a66fd32d6dff0a67bb4d08d25a3"
+    },
+    {
+      "path": "com.jngame.tracy/package.json.meta",
+      "change": "A",
+      "added": 7,
+      "deleted": 0,
+      "category": "Unity 元数据",
+      "exists_in_worktree": true,
+      "sha256": "5de5b8029f6a9f69af0abf50fd6cfa4f03b36742f6243697e323dd071182cd17"
+    },
+    {
+      "path": "com.unity.render-pipelines.core/Runtime/RenderPipeline/ProfilingScope.cs",
+      "change": "M",
+      "added": 53,
+      "deleted": 1,
+      "category": "实现代码与工具",
+      "exists_in_worktree": true,
+      "sha256": "ab2c319fcf64744b8d2e25e7c8eae9ef938d072bcb151b371a0d207de3731833"
+    },
+    {
+      "path": "com.unity.render-pipelines.core/Runtime/Unity.RenderPipelines.Core.Runtime.asmdef",
+      "change": "M",
+      "added": 6,
+      "deleted": 1,
+      "category": "构建与程序集",
+      "exists_in_worktree": true,
+      "sha256": "75e73c7a6a24c0f833819b8f331a80b603af6360b908c486e7739e80382fd66e"
+    }
+  ]
+}

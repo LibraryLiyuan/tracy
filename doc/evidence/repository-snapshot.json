@@ -1,0 +1,249 @@
+{
+  "date": "2026-10-14",
+  "observed_at_utc": "2026-10-14T11:40:27.412436+08:00",
+  "scope": "Local refs only; no fetch. Feature deltas compare merge-base to the requested branch HEAD; uncommitted doc deletions are separately recorded, not counted as implementation delta.",
+  "repositories": [
+    {
+      "name": "tracy",
+      "root": "C:/CodeProjects/GodotProjects/tracy-0.13.1",
+      "branch": "mainline",
+      "base": "v0.13.1",
+      "head": "f49190f2541c8da739d6c74fd2fe34eeff222e5e",
+      "base_head": "05cceee0df3b8d7c6fa87e9638af311dbabc63cb",
+      "merge_base": "05cceee0df3b8d7c6fa87e9638af311dbabc63cb",
+      "comparison": "05cceee0df3b8d7c6fa87e9638af311dbabc63cb..f49190f2541c8da739d6c74fd2fe34eeff222e5e",
+      "left_right": "0\t352",
+      "status_porcelain": [
+        " D doc/Converter-Memory-Attribution-20260915.zh-CN.md",
+        " D doc/JN-Catalog-Storage-Progress.md",
+        " D doc/JN-Extended-Trace-v1.md",
+        " D doc/JN-Finalize-Optimization.md",
+        " D doc/JN-Offline-CPU-Zone-Storage.md",
+        " D doc/JN-Offline-Callstack-Storage.md",
+        " D doc/JN-Offline-GPU-Zone-Storage.md",
+        " D doc/JN-Offline-Pass-Storage.md",
+        " D doc/JN-Offline-Sample-Storage.md",
+        " D doc/JN-Offline-String-Storage.md",
+        " D doc/JN-Replay-Write-Optimization.md",
+        " D doc/JN-Streaming-Dictionary-Validation.md",
+        " D doc/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+        " D doc/JN-Tracy-N27-Profiler-GUI-Binary-Manifest.json",
+        " D doc/JN-Tracy-N27-Profiler-GUI-Implementation-Plan.zh-CN.md",
+        " D doc/JN-Tracy-N27-Profiler-GUI-Test-Corpus.md",
+        " D doc/JN-Tracy-Query-Analysis-Cache-Acceptance.zh-CN.md",
+        " D doc/JN-Tracy-Query-Analysis-Cache-Implementation-Plan.zh-CN.md",
+        " D doc/JN-Tracy-QueryScan-DevBase-Extraction-20260907.zh-CN.md",
+        " D doc/JN-Tracy-Skill-Cache-Integration-20260909.zh-CN.md",
+        " D doc/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+        " D doc/JN-Tracy-Stream-Convert-Offline-Optimization-Plan.zh-CN.md",
+        " D doc/JN-Tracy-Stream-Convert-Offline-Optimization-Release-Manifest.json",
+        " D doc/JNTracy-AI-Deployment-and-Test.zh-CN.md",
+        " D doc/Query-GpuCatalog-DiskIndex-Progress.zh-CN.md",
+        " D doc/Query-LongData-Holder-Audit.zh-CN.md",
+        " D doc/Query-LongData-R19-Audit-20260929.json",
+        " D doc/Query-LongData-Task-Closure-20260929.zh-CN.md",
+        " D doc/profiler.png",
+        " D doc/profiler2.png",
+        " D doc/profiler3.png"
+      ],
+      "total_files": 915,
+      "added": 527042,
+      "deleted": 2219,
+      "categories": {
+        "配置与数据合同": {
+          "files": 52,
+          "added": 10200,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "其他": {
+          "files": 10,
+          "added": 340,
+          "deleted": 0,
+          "binary_files": 2
+        },
+        "构建与程序集": {
+          "files": 17,
+          "added": 1317,
+          "deleted": 10,
+          "binary_files": 0
+        },
+        "实现代码与工具": {
+          "files": 357,
+          "added": 148916,
+          "deleted": 2209,
+          "binary_files": 0
+        },
+        "文档与图片": {
+          "files": 121,
+          "added": 18778,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "测试与验收工具": {
+          "files": 320,
+          "added": 59305,
+          "deleted": 0,
+          "binary_files": 21
+        },
+        "第三方与嵌入来源": {
+          "files": 38,
+          "added": 288186,
+          "deleted": 0,
+          "binary_files": 0
+        }
+      },
+      "recent_commits": [
+        "f49190f25|2026-10-14T10:56:57+08:00|修改5g内存限制至16g",
+        "bb7c5d343|2026-10-13T14:42:53+08:00|补提交query代码、支持图片显示",
+        "6af2fb726|2026-10-12T15:11:22+08:00|新版skill",
+        "6cf440e8c|2026-10-12T15:10:54+08:00|修复tracy 造成game 闪退问题",
+        "c015f497c|2026-10-10T21:01:13+08:00|修复索引崩溃问题",
+        "5fa241e3d|2026-10-09T17:08:13+08:00|feat(profiler): merge FPS into the long-capture frame graph",
+        "3947331da|2026-10-09T17:58:36+08:00|merge: integrate VRAM categories and streaming capture with dev",
+        "45769aed9|2026-10-09T15:07:17+08:00|feat: GPU memory, usage and FPS lanes; frame-level GPU resources",
+        "816d36c89|2026-10-05T17:40:34+08:00|feat: long-capture streaming for 30-minute JN Unity captures",
+        "08b2bef60|2026-10-03T00:57:22+08:00|fix(capture): restore offline validation sources and expand disk budget",
+        "e27f8698e|2026-09-29T21:01:58+08:00|merge: integrate Query long-data delivery into dev",
+        "8e27d69df|2026-09-29T20:21:49+08:00|profiler: persist custom thread layout"
+      ]
+    },
+    {
+      "name": "jnunity",
+      "root": "C:/workflow/jnunity",
+      "branch": "feature/JNTracyUnity",
+      "base": "origin/T3/unity-2022.3.67f1",
+      "head": "c2877d4b053c3e084b0316fc08bc6a1209e2baa8",
+      "base_head": "b90327ab0480bc40180a001a5803ffe7caaa5eed",
+      "merge_base": "81d9904a2504dd2a17691b4c0cf3741e33509f37",
+      "comparison": "81d9904a2504dd2a17691b4c0cf3741e33509f37..c2877d4b053c3e084b0316fc08bc6a1209e2baa8",
+      "left_right": "3\t9",
+      "status_porcelain": [
+        "?? .claude/settings.local.json"
+      ],
+      "total_files": 254,
+      "added": 94310,
+      "deleted": 99,
+      "categories": {
+        "构建与程序集": {
+          "files": 5,
+          "added": 151,
+          "deleted": 1,
+          "binary_files": 0
+        },
+        "其他": {
+          "files": 1,
+          "added": 1,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "实现代码与工具": {
+          "files": 70,
+          "added": 24887,
+          "deleted": 98,
+          "binary_files": 0
+        },
+        "第三方与嵌入来源": {
+          "files": 84,
+          "added": 53201,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "配置与数据合同": {
+          "files": 10,
+          "added": 956,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "文档与图片": {
+          "files": 2,
+          "added": 62,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "测试与验收工具": {
+          "files": 82,
+          "added": 15052,
+          "deleted": 0,
+          "binary_files": 0
+        }
+      },
+      "recent_commits": [
+        "c2877d4b05|2026-10-12T15:23:32+08:00|Merge branch 'feature/JNTracyUnity' of code.byted.org:jng/jnunity into feature/JNTracyUnity",
+        "10229fb123|2026-10-12T15:14:52+08:00|修复tracy 崩溃",
+        "c0cde1b640|2026-10-12T11:34:07+08:00|Merge branch 'feature/JNTracyUnity' of code.byted.org:jng/jnunity into feature/JNTracyUnity",
+        "08ecc97db5|2026-10-10T21:03:27+08:00|修复索引创建崩溃",
+        "1292a1889d|2026-10-01T22:21:17+08:00|Add JNTracy VRAM categories, system usage plots and lower recording overhead",
+        "a4ae03d26f|2026-09-30T17:48:05+08:00|Integrate JNTracy profiling and GPU resource catalog into T3",
+        "641c7a7d29|2026-10-10T21:03:27+08:00|修复索引创建崩溃",
+        "214a769e64|2026-10-01T22:21:17+08:00|Add JNTracy VRAM categories, system usage plots and lower recording overhead",
+        "81d9904a25|2026-10-08T18:52:45+08:00|fix: support attributed animation culling sources",
+        "2caec56880|2026-09-30T17:48:05+08:00|Integrate JNTracy profiling and GPU resource catalog into T3",
+        "4962b627d6|2026-09-29T11:56:59+08:00|fix: preserve asset layer during async instantiation",
+        "1c7f43ba54|2026-09-24T09:33:06Z|#827007 Remove obsolete VFX compute prewarm path"
+      ]
+    },
+    {
+      "name": "PackageRepo",
+      "root": "C:/workflow/PackageRepo",
+      "branch": "feature/Pack-JNTracy",
+      "base": "origin/t3/development",
+      "head": "0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+      "base_head": "7c158b18995a397e587855d8968b726426fdf1be",
+      "merge_base": "92f1ededb40cfada15df61411a5ad0a7d2ce12eb",
+      "comparison": "92f1ededb40cfada15df61411a5ad0a7d2ce12eb..0ac6735ce3ca84f7ffbe2dd0cfcfa8acbfa2ed91",
+      "left_right": "102\t2",
+      "status_porcelain": [],
+      "total_files": 99,
+      "added": 10454,
+      "deleted": 44,
+      "categories": {
+        "构建与程序集": {
+          "files": 6,
+          "added": 87,
+          "deleted": 5,
+          "binary_files": 0
+        },
+        "实现代码与工具": {
+          "files": 53,
+          "added": 9913,
+          "deleted": 37,
+          "binary_files": 0
+        },
+        "配置与数据合同": {
+          "files": 3,
+          "added": 20,
+          "deleted": 2,
+          "binary_files": 0
+        },
+        "Unity 元数据": {
+          "files": 36,
+          "added": 333,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "测试与验收工具": {
+          "files": 1,
+          "added": 101,
+          "deleted": 0,
+          "binary_files": 0
+        }
+      },
+      "recent_commits": [
+        "0ac6735ce|2026-10-10T15:53:45+08:00|Merge origin/t3/development into feature/Pack-JNTracy",
+        "92f1ededb|2026-10-10T03:37:36Z|Merge 'mainline' into 't3/development'",
+        "d05387eee|2026-10-10T03:29:18Z|Merge 'bugfix/fix-vg-terrain-flicking&fuse' into 'mainline'",
+        "35e9bbde9|2026-10-10T03:19:59Z|Merge 'mainline' into 't3/development'",
+        "ebc4bff18|2026-10-10T03:18:46Z|Merge 'feature/haircompare' into 'mainline'",
+        "29d75dfd0|2026-10-10T03:16:26Z|Merge 'codex/fluidninja-quality-performance' into 'mainline'",
+        "9a245eb3d|2026-10-10T11:09:29+08:00|heterogeneous volume fog bugfix",
+        "8a0891cf9|2026-10-10T03:07:41Z|Merge 'cherry-pick-commit-4d78edd2' into 't3/development'",
+        "0f0c21c81|2026-10-10T03:06:19Z|Merge 'codex/fix-forward-vsm-bindings' into 'mainline'",
+        "4d78edd26|2026-10-10T03:06:19Z|Merge 'codex/fix-forward-vsm-bindings' into 'mainline'",
+        "cd00de773|2026-10-10T11:01:50+08:00|fix: preserve produced VSM bindings across cache swaps",
+        "3f133d026|2026-10-10T10:53:09+08:00|fix: rebind forward VSM resources in consuming passes"
+      ]
+    }
+  ],
+  "capture_note": "Corrected the first porcelain line leading space trimmed by the collector; original initial read and normalized before/after deleted path sets confirm 31 unchanged deletions."
+}

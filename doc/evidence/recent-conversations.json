@@ -1,0 +1,100 @@
+{
+  "date": "2026-10-14",
+  "scope": "Selected recent turns, excluding hidden reasoning and raw command outputs; complements historical 113-thread inventory.",
+  "threads": [
+    {
+      "id": "01a12f00-ba3a-7153-8951-1061612a24ac",
+      "title": "Compare Tracy skill updates",
+      "focus": "新 Skill 完整重跑、31,373 帧覆盖、执行时间与分享包",
+      "created_at": 1791789939,
+      "updated_at": 1791892161,
+      "read_turns": [
+        "01a1350e-0544-7d81-aeb2-1a3343bc60b8",
+        "01a134bd-967d-7803-a198-7db7cc208a45",
+        "01a1342f-22ca-7641-992a-f2432760d8ae",
+        "01a1342a-68e1-71c3-9140-c88849187602"
+      ],
+      "older_turns_available": true
+    },
+    {
+      "id": "01a13337-2877-72b0-a6bc-fe925757fb5b",
+      "title": "Compare Tracy skill updates (2)",
+      "focus": "Query 替代路线的耗时、内存、失败恢复与优化方向",
+      "created_at": 1791863900,
+      "updated_at": 1791947185,
+      "read_turns": [
+        "01a13369-4c5a-7180-9e76-403deb5cdd5d",
+        "01a1334e-43ad-7b10-87fe-73c9e4949b7e",
+        "01a13338-b7c6-7ee1-8b51-4f129084ffb2",
+        "01a13337-5a0f-7a12-ba71-0ddb7d1dd772"
+      ],
+      "older_turns_available": true
+    },
+    {
+      "id": "01a1350e-f0c0-7430-90d5-c626d213c5c5",
+      "title": "Compare Tracy skill updates (4)",
+      "focus": "两份同源报告的口径、共同路径和正文遗漏",
+      "created_at": 1791891534,
+      "updated_at": 1791947280,
+      "read_turns": [
+        "01a1385f-fd35-7972-bff8-b7b0621dec24",
+        "01a1350f-7997-78f0-86ed-004966664de5",
+        "01a134bd-967d-7803-a198-7db7cc208a45",
+        "01a1342f-22ca-7641-992a-f2432760d8ae"
+      ],
+      "older_turns_available": true
+    },
+    {
+      "id": "01a1350f-e092-78c2-b1fe-c971fd92dd74",
+      "title": "Compare Tracy skill updates (5)",
+      "focus": "正常阶段内存和 Catalog 异常分支",
+      "created_at": 1791891595,
+      "updated_at": 1791947180,
+      "read_turns": [
+        "01a13510-410e-72a3-80b8-04494dd5663d",
+        "01a134bd-967d-7803-a198-7db7cc208a45",
+        "01a1342f-22ca-7641-992a-f2432760d8ae",
+        "01a1342a-68e1-71c3-9140-c88849187602"
+      ],
+      "older_turns_available": true
+    },
+    {
+      "id": "01a13369-6f4c-78c3-ad88-358d884fb7f2",
+      "title": "Compare Tracy skill updates (3)",
+      "focus": "Query 修复分支与 analyze 替代路线边界",
+      "created_at": 1791873520,
+      "updated_at": 1791891461,
+      "read_turns": [
+        "01a133fc-1668-7563-b578-6022f3fa3ca6",
+        "01a1338f-ec6a-71c0-b7c5-899b07aa2037",
+        "01a1336a-209f-7413-b31e-48b3e65165df",
+        "01a13361-6a64-7382-b4eb-ca3a158542a2"
+      ],
+      "older_turns_available": true
+    },
+    {
+      "id": "01a124dd-aaab-7080-8d03-addf41942eb6",
+      "title": "试验技能并生成替换包",
+      "focus": "2453 独立 Player、Client DLL/PDB 补丁和短录制验证",
+      "created_at": 1791776332,
+      "updated_at": 1791779572,
+      "read_turns": [
+        "01a12e42-581d-7dc3-bafe-cb6ba1829cec",
+        "01a12e31-1b36-71a1-b77e-297f0565d9bc",
+        "01a124dd-e65c-7ce3-bdf7-f7af4925af46"
+      ],
+      "older_turns_available": false
+    },
+    {
+      "id": "01a13873-b27e-7151-9e05-69e209ad6d7b",
+      "title": "说明 Tracy 文档用途",
+      "focus": "原 doc 目录用途与历史验收边界",
+      "created_at": 1791948468,
+      "updated_at": 1791948562,
+      "read_turns": [
+        "01a13873-b705-73d0-af6c-dbfe3f3655af"
+      ],
+      "older_turns_available": false
+    }
+  ]
+}

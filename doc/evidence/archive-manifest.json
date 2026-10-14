@@ -1,0 +1,1248 @@
+{
+  "files": [
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/01-system/architecture.md",
+      "destination": "history/2026-09-document-center/01-system/architecture.md",
+      "original_sha256": "53c824523c2f0006a6118030c6cbbc0eb53f8685bdf098dc3eeca191a35a66cc",
+      "archived_sha256": "d56fcc520594f48be0dd6e672a4036e77e2bb9316ac2f6feb088750c54b7dfa8",
+      "original_bytes": 4375,
+      "archived_bytes": 4668,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/01-system/capabilities.md",
+      "destination": "history/2026-09-document-center/01-system/capabilities.md",
+      "original_sha256": "fae236b2c08d0c52e742c47fd56c7112c9b385ef5c953c652d24fabb8b85958f",
+      "archived_sha256": "1ddb9ec79c30c395ca9da639cd567ff66786438ce3a31aa633d19a8d91faff4a",
+      "original_bytes": 3807,
+      "archived_bytes": 4100,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/01-system/contracts.md",
+      "destination": "history/2026-09-document-center/01-system/contracts.md",
+      "original_sha256": "b84ec0ea879c6607305d014add41b6eddbaeb68cf4823bd19bfba2233c0651fe",
+      "archived_sha256": "6d642a32ea59d6d5d5dcaedb83fd6e20e7967252d3fdf76b4a78a15c8ad3e871",
+      "original_bytes": 4202,
+      "archived_bytes": 4495,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/01-capture.md",
+      "destination": "history/2026-09-document-center/02-chains/01-capture.md",
+      "original_sha256": "56c3fdd47067ef2b74c9a5d8a5ed66fb7ccd2efdb6e7cd4b68033a12540d6c1c",
+      "archived_sha256": "f3e20efb9aa633ca3e8e766fdd7a7e86ed8d22e573bf92680c2bf736fd37d11e",
+      "original_bytes": 3123,
+      "archived_bytes": 3509,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/02-storage-query.md",
+      "destination": "history/2026-09-document-center/02-chains/02-storage-query.md",
+      "original_sha256": "795c7a8960159085a56d4e632d773400c64e7ddcf94031fc76b3f64b8e3f3f88",
+      "archived_sha256": "f72aa4b8639fd6508d3a26098692f8e1c016a7508d3f4b41d2d25b1312f02165",
+      "original_bytes": 3266,
+      "archived_bytes": 3559,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/03-cpu-job.md",
+      "destination": "history/2026-09-document-center/02-chains/03-cpu-job.md",
+      "original_sha256": "03f9e92361eefc44ee39046d7afca6725bb26c12a9907facd49c6829b34b7206",
+      "archived_sha256": "2fc313aae66f68a4bccac4e2429243919bf9b919ebf4ad3f9d31fb56519b8307",
+      "original_bytes": 3259,
+      "archived_bytes": 3552,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/04-gpu-frame-dxr.md",
+      "destination": "history/2026-09-document-center/02-chains/04-gpu-frame-dxr.md",
+      "original_sha256": "5ee83cf20ba32b9500e17f90cf3d59f3d1b06b51cafcc0b7a5afc32f633687e6",
+      "archived_sha256": "7e7a89d372bde8b0614843e0a3c85e14a8e1c4dde0001ea8470c3625e7434189",
+      "original_bytes": 3091,
+      "archived_bytes": 3384,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/05-resource-memory.md",
+      "destination": "history/2026-09-document-center/02-chains/05-resource-memory.md",
+      "original_sha256": "7761dbe42886f67e0ad13da2f932d4ef033431fc0f3b2564db6215e1f56389a6",
+      "archived_sha256": "d01b9f3db98ffdc8e726c55584904297d929e3b5c490eedabbe29e7c02f12c37",
+      "original_bytes": 3018,
+      "archived_bytes": 3311,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/06-ai-analysis.md",
+      "destination": "history/2026-09-document-center/02-chains/06-ai-analysis.md",
+      "original_sha256": "91e6faea1212ea74314731effec2e3a831fda7e8d2b4469644738b446da29f8e",
+      "archived_sha256": "87b17f12c36eb881e802a06d78f671031fd5d9836cd978f7f6fe62fb2befb8b4",
+      "original_bytes": 3528,
+      "archived_bytes": 3821,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/07-build-delivery.md",
+      "destination": "history/2026-09-document-center/02-chains/07-build-delivery.md",
+      "original_sha256": "ecc7de0283ebe669f3a9b9b24bc247cd2d6232c46fb227c0b058ddb18eedf78d",
+      "archived_sha256": "37d1478b655ebcd79085bb0fb1ddc4dcaae2abfd4a49586cf748216445b2081d",
+      "original_bytes": 2366,
+      "archived_bytes": 2659,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/02-chains/README.md",
+      "destination": "history/2026-09-document-center/02-chains/README.md",
+      "original_sha256": "6e96214bd7f0a3b1740e0eca02d2690f5f982d0b3dfc3ac9b827ee31458e65fd",
+      "archived_sha256": "df7f9ff92e5954370207787a65900471acb37ff78cb0938c4c5b443c3e1222e5",
+      "original_bytes": 1386,
+      "archived_bytes": 1679,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/capture-foundation.md",
+      "destination": "history/2026-09-document-center/03-iterations/capture-foundation.md",
+      "original_sha256": "bc8d580d9184b3a69981bd7eed966f861cdc1f014c43fcac1968bfe669015754",
+      "archived_sha256": "57d406f2be73b1a137eb01a35e7c40d0e595a7392cea2a1e300cc9ed9d1e5c63",
+      "original_bytes": 3496,
+      "archived_bytes": 3821,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/gpu-evolution.md",
+      "destination": "history/2026-09-document-center/03-iterations/gpu-evolution.md",
+      "original_sha256": "08691acb39033ba09ccc5d1286c0ca8a76389bbed85fe49e564e99131c5bcbf4",
+      "archived_sha256": "4c14a5cf43273c678430fdcbf9e470b611c8f5b74de71fe5c3ba19b54e3df265",
+      "original_bytes": 2064,
+      "archived_bytes": 2357,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/queryscan-evolution.md",
+      "destination": "history/2026-09-document-center/03-iterations/queryscan-evolution.md",
+      "original_sha256": "2810e1f730747a01141dfbe7998c138fa9981940a9027af19d6decc365d4ab40",
+      "archived_sha256": "a58cb6b71bdc6afa84c45e049bf423310a32094b438771feb40558dd243b9037",
+      "original_bytes": 4289,
+      "archived_bytes": 4613,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/README.md",
+      "destination": "history/2026-09-document-center/03-iterations/README.md",
+      "original_sha256": "fa4d8f4d594edaec55666201d3133e824de9d89a52a5ecb521e3d4cdca3b7436",
+      "archived_sha256": "9e836d4ee4a138aad66b311d251df446c01e3cdcbd7c44ae80a7ace56ad29ea7",
+      "original_bytes": 2907,
+      "archived_bytes": 3200,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/resource-evolution.md",
+      "destination": "history/2026-09-document-center/03-iterations/resource-evolution.md",
+      "original_sha256": "4fb3bfacc9a5443843fe5462f269fe0e5b247a9fe59fab1db531641028905fb3",
+      "archived_sha256": "2b9861774461c3e571b0eee98fd5260eee2289f62a66f722e2df9e2a42b7b687",
+      "original_bytes": 3170,
+      "archived_bytes": 3463,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/03-iterations/storage-evolution.md",
+      "destination": "history/2026-09-document-center/03-iterations/storage-evolution.md",
+      "original_sha256": "f54f28687891957c27b4880668a6260825837d6bfd34f0a56f23427e260d876f",
+      "archived_sha256": "e3333636391ea281a043239cea8fabc574f85f8ace21e80cadb5888766d109f9",
+      "original_bytes": 2915,
+      "archived_bytes": 3208,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/04-branches/jnunity.md",
+      "destination": "history/2026-09-document-center/04-branches/jnunity.md",
+      "original_sha256": "1b16cc38deba1668690eb6512112b5bc69ad950da09988efdb427d82134ca87a",
+      "archived_sha256": "485c32b94e9ba5289c2e88ead7e9aba9aaad053a545cb31ded2ee7b1588c0632",
+      "original_bytes": 10616,
+      "archived_bytes": 10909,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/04-branches/PackageRepo.md",
+      "destination": "history/2026-09-document-center/04-branches/PackageRepo.md",
+      "original_sha256": "6fcf6b474358aa5583f2afc33d235cdf6558eac6dbbb0e4ffaca749de10a176b",
+      "archived_sha256": "dbf096f03c2dbbb15b09b4d2b4d44159f9b2216273456ae20e9a5b0926ecd8d4",
+      "original_bytes": 8321,
+      "archived_bytes": 8614,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/04-branches/README.md",
+      "destination": "history/2026-09-document-center/04-branches/README.md",
+      "original_sha256": "83c0850d09c9a1f017d91b3abbcce0c0075f55d67e45e1c36cdc3ad0ff938538",
+      "archived_sha256": "a789af17b2e25fd84873c62e2a744e93320c7b07153f28678dd33003adca509f",
+      "original_bytes": 3535,
+      "archived_bytes": 3828,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/04-branches/tracy.md",
+      "destination": "history/2026-09-document-center/04-branches/tracy.md",
+      "original_sha256": "ea1211e2ae1b4db8cf2005744d961f0e0052559dd7122aee3e36ce42799ea695",
+      "archived_sha256": "9fa009eee4b44c173e20b1b2e14d4926d6c3e1b22f5a26c631417f7044d5f404",
+      "original_bytes": 15396,
+      "archived_bytes": 15689,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/05-operations/config-compatibility.md",
+      "destination": "history/2026-09-document-center/05-operations/config-compatibility.md",
+      "original_sha256": "ae5eee70b86ae614b3f5d5ba4ac1286c2a8a93ed695d1033ac627b7c23ddb7b3",
+      "archived_sha256": "f68a6c43c434e8a54aaac40502354d440f47bec820c6551a6cb6d8e604ed1d8c",
+      "original_bytes": 3024,
+      "archived_bytes": 3317,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/05-operations/runbook.md",
+      "destination": "history/2026-09-document-center/05-operations/runbook.md",
+      "original_sha256": "bc2a5b2cfde7bd7c1c1e6dd5a0c1f37ac674f7b7cd8cac0ac103cd13ff8670e9",
+      "archived_sha256": "b2c04bb7cae8c26f0072e8de6bf61e6062cbecd8b3d828e1b8dfa1cebe390869",
+      "original_bytes": 5196,
+      "archived_bytes": 5489,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/05-operations/tool-catalog.md",
+      "destination": "history/2026-09-document-center/05-operations/tool-catalog.md",
+      "original_sha256": "d9c9c981b5cb24c7b2d0f52473af869363a94a3ac2e9f29bc299d827442a5a17",
+      "archived_sha256": "d38536b2aeebb8142a9c209dac2b3629d5d268f8df1f17d780e96a584655de3c",
+      "original_bytes": 5080,
+      "archived_bytes": 5431,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/05-operations/troubleshooting.md",
+      "destination": "history/2026-09-document-center/05-operations/troubleshooting.md",
+      "original_sha256": "bb1c3d8a4715c7447192ffb82429ad3bb7611b8f9c85914dc5b538f9617e7841",
+      "archived_sha256": "5431abc401d9a5dc8c70ce78b18ad709e8864d717943d2527858eb51229428ab",
+      "original_bytes": 3035,
+      "archived_bytes": 3328,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/06-quality/decisions.md",
+      "destination": "history/2026-09-document-center/06-quality/decisions.md",
+      "original_sha256": "c510a12ca5ff21f74fc57a75673145ba6c965439175a650112d392c3f923d83b",
+      "archived_sha256": "0c8756a8da7243c807f331fa8fec92449c2e67fe9f5a885488acef7e71989b49",
+      "original_bytes": 3009,
+      "archived_bytes": 3302,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/06-quality/metrics.md",
+      "destination": "history/2026-09-document-center/06-quality/metrics.md",
+      "original_sha256": "f075c30e9b1afd5741bd8d6cf8e9a4b8bd86154573549ea0dc52d3fe15bb0188",
+      "archived_sha256": "f40b64b0f613d8da1c01407a3d0891a75f6fcb58035e9e355e8ab6806dca5da5",
+      "original_bytes": 3471,
+      "archived_bytes": 3764,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/06-quality/validation.md",
+      "destination": "history/2026-09-document-center/06-quality/validation.md",
+      "original_sha256": "41d318edefcb99dce7b69d7af54bb8c03addb16ecdfc3e77800922b0ee651ea6",
+      "archived_sha256": "2cb21f233173ed0c1b12e29977ba8a6bc9081fdd69074a34abb0da02cc373580",
+      "original_bytes": 3190,
+      "archived_bytes": 3483,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/07-collaboration/maintenance.md",
+      "destination": "history/2026-09-document-center/07-collaboration/maintenance.md",
+      "original_sha256": "945e83b7757f1a902c9e21d5520e727f4bba9e091d1aae11d584fb9976f508bf",
+      "archived_sha256": "e4da330bedc3d4d728da4e03cf2aea56aa53f599d38dd8408339fa04b738f721",
+      "original_bytes": 3311,
+      "archived_bytes": 3604,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/07-collaboration/starting-prompts.md",
+      "destination": "history/2026-09-document-center/07-collaboration/starting-prompts.md",
+      "original_sha256": "4039cd00f32dedac153f08d36e8a6d39b96c6268472076d573c897469a3981f0",
+      "archived_sha256": "68cb78fbb739ceac82b8df75c1f7d9bd874a348c856d7f137d407c6bd7448234",
+      "original_bytes": 2457,
+      "archived_bytes": 2750,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/07-collaboration/templates.md",
+      "destination": "history/2026-09-document-center/07-collaboration/templates.md",
+      "original_sha256": "d9bd6077990e073697c0d1fc3c0411e9037255f2612f9bd75fbde378bc246181",
+      "archived_sha256": "4f10f4fb2107225e66760823102363fcdcbca2e223dc7bd33ac97b20aede62bd",
+      "original_bytes": 2650,
+      "archived_bytes": 2943,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/08-references/known-gaps.md",
+      "destination": "history/2026-09-document-center/08-references/known-gaps.md",
+      "original_sha256": "15b8743b6c74fa094db2463a5c00f52a730b2526ca3a267f62e68a524df4bee1",
+      "archived_sha256": "0b0e186c058ae5628837617d4942d36b8fac6019d95b541fa438a8fd386b10a9",
+      "original_bytes": 3314,
+      "archived_bytes": 3454,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/08-references/source-index.md",
+      "destination": "history/2026-09-document-center/08-references/source-index.md",
+      "original_sha256": "6d96cd45df24d49d657b5793b11c70952d4e5ba7c9949734ccad66e60e094a1b",
+      "archived_sha256": "c09a09cc790baed6ee37f51bd5144e867e8e31058bfb8dc35a5cc37573bbdee4",
+      "original_bytes": 10820,
+      "archived_bytes": 11481,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/branch-annotations.json",
+      "destination": "history/2026-09-document-center/evidence/branch-annotations.json",
+      "original_sha256": "3bf79194028ffe7067a02236005ee3b8a83a990dd5e5f25c3c1488ebae179492",
+      "archived_sha256": "3bf79194028ffe7067a02236005ee3b8a83a990dd5e5f25c3c1488ebae179492",
+      "original_bytes": 5855,
+      "archived_bytes": 5855,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/document-validation-first-pass.json",
+      "destination": "history/2026-09-document-center/evidence/document-validation-first-pass.json",
+      "original_sha256": "8c7270d331586f61cc1868efcc986480d991ef9f288d8a2d0b77c9e3046182fe",
+      "archived_sha256": "8c7270d331586f61cc1868efcc986480d991ef9f288d8a2d0b77c9e3046182fe",
+      "original_bytes": 13168,
+      "archived_bytes": 13168,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/document-validation.json",
+      "destination": "history/2026-09-document-center/evidence/document-validation.json",
+      "original_sha256": "04550d46df2adfb567c26265124f4f10e7ad1e0cc215b0309415829a7bd70603",
+      "archived_sha256": "04550d46df2adfb567c26265124f4f10e7ad1e0cc215b0309415829a7bd70603",
+      "original_bytes": 10445,
+      "archived_bytes": 10445,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/repository-snapshot.json",
+      "destination": "history/2026-09-document-center/evidence/repository-snapshot.json",
+      "original_sha256": "95cf39867c56d3235c56448a2d54ad6d5e3bb650e45bfb49c01b26c2c2f53900",
+      "archived_sha256": "95cf39867c56d3235c56448a2d54ad6d5e3bb650e45bfb49c01b26c2c2f53900",
+      "original_bytes": 62370,
+      "archived_bytes": 62370,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/source-manifest-initial.json",
+      "destination": "history/2026-09-document-center/evidence/source-manifest-initial.json",
+      "original_sha256": "b74a245374dc657d5339c96651d1b7d589861cd4a2ff3167b5cf2505c76f132e",
+      "archived_sha256": "b74a245374dc657d5339c96651d1b7d589861cd4a2ff3167b5cf2505c76f132e",
+      "original_bytes": 15929,
+      "archived_bytes": 15929,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/source-manifest.json",
+      "destination": "history/2026-09-document-center/evidence/source-manifest.json",
+      "original_sha256": "1d517f450e7433e8a5a7d387b0ea0c46b604f37f44ba6770dbe04586dfd82632",
+      "archived_sha256": "1d517f450e7433e8a5a7d387b0ea0c46b604f37f44ba6770dbe04586dfd82632",
+      "original_bytes": 16419,
+      "archived_bytes": 16419,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/source-register.json",
+      "destination": "history/2026-09-document-center/evidence/source-register.json",
+      "original_sha256": "14fe2842075596f392115eb3948094d84802861f308fd5a43ab65ac95f8af15a",
+      "archived_sha256": "14fe2842075596f392115eb3948094d84802861f308fd5a43ab65ac95f8af15a",
+      "original_bytes": 9368,
+      "archived_bytes": 9368,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/evidence/source-review.json",
+      "destination": "history/2026-09-document-center/evidence/source-review.json",
+      "original_sha256": "8faec5fa66a327a609aa6832857ace785b4fbbc849ac3077aa822c237d4463f7",
+      "archived_sha256": "8faec5fa66a327a609aa6832857ace785b4fbbc849ac3077aa822c237d4463f7",
+      "original_bytes": 414,
+      "archived_bytes": 414,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/README.md",
+      "destination": "history/2026-09-document-center/README.md",
+      "original_sha256": "8330f1abc982aba5e2307f9aa5dcc44ceee3fc03a00e6171186828fbb6b67b9e",
+      "archived_sha256": "52af84f077294c9803c312e5663ba15c8618cdaf7801bdd2b34ce27aaa8c697c",
+      "original_bytes": 4127,
+      "archived_bytes": 4421,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/sessions/2026-09-07-documentation-bootstrap.md",
+      "destination": "history/2026-09-document-center/sessions/2026-09-07-documentation-bootstrap.md",
+      "original_sha256": "83475a799392cf0f033bebf3cb95b15c9aec035ef4aa0a3c9a2fe6dda4a50492",
+      "archived_sha256": "d86fc3bdaaeca91d8d8740360fb2fce4bee077697a5a1b5df3b3e11371e4ea05",
+      "original_bytes": 2444,
+      "archived_bytes": 2737,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/STATUS.md",
+      "destination": "history/2026-09-document-center/STATUS.md",
+      "original_sha256": "7ec8644e48eaee82619912309481add4c19b61670b8d6ddc808b769d96392c74",
+      "archived_sha256": "d47ca72d27591571b7e724556e673a842799363a4a2511aabb04213d8d00b8b2",
+      "original_bytes": 4146,
+      "archived_bytes": 4506,
+      "source_version": "2026 年 9 月文档中心快照"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/config-comparison.json",
+      "destination": "history/2026-10-10-inventory/evidence/config-comparison.json",
+      "original_sha256": "c23a02b2656559dce7870c6f6bf50cc7b933b52f4f81b0da4f04297b9b1dd897",
+      "archived_sha256": "c23a02b2656559dce7870c6f6bf50cc7b933b52f4f81b0da4f04297b9b1dd897",
+      "original_bytes": 1616,
+      "archived_bytes": 1616,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/document-check.json",
+      "destination": "history/2026-10-10-inventory/evidence/document-check.json",
+      "original_sha256": "42da6700ccc0e1c963ddc94eb94381fed23928962efb04c41694d7cbe431ab5b",
+      "archived_sha256": "42da6700ccc0e1c963ddc94eb94381fed23928962efb04c41694d7cbe431ab5b",
+      "original_bytes": 25104,
+      "archived_bytes": 25104,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/recent-thread-metadata.json",
+      "destination": "history/2026-10-10-inventory/evidence/recent-thread-metadata.json",
+      "original_sha256": "d77230c1522fba1b7c6a29ef11a9e999421c9d5175c999295d66295ed4555d4c",
+      "archived_sha256": "d77230c1522fba1b7c6a29ef11a9e999421c9d5175c999295d66295ed4555d4c",
+      "original_bytes": 15758,
+      "archived_bytes": 15758,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/repository-snapshot.json",
+      "destination": "history/2026-10-10-inventory/evidence/repository-snapshot.json",
+      "original_sha256": "faf32648b8b96f7d509282eaed41e50a14e2842348ad01c2a38c382c42c9f3de",
+      "archived_sha256": "faf32648b8b96f7d509282eaed41e50a14e2842348ad01c2a38c382c42c9f3de",
+      "original_bytes": 6658,
+      "archived_bytes": 6658,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/source-file-manifest.json",
+      "destination": "history/2026-10-10-inventory/evidence/source-file-manifest.json",
+      "original_sha256": "9f125bd24c1f05b008e90ee8e1e246e23f41d17d1080072a1fa7089752be68e4",
+      "archived_sha256": "9f125bd24c1f05b008e90ee8e1e246e23f41d17d1080072a1fa7089752be68e4",
+      "original_bytes": 13214,
+      "archived_bytes": 13214,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/thread-inventory.json",
+      "destination": "history/2026-10-10-inventory/evidence/thread-inventory.json",
+      "original_sha256": "502cb1e5c9b011a15106fb45c47dfd207952d503e57b038989ee9402729059b0",
+      "archived_sha256": "502cb1e5c9b011a15106fb45c47dfd207952d503e57b038989ee9402729059b0",
+      "original_bytes": 34071,
+      "archived_bytes": 34071,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/thread-read-audit.json",
+      "destination": "history/2026-10-10-inventory/evidence/thread-read-audit.json",
+      "original_sha256": "be6b0c24d16e69603683dca795d8bd9a29898b2906896656302e26d31e5de5af",
+      "archived_sha256": "be6b0c24d16e69603683dca795d8bd9a29898b2906896656302e26d31e5de5af",
+      "original_bytes": 88294,
+      "archived_bytes": 88294,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/evidence/tool-hash-check.json",
+      "destination": "history/2026-10-10-inventory/evidence/tool-hash-check.json",
+      "original_sha256": "f25595dc63b413174d6b160dfa2851d6ea4b665455876ddae4a20320854a7c3a",
+      "archived_sha256": "f25595dc63b413174d6b160dfa2851d6ea4b665455876ddae4a20320854a7c3a",
+      "original_bytes": 3132,
+      "archived_bytes": 3132,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/sources.zh-CN.md",
+      "destination": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "original_sha256": "602094de5159ca163297dfb4ae3024f54b59cd84ca914f27160836a4da1b3036",
+      "archived_sha256": "5ab4ffee98e32baefa0d7d8b3b39bd14d6445918c6d27de28fc3a39aa2e97d47",
+      "original_bytes": 22459,
+      "archived_bytes": 23624,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/Users/Admin/Documents/JN-Unity-T3/JNTracy-Docs/09-handoff/2026-10-10/work-inventory.zh-CN.md",
+      "destination": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "original_sha256": "f63e424e48b817747512a4204ea0a1b21fcbd3f0d48a87e4bc042e8fea9fe710",
+      "archived_sha256": "cb4dd1eff9f0157b3362fcc598957a1712be5c87fa397eb2cbb262c292d5897d",
+      "original_bytes": 26892,
+      "archived_bytes": 27714,
+      "source_version": "2026 年 10 月 10 日交接整理"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/Converter-Memory-Attribution-20260915.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/Converter-Memory-Attribution-20260915.zh-CN.md",
+      "original_sha256": "73f2dac4876fe68be435fc1aeff680b630e1149af3cba0e3d7767475894105bb",
+      "archived_sha256": "899a0fe71a517e72e87f616b06942b92ead2620fb0010a6ac32f182fafa9c664",
+      "original_bytes": 3120,
+      "archived_bytes": 3418,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Catalog-Storage-Progress.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Catalog-Storage-Progress.md",
+      "original_sha256": "dc5d4adbb87cf0f4957712330ed7e54d15abbc698ef3ab8b2b8f8e864e9fd9a6",
+      "archived_sha256": "1d18f33cdb50fb671a6f8df2f7a2a290687640744ac73fb01d691ac6924f9b10",
+      "original_bytes": 4239,
+      "archived_bytes": 4537,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Extended-Trace-v1.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Extended-Trace-v1.md",
+      "original_sha256": "c6450eac368eb010f00480cdef85f2030351cf4a76bf2c619a405c95db459b05",
+      "archived_sha256": "7ee97a6c20eb2607c6cb4f0149f1a72b3a15fa7ea2904b14d9491937b27cbbdc",
+      "original_bytes": 4590,
+      "archived_bytes": 4888,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Finalize-Optimization.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Finalize-Optimization.md",
+      "original_sha256": "120747c0d00e8518fdfb2d0d5ba2f789278b020a7c657de9c182801f3189a115",
+      "archived_sha256": "12b8c20b6640c28179286957f4fa303b0a2b23ea67ca3a3bba3fa76d8f24f262",
+      "original_bytes": 12003,
+      "archived_bytes": 12301,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-CPU-Zone-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-CPU-Zone-Storage.md",
+      "original_sha256": "c1a80a6a7a593fdefffcdde4fce4513178c72efa3ec16083896b51f28689eb9a",
+      "archived_sha256": "18a3136e9d2432790cc818f106aad4ca5413fae9ceccd4355ee2a0b735af5f93",
+      "original_bytes": 2137,
+      "archived_bytes": 2435,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-Callstack-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-Callstack-Storage.md",
+      "original_sha256": "575553e663f978a7ed08fa6634fbec4b9ab574804bffce34978282ae9a0b9dbc",
+      "archived_sha256": "fb1386667c60a3d989a6fccd802d2f8a80c1adb3e3f7100f003e027a2c19b89a",
+      "original_bytes": 2054,
+      "archived_bytes": 2352,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-GPU-Zone-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-GPU-Zone-Storage.md",
+      "original_sha256": "d96530ce279439592db826a7daf2ebcce2cea28d213ceb8288ba90fd97f5750e",
+      "archived_sha256": "3903c785867b74b6829e7b9f92f5d9d893860a09f288176b19afc4ed48b4570c",
+      "original_bytes": 2181,
+      "archived_bytes": 2479,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-Pass-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-Pass-Storage.md",
+      "original_sha256": "e40e56fa89439dd040e8718b39936d24e81d2809190de5db864c96947ba8bfb9",
+      "archived_sha256": "7319657736681077d7194d0e98d5797b4d03ec4acee4362c50e6ff3e695a51cb",
+      "original_bytes": 1979,
+      "archived_bytes": 2277,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-Sample-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-Sample-Storage.md",
+      "original_sha256": "fd1d36242b6ee5521354b73d8c51acf497c5c051cbdc0fabe00d530bf79d4e5e",
+      "archived_sha256": "e083f4738bf1d3d678643e280b411aa387eae707e24d5f38d11e8d501573aaf7",
+      "original_bytes": 1941,
+      "archived_bytes": 2239,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Offline-String-Storage.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Offline-String-Storage.md",
+      "original_sha256": "13558cb66c176d42f3dcff6cd8072886a868cc11c0bc7c6293199f8019f104f1",
+      "archived_sha256": "f59e2fe1f8cae6f921b8cb7c4424141b54bf5b0acb5053447dba1e8a1a4adee9",
+      "original_bytes": 2629,
+      "archived_bytes": 2927,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Replay-Write-Optimization.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Replay-Write-Optimization.md",
+      "original_sha256": "9d1edcb58b6fab1f0e7ca3b26292c88c8915d10521b0171912aa66706bc73f73",
+      "archived_sha256": "0cb7685f5858b3e840f62277cfda071ef3b51654e24d8ac133ba7a6b479258da",
+      "original_bytes": 9446,
+      "archived_bytes": 9744,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Streaming-Dictionary-Validation.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Streaming-Dictionary-Validation.md",
+      "original_sha256": "7b7058a2e7584964889091588bfb02919d21320df7fdf677133fb3ab2d0c1e50",
+      "archived_sha256": "f56f585386729ad5e8cc6ff3cfc46b3acf65108e49f220452f1a7ff62697133b",
+      "original_bytes": 1779,
+      "archived_bytes": 2077,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+      "original_sha256": "a73c85eda1c69e770240daf777567ee81b0acfff8a8bad803eb71a9260010751",
+      "archived_sha256": "ba6d112dfd4cefb9ac8ac417db22ed5ffbddd413f6c46b79443483ae324c79e4",
+      "original_bytes": 13388,
+      "archived_bytes": 13686,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Binary-Manifest.json",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-N27-Profiler-GUI-Binary-Manifest.json",
+      "original_sha256": "031c2bbea7540554a6d5c77bb5512b6649e6c5253e894a7e0e8e47061e72fb02",
+      "archived_sha256": "031c2bbea7540554a6d5c77bb5512b6649e6c5253e894a7e0e8e47061e72fb02",
+      "original_bytes": 746,
+      "archived_bytes": 746,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Implementation-Plan.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-N27-Profiler-GUI-Implementation-Plan.zh-CN.md",
+      "original_sha256": "86242b37da604133d06c5ca03b7448cb3a18317e802d342e537fadf5f02f2fdb",
+      "archived_sha256": "20811b5805a9cf56e3209330001a939fdda3519972f86abb55b4f7d869b6c021",
+      "original_bytes": 5062,
+      "archived_bytes": 5360,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Test-Corpus.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-N27-Profiler-GUI-Test-Corpus.md",
+      "original_sha256": "b3a3b9fe60011984b4853d34c59d6695d949e5762a6be79ed843d4664e1a9702",
+      "archived_sha256": "f44db90cafd0c8b1820a697b012913cf7026d15cfbbe3a2a4d49040ac7495b47",
+      "original_bytes": 806,
+      "archived_bytes": 1104,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Query-Analysis-Cache-Acceptance.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Query-Analysis-Cache-Acceptance.zh-CN.md",
+      "original_sha256": "3aa20aa6facec13a52608dc113d5ba05f02d97dec647e4abdb27b840cf2e6668",
+      "archived_sha256": "525e8b65a669f0a2bf659ef6b9b7acc73e260cc02d1b588a59c3cba826af5b74",
+      "original_bytes": 100242,
+      "archived_bytes": 100540,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Query-Analysis-Cache-Implementation-Plan.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Query-Analysis-Cache-Implementation-Plan.zh-CN.md",
+      "original_sha256": "9bee466c2d43c5a0bfcd9d2d2209f9e66bcfedc7ad6b8ed259f42da7e575911c",
+      "archived_sha256": "2c01f8aa1d4dd38bf6b6471da4c378698081d225c0f0a2238cb955b1b52405f4",
+      "original_bytes": 7295,
+      "archived_bytes": 7593,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-QueryScan-DevBase-Extraction-20260907.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-QueryScan-DevBase-Extraction-20260907.zh-CN.md",
+      "original_sha256": "d0caf673f58d8d3b48a300a95a257e5741bf2ac13e01921ed8ca64502362531c",
+      "archived_sha256": "c29c81ec1c78734be4de07d3eb4264ce989b1d6663cb203da7636283e0d52ecf",
+      "original_bytes": 8046,
+      "archived_bytes": 8344,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Skill-Cache-Integration-20260909.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Skill-Cache-Integration-20260909.zh-CN.md",
+      "original_sha256": "17a6858fb050e43fbb096a0db7d5a5553ec83282f3c586588dc2b1da7fb8a26e",
+      "archived_sha256": "4384272e8ba1412575742766cb20e146d5d86ae3e944db88c3d72a47ecd6bbc4",
+      "original_bytes": 16993,
+      "archived_bytes": 17291,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+      "original_sha256": "0bb642d090fbd269ff66c49384e1d5d114c1b2175f0fce4405f7e91f0d7ebd83",
+      "archived_sha256": "e3e33b0a60e5c546106703f8265547634e6f50fd9e56220f8673e351c19a7e5c",
+      "original_bytes": 14317,
+      "archived_bytes": 14615,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Plan.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Stream-Convert-Offline-Optimization-Plan.zh-CN.md",
+      "original_sha256": "4a381563967d7bfd1ebe49d6051b7b8f6b828b3c1dba76e1cab50f1dcb0f7320",
+      "archived_sha256": "243632f61d27dd24a4898b8593880982da8e4eff3ce00a91765d24bd1775cf2f",
+      "original_bytes": 11451,
+      "archived_bytes": 11749,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Release-Manifest.json",
+      "destination": "history/mainline-doc-before-reorganization/JN-Tracy-Stream-Convert-Offline-Optimization-Release-Manifest.json",
+      "original_sha256": "1a89b18d088a6c71898e4ee4b4014a1b1fd33aea87ec2c4211d6ab8e3e69ba10",
+      "archived_sha256": "1a89b18d088a6c71898e4ee4b4014a1b1fd33aea87ec2c4211d6ab8e3e69ba10",
+      "original_bytes": 1467,
+      "archived_bytes": 1467,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JNTracy-AI-Deployment-and-Test.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/JNTracy-AI-Deployment-and-Test.zh-CN.md",
+      "original_sha256": "b3d75b6bc4edbffdda4c22a85a69d7dffd90329363287f2ec6bb07b809a589b1",
+      "archived_sha256": "09bf0126525b489cdae3f0b937afeaf4fbc220b3e508ae26560b558dc402d313",
+      "original_bytes": 12009,
+      "archived_bytes": 12307,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/Query-GpuCatalog-DiskIndex-Progress.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/Query-GpuCatalog-DiskIndex-Progress.zh-CN.md",
+      "original_sha256": "b17795ea56a49262a0f87349687893c249e30e4d85d5c99e5521662023e04168",
+      "archived_sha256": "c92b231910e06780724d4250ce6e2ef318472bbedce8bb6079a7e053152d25b0",
+      "original_bytes": 53322,
+      "archived_bytes": 53620,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/Query-LongData-Holder-Audit.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/Query-LongData-Holder-Audit.zh-CN.md",
+      "original_sha256": "e1c37aee9242306ff6b092e1df1ea2b4b14b64b8d999315a65c69433b2b2c24d",
+      "archived_sha256": "f7e6d87e48d877a657a9e33c1189397d291a49f29958dfdc9fa62977823d9798",
+      "original_bytes": 12925,
+      "archived_bytes": 13223,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/Query-LongData-R19-Audit-20260929.json",
+      "destination": "history/mainline-doc-before-reorganization/Query-LongData-R19-Audit-20260929.json",
+      "original_sha256": "ac77458ff94ba70dd0fd0969e06f02032c7ef4acbfe6bea6e3b8e41f6ae8f7f2",
+      "archived_sha256": "ac77458ff94ba70dd0fd0969e06f02032c7ef4acbfe6bea6e3b8e41f6ae8f7f2",
+      "original_bytes": 3912,
+      "archived_bytes": 3912,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/Query-LongData-Task-Closure-20260929.zh-CN.md",
+      "destination": "history/mainline-doc-before-reorganization/Query-LongData-Task-Closure-20260929.zh-CN.md",
+      "original_sha256": "ce8af52eaa18bdf752b757bca9795173c69860b7f6aa7d30f8362a4880b9dbf7",
+      "archived_sha256": "754f6840d2bd44020ab6f2772934ce57b77ad33f1e5669fa4a9b994e2151cdb1",
+      "original_bytes": 5679,
+      "archived_bytes": 5977,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/profiler.png",
+      "destination": "history/mainline-doc-before-reorganization/profiler.png",
+      "original_sha256": "717561c3c1bdc7238aedfa40a321212e3ceec70de423ddb13d6cbe71bf9b2aaf",
+      "archived_sha256": "717561c3c1bdc7238aedfa40a321212e3ceec70de423ddb13d6cbe71bf9b2aaf",
+      "original_bytes": 218265,
+      "archived_bytes": 218265,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/profiler2.png",
+      "destination": "history/mainline-doc-before-reorganization/profiler2.png",
+      "original_sha256": "931b4c9e096df4fa407cb1dd59effdf0994abb8038b7e03ef8f3f391f96dbccf",
+      "archived_sha256": "931b4c9e096df4fa407cb1dd59effdf0994abb8038b7e03ef8f3f391f96dbccf",
+      "original_bytes": 256370,
+      "archived_bytes": 256370,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    },
+    {
+      "source": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/profiler3.png",
+      "destination": "history/mainline-doc-before-reorganization/profiler3.png",
+      "original_sha256": "567b1d067de03738241d0f751da5938378f7497d8774af4a1ecb7bdbbcb110ed",
+      "archived_sha256": "567b1d067de03738241d0f751da5938378f7497d8774af4a1ecb7bdbbcb110ed",
+      "original_bytes": 239265,
+      "archived_bytes": 239265,
+      "source_version": "mainline f49190f2541c 中的历史资料"
+    }
+  ],
+  "link_rewrites": [
+    {
+      "document": "history/2026-09-document-center/02-chains/01-capture.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/scripts/start-capture.ps1",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/start-capture.ps1"
+    },
+    {
+      "document": "history/2026-09-document-center/02-chains/01-capture.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/scripts/monitor-capture.ps1",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/monitor-capture.ps1"
+    },
+    {
+      "document": "history/2026-09-document-center/02-chains/01-capture.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/scripts/stop-capture.ps1",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/stop-capture.ps1"
+    },
+    {
+      "document": "history/2026-09-document-center/03-iterations/queryscan-evolution.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/docs",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs"
+    },
+    {
+      "document": "history/2026-09-document-center/05-operations/tool-catalog.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/scripts",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts"
+    },
+    {
+      "document": "history/2026-09-document-center/05-operations/tool-catalog.md",
+      "old": "../../tools",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/tools"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md",
+      "new": "source-index.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s10",
+      "new": "source-index.md#s10"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s11",
+      "new": "source-index.md#s11"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s22",
+      "new": "source-index.md#s22"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s02",
+      "new": "source-index.md#s02"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s05",
+      "new": "source-index.md#s05"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s18",
+      "new": "source-index.md#s18"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s04",
+      "new": "source-index.md#s04"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/known-gaps.md",
+      "old": "../08-references/source-index.md#s23",
+      "new": "source-index.md#s23"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+      "new": "../../mainline-doc-before-reorganization/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+      "new": "../../mainline-doc-before-reorganization/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../skill-draft/diagnose-jn-unity-tracy/docs",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../Analysis",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Analysis"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../AnalysisReports",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/AnalysisReports"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../TestMachine-Handoff",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/TestMachine-Handoff"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../JN-Unity-Tracy-云文档主采集精简版-20260729",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/JN-Unity-Tracy-云文档主采集精简版-20260729"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "old": "../../doc_work/Unity_Tracy_Performance_Interview_Handbook.docx",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/doc_work/Unity_Tracy_Performance_Interview_Handbook.docx"
+    },
+    {
+      "document": "history/2026-09-document-center/README.md",
+      "old": "09-handoff/2026-10-10/work-inventory.zh-CN.md",
+      "new": "../2026-10-10-inventory/work-inventory.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/README.md",
+      "old": "09-handoff/2026-10-10/sources.zh-CN.md",
+      "new": "../2026-10-10-inventory/sources.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/STATUS.md",
+      "old": "09-handoff/2026-10-10/work-inventory.zh-CN.md",
+      "new": "../2026-10-10-inventory/work-inventory.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/STATUS.md",
+      "old": "../QSCAN14-Frame-Window-Investigation-20260907/Implementation-Progress.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/Implementation-Progress.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/STATUS.md",
+      "old": "../QSCAN14-Frame-Window-Investigation-20260907/FW5-Short-Trace-Memory-Guard-Failure.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/FW5-Short-Trace-Memory-Guard-Failure.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../README.md",
+      "new": "../2026-09-document-center/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../01-system/architecture.md",
+      "new": "../2026-09-document-center/01-system/architecture.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../01-system/capabilities.md",
+      "new": "../2026-09-document-center/01-system/capabilities.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../01-system/contracts.md",
+      "new": "../2026-09-document-center/01-system/contracts.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../02-chains/README.md",
+      "new": "../2026-09-document-center/02-chains/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../03-iterations/README.md",
+      "new": "../2026-09-document-center/03-iterations/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../04-branches/README.md",
+      "new": "../2026-09-document-center/04-branches/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../05-operations/runbook.md",
+      "new": "../2026-09-document-center/05-operations/runbook.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../05-operations/tool-catalog.md",
+      "new": "../2026-09-document-center/05-operations/tool-catalog.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../06-quality/metrics.md",
+      "new": "../2026-09-document-center/06-quality/metrics.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../06-quality/validation.md",
+      "new": "../2026-09-document-center/06-quality/validation.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../06-quality/decisions.md",
+      "new": "../2026-09-document-center/06-quality/decisions.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Query-Cache-Storage-Optimization/Implementation-Status.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Query-Cache-Storage-Optimization/Implementation-Status.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Fixed-Slice-Plan.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Fixed-Slice-MCP-Parity-Plan-20261007.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Fixed-Slice-MCP-Parity-Plan-20261007.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../QS17-Skill-2.3.1-ReportIteration/Typora/Performance-Analysis-Report.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/QS17-Skill-2.3.1-ReportIteration/Typora/Performance-Analysis-Report.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../QS17-Skill-2.3.1-SharePackage/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/QS17-Skill-2.3.1-SharePackage/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Integrated-3947331da/",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Integrated-3947331da"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Integrated-3947331da/executables.json",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Integrated-3947331da/executables.json"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../Tracy-Integrated-3947331da/validation.json",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Integrated-3947331da/validation.json"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../TestMachine-Handoff/2026-09-14/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/TestMachine-Handoff/2026-09-14/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../output/tracy-manual-zh-CN/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/output/tracy-manual-zh-CN/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "old": "../../../History/Organization-20260911/move-map.csv",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/History/Organization-20260911/move-map.csv"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Tracy-Integrated-3947331da/",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Integrated-3947331da"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Tracy-Integrated-3947331da/validation.json",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Integrated-3947331da/validation.json"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../01-system/architecture.md",
+      "new": "../2026-09-document-center/01-system/architecture.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../02-chains/03-cpu-job.md",
+      "new": "../2026-09-document-center/02-chains/03-cpu-job.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../03-iterations/resource-evolution.md",
+      "new": "../2026-09-document-center/03-iterations/resource-evolution.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../02-chains/04-gpu-frame-dxr.md",
+      "new": "../2026-09-document-center/02-chains/04-gpu-frame-dxr.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../02-chains/05-resource-memory.md",
+      "new": "../2026-09-document-center/02-chains/05-resource-memory.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../06-quality/metrics.md",
+      "new": "../2026-09-document-center/06-quality/metrics.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/deployment-records/20260816/Player-T3-Auto-Login-and-Capture-Acceptance-2026-08-16.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config/",
+      "new": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Config"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../03-iterations/storage-evolution.md",
+      "new": "../2026-09-document-center/03-iterations/storage-evolution.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Tracy-Fixed-Slice-Plan.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Fixed-Slice-Plan.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-Fixed-Slice-Evidence/20261007-mcp-parity-001/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/GpuCatalog-DiskIndex/Query-Final-Acceptance-20260929-r20/Report.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Skill-Quality-Review-20261008/Tracy分析与报告质量深度评审.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/Skill-Quality-Review-20261008/插桩分析与报告格式约束建议.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../QS17-Skill-2.3.1-SharePackage/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/QS17-Skill-2.3.1-SharePackage/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../TestMachine-Handoff/2026-09-14/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/TestMachine-Handoff/2026-09-14/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/UnityProfiler-Tracy-JobWorker-20260928/SRPBatcher-Hierarchy-Audit.zh-CN.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../README.md",
+      "new": "../2026-09-document-center/README.md"
+    },
+    {
+      "document": "history/2026-10-10-inventory/work-inventory.zh-CN.md",
+      "old": "../../../output/tracy-manual-zh-CN/README.zh-CN.md",
+      "new": "C:/Users/Admin/Documents/JN-Unity-T3/output/tracy-manual-zh-CN/README.zh-CN.md"
+    }
+  ],
+  "unresolved_historical_references": [
+    {
+      "document": "history/2026-09-document-center/03-iterations/capture-foundation.md",
+      "label": "引擎历史验收目录",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance",
+      "resolved": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance/README.zh-CN.md",
+      "resolved": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance/README.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/GPU-Resource-Catalog-Acceptance/N27-GPU-Resource-Catalog-Acceptance.zh-CN.md",
+      "resolved": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/GPU-Resource-Catalog-Acceptance/N27-GPU-Resource-Catalog-Acceptance.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/N28-ResourceGraph-Schema3-Repair-and-Completion-Plan.zh-CN.md",
+      "resolved": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/N28-ResourceGraph-Schema3-Repair-and-Completion-Plan.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n29-gpu-analysis/doc/JN-Tracy-N29-GPU-Resource-Analysis-Sidecar-Acceptance.zh-CN.md",
+      "resolved": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n29-gpu-analysis/doc/JN-Tracy-N29-GPU-Resource-Analysis-Sidecar-Acceptance.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30-Long-Trace-Session-Store-Acceptance.zh-CN.md",
+      "resolved": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30-Long-Trace-Session-Store-Acceptance.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-Trusted-Session-Completion-Plan.zh-CN.md",
+      "resolved": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-Trusted-Session-Completion-Plan.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "打开原始文件",
+      "target": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-P3-Short-Differential-Failure-Review.zh-CN.md",
+      "resolved": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-P3-Short-Differential-Failure-Review.zh-CN.md"
+    },
+    {
+      "document": "history/2026-09-document-center/08-references/source-index.md",
+      "label": "引擎 JNTracy Docs",
+      "target": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs",
+      "resolved": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs"
+    },
+    {
+      "document": "history/2026-10-10-inventory/sources.zh-CN.md",
+      "label": "部署清单",
+      "target": "C:/workflow/T3_Builds/t3_publication_cn_development_v0.0.2375.7327240_default/T3_development_JNTracy_20261009-203345/_JNTracyDeploymentManifest.json",
+      "resolved": "C:/workflow/T3_Builds/t3_publication_cn_development_v0.0.2375.7327240_default/T3_development_JNTracy_20261009-203345/_JNTracyDeploymentManifest.json"
+    }
+  ]
+}

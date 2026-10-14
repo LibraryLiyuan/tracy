@@ -1,0 +1,372 @@
+[
+  {
+    "id": "S01",
+    "title": "三仓部署与同事验收指南",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Tracy-JNTracy-AI-Deployment-and-Test.zh-CN.md",
+    "scope": "历史部署合同，不能代表所有新分支",
+    "exists": true,
+    "bytes": 12009,
+    "last_write_time": "2026-08-31T16:19:20.7975708+08:00",
+    "sha256": "B3D75B6BC4EDBFFDDA4C22A85A69D7DFFD90329363287F2EC6BB07B809A589B1"
+  },
+  {
+    "id": "S02",
+    "title": "GPU L0 OriginFrameId 交接",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/GPU-L0-OriginFrameId-Integration-Handoff.zh-CN.md",
+    "scope": "设计与待实施边界",
+    "exists": true,
+    "bytes": 19053,
+    "last_write_time": "2026-09-06T15:38:33.0341976+08:00",
+    "sha256": "B756FBF6D2C0E3BA8D98574FD9B9D7AD17628E862726C1565A5708AE5540595B"
+  },
+  {
+    "id": "S03",
+    "title": "Render Thread 嵌套与覆盖修复",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Render-Thread-Zone-Nesting-and-Coverage-Fix-Acceptance-20260906.zh-CN.md",
+    "scope": "专项验收",
+    "exists": true,
+    "bytes": 10200,
+    "last_write_time": "2026-09-06T17:54:14.9653812+08:00",
+    "sha256": "DB3F8781F1BDAA94658CA292648C2FBD386EE1764232E9FF10B0681E51AC3415"
+  },
+  {
+    "id": "S04",
+    "title": "DXR GPU 耗时实现与验收",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/DXR-GpuTiming-20260907/DXR-GPU-Timing-Acceptance.zh-CN.md",
+    "scope": "含本地 Player 故障和 Editor 补记",
+    "exists": true,
+    "bytes": 14201,
+    "last_write_time": "2026-09-07T18:25:32.0486323+08:00",
+    "sha256": "4613EC78499D7C4AA8ECF43F58280F297E3253C74CD743E93BB811C1500ECAC2"
+  },
+  {
+    "id": "S05",
+    "title": "N31 Managed GPU Catalog 计划",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/N31-Managed-GPU-Catalog-Performance-and-Lifecycle-Plan.zh-CN.md",
+    "scope": "目标及历史性能观测，不是最终验收",
+    "exists": true,
+    "bytes": 13096,
+    "last_write_time": "2026-09-03T19:07:29.5783118+08:00",
+    "sha256": "FCDEF949025263D55E366A9243339E50128C5F79D21F36CA1BD2A168B6CB766D"
+  },
+  {
+    "id": "S06",
+    "title": "GPU Memory 长 Trace 窗口交接",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/N30-GPU-Memory-Resources-Window-Integration-Handoff.zh-CN.md",
+    "scope": "规模问题与架构建议",
+    "exists": true,
+    "bytes": 18908,
+    "last_write_time": "2026-09-01T14:38:50.9270058+08:00",
+    "sha256": "C239400BA6E66C087ECF765B1B869F0B492861AA0EF086CA34A113E238A59E06"
+  },
+  {
+    "id": "S07",
+    "title": "Query 原生扫描设计",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-06-query-native-deterministic-scan-design.zh-CN.md",
+    "scope": "设计文件；部分措辞已被后续合同收紧",
+    "exists": true,
+    "bytes": 31697,
+    "last_write_time": "2026-09-06T18:15:22.6861582+08:00",
+    "sha256": "FE1FD0500C297BE83BF8EC54A63DACFA580136FD43457BFAF6A07613B5859596"
+  },
+  {
+    "id": "S08",
+    "title": "QueryScan 实施计划",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-06-query-native-deterministic-scan-implementation-plan.zh-CN.md",
+    "scope": "阶段拆解和工作区",
+    "exists": true,
+    "bytes": 31684,
+    "last_write_time": "2026-09-06T18:29:05.7836088+08:00",
+    "sha256": "5761FB7CFE68A989296EB9651E9A886D9D8B91A0312D6B715069DF96BF0D7B94"
+  },
+  {
+    "id": "S09",
+    "title": "QSCAN13 真实 Trace 验收",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/QSCAN-13-Native-Scan-Real-Trace-Acceptance.zh-CN.md",
+    "scope": "历史阶段通过，Session 延期",
+    "exists": true,
+    "bytes": 19654,
+    "last_write_time": "2026-09-07T12:50:07.6179537+08:00",
+    "sha256": "0977CAB418BF1174AB2689A04F046630ABC8B032DD59A1C225CE7AA9E72FB64D"
+  },
+  {
+    "id": "S10",
+    "title": "QSCAN14 实施进度",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/Implementation-Progress.zh-CN.md",
+    "scope": "真实短 Trace 验收失败，安装未完成",
+    "exists": true,
+    "bytes": 7015,
+    "last_write_time": "2026-09-07T19:52:52.3952713+08:00",
+    "sha256": "D8436F0C2F550BB75A52098DCC324372DA0A7494E58A7CAA930688792D6925C8"
+  },
+  {
+    "id": "S11",
+    "title": "FW5 内存保护失败记录",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/QSCAN14-Frame-Window-Investigation-20260907/FW5-Short-Trace-Memory-Guard-Failure.zh-CN.md",
+    "scope": "取消证据和未验证假设",
+    "exists": true,
+    "bytes": 6506,
+    "last_write_time": "2026-09-07T18:37:56.0502759+08:00",
+    "sha256": "7A24ACF030C29F4478DEF3D85A2B1CB82D2A4E87AC4291F0802A2B86B327E062"
+  },
+  {
+    "id": "S12",
+    "title": "Query 1.35 扫描恢复合同",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/query-native-scan-workflow.md",
+    "scope": "草案工作流",
+    "exists": true,
+    "bytes": 6024,
+    "last_write_time": "2026-09-07T17:47:09.7193589+08:00",
+    "sha256": "FC08336F41876CD74F6CCC2A54307AD7B64EFF688307F2C36354D719C4689CA4"
+  },
+  {
+    "id": "S13",
+    "title": "候选调查与停止合同",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/candidate-investigation.md",
+    "scope": "草案调查及实际 MCP 回执要求",
+    "exists": true,
+    "bytes": 8650,
+    "last_write_time": "2026-09-07T18:06:44.3095517+08:00",
+    "sha256": "202D30AB1D03B21C625941E62D88C758B55736492C72EDBFBEF417BF7E4762A5"
+  },
+  {
+    "id": "S14",
+    "title": "采集停止与转换合同",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/capture-workflow.md",
+    "scope": "采集辅助路由",
+    "exists": true,
+    "bytes": 4623,
+    "last_write_time": "2026-09-06T23:29:56.2531166+08:00",
+    "sha256": "CAE7993DCC800753295A000D29A181D4802C4567A9BB61DF4757A335C8177AAF"
+  },
+  {
+    "id": "S15",
+    "title": "报告合同",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/references/report-contract.md",
+    "scope": "草案报告与产物结构",
+    "exists": true,
+    "bytes": 9139,
+    "last_write_time": "2026-09-07T16:42:20.9992241+08:00",
+    "sha256": "A02F94DE298A36A9D6E2A628BBB08A6F32F1A703A8C2D0A1ACDA19FB1EAC4B15"
+  },
+  {
+    "id": "S16",
+    "title": "N00 起始迭代验收索引",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/AI-Analysis-Iteration-Acceptance/README.zh-CN.md",
+    "scope": "历史专项与生产门禁状态",
+    "exists": true,
+    "bytes": 17386,
+    "last_write_time": "2026-08-22T15:51:35.1638347+08:00",
+    "sha256": "D8CC30A11F093BA1AA007ECFDB69A7F0E8E0A00877D4C24A366DE913176F583E"
+  },
+  {
+    "id": "S17",
+    "title": "N27 Catalog 集中验收",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/GPU-Resource-Catalog-Acceptance/N27-GPU-Resource-Catalog-Acceptance.zh-CN.md",
+    "scope": "功能通过及生产例外",
+    "exists": true,
+    "bytes": 51322,
+    "last_write_time": "2026-08-24T14:05:32.7418433+08:00",
+    "sha256": "46B04DB6F31D58525A53A4A8F6C5A4CCCF2123D6E2ACF57C503753C8C3226697"
+  },
+  {
+    "id": "S18",
+    "title": "N28 ResourceGraph Schema3 计划",
+    "path": "C:/workflow/jnunity/Runtime/Profiler/JNTracy/Docs/N28-ResourceGraph-Schema3-Repair-and-Completion-Plan.zh-CN.md",
+    "scope": "来源链、生命周期与连接约束",
+    "exists": true,
+    "bytes": 46560,
+    "last_write_time": "2026-08-21T20:46:31.1750418+08:00",
+    "sha256": "C16F3E2713EFB6A2F1AA7D94E5EFE17D3AB26AAE508F4C27E6F9F5F34C7A65B2"
+  },
+  {
+    "id": "S19",
+    "title": "N29 GPU Sidecar 验收",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n29-gpu-analysis/doc/JN-Tracy-N29-GPU-Resource-Analysis-Sidecar-Acceptance.zh-CN.md",
+    "scope": "Passed With Declared Exceptions",
+    "exists": true,
+    "bytes": 11946,
+    "last_write_time": "2026-08-30T01:29:33.6966855+08:00",
+    "sha256": "ABFA44F06872402EA7478D477811201598532699862A692A6FF0C24654FEA43B"
+  },
+  {
+    "id": "S20",
+    "title": "N30 Session 验收记录",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30-Long-Trace-Session-Store-Acceptance.zh-CN.md",
+    "scope": "历次阶段证据",
+    "exists": true,
+    "bytes": 173272,
+    "last_write_time": "2026-09-02T12:17:45.4161197+08:00",
+    "sha256": "F20EF75294B460C33059492B63C2B2B32966B9688A057297C0A43EA833CACE88"
+  },
+  {
+    "id": "S21",
+    "title": "N30A 可信 Session 收口计划",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-Trusted-Session-Completion-Plan.zh-CN.md",
+    "scope": "2026-09-02 A7 历史完成及源降级",
+    "exists": true,
+    "bytes": 9981,
+    "last_write_time": "2026-09-02T12:16:03.1724106+08:00",
+    "sha256": "5256D7A4AF1EB34372534C36AD19A4DA7BE120FF03E4BA2554602EEE637AB283"
+  },
+  {
+    "id": "S22",
+    "title": "N30A P3 双路径失败复核",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1-n30-long-trace-session/doc/JN-Tracy-N30A-P3-Short-Differential-Failure-Review.zh-CN.md",
+    "scope": "2026-09-07 失败，未继续新 30m",
+    "exists": true,
+    "bytes": 10371,
+    "last_write_time": "2026-09-07T17:30:41.9061077+08:00",
+    "sha256": "54ACC37B152D6336E7CDC93B6785F99413491770738F1A6831D6F1CD6BD95D83"
+  },
+  {
+    "id": "S23",
+    "title": "N27 GUI 验收",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-N27-Profiler-GUI-Acceptance.zh-CN.md",
+    "scope": "PreviewCandidate 及人工验收边界",
+    "exists": true,
+    "bytes": 13662,
+    "last_write_time": "2026-08-25T16:44:07.9809854+08:00",
+    "sha256": "D896353D82688EE664F4E65718C5AA12A2CA52DF599781513BDAA72A775CF22F"
+  },
+  {
+    "id": "S24",
+    "title": "离线转换优化验收记录",
+    "path": "C:/CodeProjects/GodotProjects/tracy-0.13.1/doc/JN-Tracy-Stream-Convert-Offline-Optimization-Acceptance.zh-CN.md",
+    "scope": "历史算法与阶段观测",
+    "exists": true,
+    "bytes": 14559,
+    "last_write_time": "2026-08-23T21:46:03.8303998+08:00",
+    "sha256": "1F9E08FD39C5E4CE0C2699C30C4FFE1D7718F87D0EBF33BFE9E3BCF99EE2887D"
+  },
+  {
+    "id": "S25",
+    "title": "测试机部署交接",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/TestMachine-Handoff/2026-08-29/JN-Tracy-Test-Machine-Deployment-Handoff.zh-CN.md",
+    "scope": "固定旧快照",
+    "exists": true,
+    "bytes": 18095,
+    "last_write_time": "2026-08-29T22:38:10.6553436+08:00",
+    "sha256": "20A4D6DBEAB1B60AC05023807F728C5726BCD16ECF81CFB381F137D9A0646204"
+  },
+  {
+    "id": "S26",
+    "title": "G01 证据索引示例",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/Analysis/G01-Static-20260826-200012-Full-20260830/AnalysisReport/Evidence-Index.md",
+    "scope": "历史报告结构参考",
+    "exists": true,
+    "bytes": 2455,
+    "last_write_time": "2026-08-30T22:23:04.0735808+08:00",
+    "sha256": "54041DB5A51ED7C0501ED204048976B942E0F6DC696A65B99BE88361248DF490"
+  },
+  {
+    "id": "S27",
+    "title": "草案 Skill 入口",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/SKILL.md",
+    "scope": "现场读取 version 2.0.1",
+    "exists": true,
+    "bytes": 9788,
+    "last_write_time": "2026-09-07T16:42:09.1291363+08:00",
+    "sha256": "B2F41234016D549849F56F79CCCFE1CBDB3D534C53AE164815D9F83979875CC1"
+  },
+  {
+    "id": "S28",
+    "title": "已安装 Skill 入口",
+    "path": "C:/Users/Admin/.codex/skills/diagnose-jn-unity-tracy/SKILL.md",
+    "scope": "现场读取 version 1.1.3",
+    "exists": true,
+    "bytes": 7703,
+    "last_write_time": "2026-09-07T16:06:31.0729284+08:00",
+    "sha256": "4677C1AA776850E29DDDF6A1F0273BD0C37168DFB7B825EE85ADEA0EE5EAFFB1"
+  },
+  {
+    "id": "S29",
+    "title": "Player staging 工具合同",
+    "path": "C:/Users/Admin/.codex/skills/jntracy-stage-player-code/SKILL.md",
+    "scope": "文档资料；本次未执行部署",
+    "exists": true,
+    "bytes": 8141,
+    "last_write_time": "2026-08-14T17:00:27.9627255+08:00",
+    "sha256": "862F5E27FDA6B96B5B2C14D8BC0199C5ACA63505D313BB2DC1CC26C4E2E1D43D"
+  },
+  {
+    "id": "S30",
+    "title": "启动采集脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/start-capture.ps1",
+    "scope": "已检查参数与正文入口",
+    "exists": true,
+    "bytes": 2451,
+    "last_write_time": "2026-08-24T18:55:16.7213780+08:00",
+    "sha256": "68766B1C76D32A60870996A828F80EB9CC73BAA8AE731D610853BB8D87E3017B"
+  },
+  {
+    "id": "S31",
+    "title": "采集监控脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/monitor-capture.ps1",
+    "scope": "已检查参数与正文入口",
+    "exists": true,
+    "bytes": 2865,
+    "last_write_time": "2026-08-24T19:01:38.1501931+08:00",
+    "sha256": "B752DC66D882D2D49834F289F982AFABFDE95BF8DA3111D991432003D377D9DA"
+  },
+  {
+    "id": "S32",
+    "title": "停止采集脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/stop-capture.ps1",
+    "scope": "已检查参数与正文入口",
+    "exists": true,
+    "bytes": 3571,
+    "last_write_time": "2026-08-24T19:01:39.4173337+08:00",
+    "sha256": "F65E26BE08ED40C1283616977AD05C1ED8163AE461CC636A3B6ADAFF2701A9E3"
+  },
+  {
+    "id": "S33",
+    "title": "转换与发布脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/convert-stream.ps1",
+    "scope": "已检查参数与正文入口",
+    "exists": true,
+    "bytes": 5359,
+    "last_write_time": "2026-09-07T11:02:28.5402448+08:00",
+    "sha256": "744DC5A1E0795DAD91A632E3566B06BC370E330792C3708DF45932ADF6E5842E"
+  },
+  {
+    "id": "S34",
+    "title": "旧配置 MCP 启动脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/start-query-mcp.ps1",
+    "scope": "未传新版 analysis-root 参数",
+    "exists": true,
+    "bytes": 1291,
+    "last_write_time": "2026-08-24T18:56:35.5696841+08:00",
+    "sha256": "DEF6DDA69DDB898E10C673A9A6FE5C2822EDDBD124B3829AE90ADF9990B801C7"
+  },
+  {
+    "id": "S35",
+    "title": "旧 JSON 配置解析脚本",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/scripts/resolve-profile.ps1",
+    "scope": "四份 JSON 配置入口",
+    "exists": true,
+    "bytes": 5192,
+    "last_write_time": "2026-08-30T00:48:26.1179318+08:00",
+    "sha256": "572E80E4187C307C005BD07EA4DF6A608C9A4EEA7508C57EDCCF1CF082A56BCF"
+  },
+  {
+    "id": "S36",
+    "title": "帧窗口调查实施计划",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/skill-draft/diagnose-jn-unity-tracy/docs/2026-09-07-frame-window-candidate-and-investigation-implementation-plan.zh-CN.md",
+    "scope": "实施进度引用的正式计划",
+    "exists": true,
+    "bytes": 11843,
+    "last_write_time": "2026-09-07T16:38:09.0248469+08:00",
+    "sha256": "430B18F035420DA4E22D151B00843FD43CEEFA6977EFE17F4A1192B57E627372"
+  },
+  {
+    "id": "S37",
+    "title": "GPU 帧归属与层级架构讨论",
+    "path": "C:/Users/Admin/Documents/JN-Unity-T3/GPU-Zone-OriginFrameId-and-Hierarchy-Architecture-Brainstorming-20260906.zh-CN.md",
+    "scope": "设计资料",
+    "exists": true,
+    "bytes": 21354,
+    "last_write_time": "2026-09-06T16:18:05.6751881+08:00",
+    "sha256": "BC021FB37FD86C6C5B118E09F83D4BAF85FDE407E764FCB3C44E3A2D0F6EAB3D"
+  }
+]
