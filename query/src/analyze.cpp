@@ -293,7 +293,7 @@ int main( int argc, char** argv )
         if( fs::exists( output ) && !fs::is_empty( output ) ) throw std::runtime_error( "output must be new or empty" );
         fs::create_directories( output ); ownsOutput = true;
         const auto started = Clock::now();
-        analysis::AnalysisProcessMemoryOptions memoryOptions; memoryOptions.maximumBytes = 4ull << 30;
+        analysis::AnalysisProcessMemoryOptions memoryOptions; memoryOptions.maximumBytes = 16ull << 30;
         analysis::AnalysisProcessMemoryGuard memory( memoryOptions ); std::stop_source stop; auto monitor = memory.Monitor( stop );
         const auto plan = planPath.empty() ? json::object() : Read( planPath ); Save( output / "plan.json", plan );
         if( mode == "shortlist" && ( !plan.value( "windows", json::array() ).empty() || !plan.value( "requests", json::array() ).empty() ) )
